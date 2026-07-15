@@ -97,8 +97,17 @@ export class LocalAgentRuntime {
     const before = kernel.listMessages().length;
     const now = new Date().toISOString();
 
-    const transitionApplied = applyProducerDecisionFlow(kernel, message, now);
+    const gate = detectGateAction(message.content);
+    const shouldRunLocalDecisionFlow = gate ? scriptedReplies || isGateExecutionConfirmation(message.content, gate) : false;
+    const transitionApplied = shouldRunLocalDecisionFlow ? applyProducerDecisionFlow(kernel, message, now) : false;
     if (transitionApplied) {
+      return {
+        routePlan,
+        agentMessages: kernel.listMessages().slice(before)
+      };
+    }
+
+    if (!scriptedReplies) {
       return {
         routePlan,
         agentMessages: kernel.listMessages().slice(before)
@@ -107,13 +116,6 @@ export class LocalAgentRuntime {
 
     if (isPresencePing(message.content)) {
       writePresenceResponse(kernel);
-      return {
-        routePlan,
-        agentMessages: kernel.listMessages().slice(before)
-      };
-    }
-
-    if (!scriptedReplies) {
       return {
         routePlan,
         agentMessages: kernel.listMessages().slice(before)
@@ -427,6 +429,7 @@ function hasRecentGateReview(kernel: StudioKernel, gate: GateAction, currentMess
   const messages = kernel.listMessages();
   const reviewNeedle = `二次确认口令：${gate.confirmToken}`;
   let latestReview = -1;
+  let latestReviewRequest = -1;
   let latestExecution = -1;
   for (let index = 0; index < messages.length; index += 1) {
     const message = messages[index];
@@ -434,7 +437,20 @@ function hasRecentGateReview(kernel: StudioKernel, gate: GateAction, currentMess
       continue;
     }
 
-    if (message.senderType === "agent" && message.content.includes(reviewNeedle)) {
+    const requestedGate = detectGateAction(message.content);
+    if (
+      message.messageId !== currentMessageId &&
+      message.senderType === "producer" &&
+      requestedGate?.actionId === gate.actionId &&
+      !isGateExecutionConfirmation(message.content, gate)
+    ) {
+      latestReviewRequest = index;
+    }
+
+    if (
+      message.senderType === "agent" &&
+      (message.content.includes(reviewNeedle) || (message.messageType === "review" && latestReviewRequest !== -1 && index > latestReviewRequest))
+    ) {
       latestReview = index;
     }
     if (message.messageId !== currentMessageId && message.senderType === "producer" && isGateExecutionConfirmation(message.content, gate)) {
