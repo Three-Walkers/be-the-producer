@@ -1,8 +1,19 @@
 import { createRestartedStudioKernel, createStudioKernel, defaultAgentContracts, LocalAgentRuntime, type StudioKernel } from "@game-pipeline/agent-runtime";
 import type { MessageType, RoomKind, StudioMessage } from "@game-pipeline/shared-schemas";
+import { spawn } from "node:child_process";
+import { dirname } from "node:path";
 import { ModelAgentRuntime } from "./modelAgentRuntime.js";
 import { ProjectPersistenceStore, type ProjectSummary } from "./projectPersistence.js";
-import { deleteProjectWorkspace, readWorkspaceTree, syncProjectWorkspace, type WorkspaceSyncResult, type WorkspaceTreeEntry } from "./workspaceWriter.js";
+import {
+  deleteProjectWorkspace,
+  readArtifactPreview,
+  readWorkspaceTree,
+  resolveArtifactWorkspaceTarget,
+  syncProjectWorkspace,
+  type ArtifactPreviewResult,
+  type WorkspaceSyncResult,
+  type WorkspaceTreeEntry
+} from "./workspaceWriter.js";
 
 export interface CreateProjectInput {
   name: string;
@@ -229,6 +240,40 @@ export class StudioProjectStore {
     return readWorkspaceTree(projectId);
   }
 
+  readArtifactPreview(projectId: string, artifactId: string): ArtifactPreviewResult {
+    const kernel = this.getKernel(projectId);
+    syncProjectWorkspace(kernel);
+    const artifact = kernel.listArtifacts().find((candidate) => candidate.artifactId === artifactId);
+    if (!artifact) {
+      throw new HttpError(404, `Artifact not found: ${artifactId}`);
+    }
+
+    return readArtifactPreview(projectId, artifact);
+  }
+
+  openArtifactInFinder(projectId: string, artifactId: string): {
+    opened: boolean;
+    target: ReturnType<typeof resolveArtifactWorkspaceTarget>;
+  } {
+    const kernel = this.getKernel(projectId);
+    syncProjectWorkspace(kernel);
+    const artifact = kernel.listArtifacts().find((candidate) => candidate.artifactId === artifactId);
+    if (!artifact) {
+      throw new HttpError(404, `Artifact not found: ${artifactId}`);
+    }
+
+    const target = resolveArtifactWorkspaceTarget(projectId, artifact);
+    if (!target.exists) {
+      throw new HttpError(404, "交付物文件尚未写入本地工作空间。");
+    }
+
+    openLocalPath(target.absolutePath, target.type ?? "file");
+    return {
+      opened: true,
+      target
+    };
+  }
+
   deleteProject(projectId: string): { projectId: string } {
     this.getKernel(projectId);
     this.projects.delete(projectId);
@@ -275,6 +320,30 @@ function extractMentionedAgents(content: string): string[] {
 
 function uniqueStrings(values: string[]): string[] {
   return [...new Set(values.filter(Boolean))];
+}
+
+function openLocalPath(absolutePath: string, type: "file" | "directory"): void {
+  const command =
+    process.platform === "darwin"
+      ? "open"
+      : process.platform === "win32"
+        ? "explorer.exe"
+        : "xdg-open";
+  const args =
+    process.platform === "darwin"
+      ? type === "file"
+        ? ["-R", absolutePath]
+        : [absolutePath]
+      : process.platform === "win32"
+        ? type === "file"
+          ? [`/select,${absolutePath}`]
+          : [absolutePath]
+        : [type === "file" ? dirname(absolutePath) : absolutePath];
+  const child = spawn(command, args, {
+    detached: true,
+    stdio: "ignore"
+  });
+  child.unref();
 }
 
 export class HttpError extends Error {

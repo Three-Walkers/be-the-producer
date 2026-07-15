@@ -268,6 +268,16 @@ export async function handleRequest(request: IncomingMessage, response: ServerRe
       return;
     }
 
+    if (request.method === "GET" && resource === "artifacts" && childId && nested === "preview") {
+      sendJson(response, 200, studioStore.readArtifactPreview(projectRoute.projectId, childId));
+      return;
+    }
+
+    if (request.method === "POST" && resource === "artifacts" && childId && nested === "open") {
+      sendJson(response, 200, studioStore.openArtifactInFinder(projectRoute.projectId, childId));
+      return;
+    }
+
     if (request.method === "GET" && resource === "artifacts") {
       sendJson(response, 200, { artifacts: kernel.listArtifacts() });
       return;

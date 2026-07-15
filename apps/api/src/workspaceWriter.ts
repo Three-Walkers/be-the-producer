@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, extname, join, normalize, relative, sep } from "node:path";
 import type { Artifact, MemoryRecord, StudioMessage, Task } from "@game-pipeline/shared-schemas";
 import type { StudioKernel } from "@game-pipeline/agent-runtime";
@@ -13,6 +13,25 @@ export interface WorkspaceTreeEntry {
   type: "file" | "directory";
   sizeBytes?: number;
   updatedAt?: string;
+}
+
+export interface ArtifactWorkspaceTarget {
+  projectRoot: string;
+  relativePath: string;
+  absolutePath: string;
+  exists: boolean;
+  type?: "file" | "directory";
+  sizeBytes?: number;
+  updatedAt?: string;
+}
+
+export interface ArtifactPreviewResult {
+  artifact: Artifact;
+  target: Omit<ArtifactWorkspaceTarget, "absolutePath">;
+  previewable: boolean;
+  content?: string;
+  language?: "markdown" | "json" | "text";
+  reason?: string;
 }
 
 const defaultWorkspaceRoot = (): string =>
@@ -79,6 +98,95 @@ export function deleteProjectWorkspace(projectId: string, workspaceRoot = defaul
   });
 }
 
+export function resolveArtifactWorkspaceTarget(
+  projectId: string,
+  artifact: Artifact,
+  workspaceRoot = defaultWorkspaceRoot()
+): ArtifactWorkspaceTarget {
+  const projectRoot = join(workspaceRoot, projectId);
+  const relativePath = safeWorkspacePath(artifactFilePath(artifact));
+  const absolutePath = join(projectRoot, relativePath);
+  if (!isInsideRoot(projectRoot, absolutePath)) {
+    throw new Error(`Unsafe artifact path: ${artifact.path}`);
+  }
+
+  if (!existsSync(absolutePath)) {
+    return {
+      projectRoot,
+      relativePath: relativePath.split(sep).join("/"),
+      absolutePath,
+      exists: false
+    };
+  }
+
+  const stats = statSync(absolutePath);
+  return {
+    projectRoot,
+    relativePath: relative(projectRoot, absolutePath).split(sep).join("/"),
+    absolutePath,
+    exists: true,
+    type: stats.isDirectory() ? "directory" : "file",
+    ...(stats.isFile() ? { sizeBytes: stats.size } : {}),
+    updatedAt: stats.mtime.toISOString()
+  };
+}
+
+export function readArtifactPreview(projectId: string, artifact: Artifact): ArtifactPreviewResult {
+  const target = resolveArtifactWorkspaceTarget(projectId, artifact);
+  const publicTarget = toPublicTarget(target);
+  if (!target.exists) {
+    return {
+      artifact,
+      target: publicTarget,
+      previewable: false,
+      reason: "交付物文件尚未写入本地工作空间。"
+    };
+  }
+
+  if (target.type !== "file") {
+    return {
+      artifact,
+      target: publicTarget,
+      previewable: false,
+      reason: "该交付物是目录或二进制资产，暂不支持内嵌预览。"
+    };
+  }
+
+  if (!isPreviewableDocument(target.relativePath)) {
+    return {
+      artifact,
+      target: publicTarget,
+      previewable: false,
+      reason: "该文件类型暂不支持内嵌预览，请在 Finder 中查看。"
+    };
+  }
+
+  const maxPreviewBytes = 512 * 1024;
+  if ((target.sizeBytes ?? 0) > maxPreviewBytes) {
+    return {
+      artifact,
+      target: publicTarget,
+      previewable: false,
+      reason: "该文档超过 512KB，暂不在页面内预览，请在 Finder 中查看。"
+    };
+  }
+
+  const rawContent = readFileSync(target.absolutePath, "utf8");
+  const language = previewLanguage(target.relativePath);
+  const content = language === "json" ? formatJsonPreview(rawContent) : rawContent;
+  return {
+    artifact,
+    target: publicTarget,
+    previewable: true,
+    content,
+    language
+  };
+}
+
+export function isPreviewableDocument(path: string): boolean {
+  return [".md", ".markdown", ".txt", ".json", ".jsonl", ".log"].includes(extname(path).toLowerCase());
+}
+
 function listWorkspaceEntries(root: string, current: string): WorkspaceTreeEntry[] {
   const entries: WorkspaceTreeEntry[] = [];
   for (const name of readdirSync(current).sort()) {
@@ -118,11 +226,7 @@ function writeJsonLines(projectRoot: string, path: string, records: MemoryRecord
 }
 
 function writeText(projectRoot: string, path: string, content: string, filesWritten: string[]): void {
-  const safePath = normalize(path);
-  if (safePath.startsWith("..") || safePath.includes(`${sep}..${sep}`)) {
-    throw new Error(`Unsafe workspace path: ${path}`);
-  }
-
+  const safePath = safeWorkspacePath(path);
   const absolutePath = join(projectRoot, safePath);
   mkdirSync(dirname(absolutePath), { recursive: true });
   writeFileSync(absolutePath, content, "utf8");
@@ -157,7 +261,7 @@ function writeArtifactFile(
   writeText(projectRoot, targetPath, renderArtifactMarkdown(artifact, sourceTask, sourceMemory), filesWritten);
 }
 
-function artifactFilePath(artifact: Artifact): string {
+export function artifactFilePath(artifact: Artifact): string {
   const extension = extname(artifact.path);
   if (extension) {
     return artifact.path;
@@ -168,6 +272,50 @@ function artifactFilePath(artifact: Artifact): string {
   }
 
   return join(artifact.path, "README.md");
+}
+
+function safeWorkspacePath(path: string): string {
+  const safePath = normalize(path);
+  if (safePath.startsWith("..") || safePath.includes(`${sep}..${sep}`)) {
+    throw new Error(`Unsafe workspace path: ${path}`);
+  }
+
+  return safePath;
+}
+
+function isInsideRoot(root: string, target: string): boolean {
+  const relativePath = relative(root, target);
+  return relativePath === "" || (!relativePath.startsWith("..") && !relativePath.includes(`${sep}..${sep}`));
+}
+
+function toPublicTarget(target: ArtifactWorkspaceTarget): Omit<ArtifactWorkspaceTarget, "absolutePath"> {
+  return {
+    projectRoot: target.projectRoot,
+    relativePath: target.relativePath,
+    exists: target.exists,
+    ...(target.type ? { type: target.type } : {}),
+    ...(target.sizeBytes !== undefined ? { sizeBytes: target.sizeBytes } : {}),
+    ...(target.updatedAt ? { updatedAt: target.updatedAt } : {})
+  };
+}
+
+function previewLanguage(path: string): "markdown" | "json" | "text" {
+  const extension = extname(path).toLowerCase();
+  if (extension === ".md" || extension === ".markdown") {
+    return "markdown";
+  }
+  if (extension === ".json" || extension === ".jsonl") {
+    return "json";
+  }
+  return "text";
+}
+
+function formatJsonPreview(content: string): string {
+  try {
+    return JSON.stringify(JSON.parse(content), null, 2);
+  } catch {
+    return content;
+  }
 }
 
 function renderProjectReadme(kernel: StudioKernel, totalTasks: number, totalArtifacts: number, totalMemory: number): string {
