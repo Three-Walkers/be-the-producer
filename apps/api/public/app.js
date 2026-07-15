@@ -11,6 +11,7 @@ const state = {
   modelProviders: [],
   modelAssignments: [],
   modelTestResults: {},
+  pendingAgentResponses: [],
   selectedModelProviderId: "dashscope"
 };
 
@@ -606,6 +607,9 @@ document.querySelectorAll("[data-preset]").forEach((button) => {
 
       const payload = buildPresetMessage(presetId, preset);
       state.activeRoomKind = payload.roomKind;
+      renderProjectHeader();
+      renderRooms();
+      renderMessages();
       await sendProducerMessage(payload);
     } catch (error) {
       showToast(error.message);
@@ -620,6 +624,7 @@ async function sendProducerMessage(input) {
   }
 
   const optimisticMessageId = appendOptimisticProducerMessage(input);
+  const pendingResponseId = appendAgentTypingIndicator(input);
   try {
     await request(`/projects/${state.projectId}/messages`, {
       method: "POST",
@@ -627,8 +632,11 @@ async function sendProducerMessage(input) {
     });
     await refreshProject();
   } catch (error) {
+    removeAgentTypingIndicator(pendingResponseId);
     markOptimisticMessageFailed(optimisticMessageId);
     throw error;
+  } finally {
+    removeAgentTypingIndicator(pendingResponseId);
   }
 }
 
@@ -655,6 +663,31 @@ function appendOptimisticProducerMessage(input) {
   renderRooms();
   renderMessages();
   return messageId;
+}
+
+function appendAgentTypingIndicator(input) {
+  const activeRoom = state.rooms.find((room) => room.kind === (input.roomKind ?? state.activeRoomKind)) ?? state.rooms[0];
+  const targetAgentIds = mentionedAgentIds(input.content);
+  const indicator = {
+    indicatorId: `typing_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    projectId: state.projectId,
+    roomId: input.roomId ?? activeRoom?.roomId ?? state.activeRoomKind,
+    targetAgentIds,
+    createdAt: new Date().toISOString()
+  };
+  state.pendingAgentResponses = [...state.pendingAgentResponses, indicator];
+  renderMessages();
+  return indicator.indicatorId;
+}
+
+function removeAgentTypingIndicator(indicatorId) {
+  const next = state.pendingAgentResponses.filter((indicator) => indicator.indicatorId !== indicatorId);
+  if (next.length === state.pendingAgentResponses.length) {
+    return;
+  }
+
+  state.pendingAgentResponses = next;
+  renderMessages();
 }
 
 function markOptimisticMessageFailed(messageId) {
@@ -727,6 +760,7 @@ async function loadProjects({ autoOpenLatest = true } = {}) {
 async function loadProject(projectId) {
   state.projectId = projectId;
   state.activeRoomKind = "studio-main";
+  state.pendingAgentResponses = [];
   await refreshProject();
 }
 
@@ -1045,6 +1079,7 @@ function renderAgentAssignments() {
 
 function renderProjectHeader() {
   $("#project-title").textContent = state.project?.name ?? "未创建";
+  $("#active-room-title").textContent = `当前房间 · ${activeRoomName()}`;
   if (!state.project) {
     $("#project-stage").textContent = "等待 idea";
     return;
@@ -1196,6 +1231,7 @@ function clearCurrentProject() {
   state.rooms = [];
   state.activeRoomKind = "studio-main";
   state.messages = [];
+  state.pendingAgentResponses = [];
   state.taskBoard = null;
   state.artifacts = [];
   state.workspace = null;
@@ -1220,6 +1256,7 @@ function renderRooms() {
   roomList.querySelectorAll("[data-room-kind]").forEach((button) => {
     button.addEventListener("click", () => {
       state.activeRoomKind = button.dataset.roomKind;
+      renderProjectHeader();
       renderRooms();
       renderMessages();
     });
@@ -1229,16 +1266,27 @@ function renderRooms() {
 function renderMessages() {
   const activeRoom = state.rooms.find((room) => room.kind === state.activeRoomKind);
   const messages = activeRoom ? state.messages.filter((message) => message.roomId === activeRoom.roomId) : state.messages;
+  const pendingResponses = activeRoom
+    ? state.pendingAgentResponses.filter((indicator) => indicator.roomId === activeRoom.roomId)
+    : state.pendingAgentResponses;
   const list = $("#message-list");
-  if (!messages.length) {
+  if (!messages.length && !pendingResponses.length) {
     list.className = "message-list empty-state";
     list.textContent = "当前房间还没有消息。";
     return;
   }
 
   list.className = "message-list";
-  list.innerHTML = messages
-    .map((message) => {
+  list.innerHTML = [
+    ...messages.map((message) => ({ type: "message", message })),
+    ...pendingResponses.map((indicator) => ({ type: "typing", indicator }))
+  ]
+    .map((item) => {
+      if (item.type === "typing") {
+        return renderTypingIndicator(item.indicator);
+      }
+
+      const { message } = item;
       const senderClass = message.senderType === "producer" ? "producer" : "agent";
       const senderId = message.senderType === "producer" ? "producer" : message.senderId;
       const sender = message.senderType === "producer" ? "制作人" : agentName(message.senderId);
@@ -1251,12 +1299,102 @@ function renderMessages() {
             <span>${escapeHtml(sender)} · ${escapeHtml(message.messageType)}${escapeHtml(statusText)}</span>
             <span>${new Date(message.createdAt).toLocaleTimeString()}</span>
           </div>
-          <div class="message-content">${escapeHtml(message.content)}</div>
+          <div class="message-content">${renderMessageContent(message.content)}</div>
         </div>
       </article>`;
     })
     .join("");
+  list.querySelectorAll("[data-open-workspace-path]").forEach((button) => {
+    button.addEventListener("click", () => {
+      openWorkspacePath(button.dataset.openWorkspacePath).catch((error) => showToast(error.message));
+    });
+  });
   list.parentElement.scrollTop = list.parentElement.scrollHeight;
+}
+
+function renderMessageContent(content) {
+  const text = String(content ?? "");
+  const codePattern = /`([^`\n]+)`/g;
+  let cursor = 0;
+  let html = "";
+  for (const match of text.matchAll(codePattern)) {
+    html += linkWorkspacePaths(text.slice(cursor, match.index));
+    const codeText = match[1] ?? "";
+    const candidate = normalizeWorkspacePathCandidate(codeText);
+    html += candidate ? workspacePathLink(candidate.path, candidate.label) : `<code class="message-inline-code">${escapeHtml(codeText)}</code>`;
+    cursor = (match.index ?? 0) + match[0].length;
+  }
+
+  html += linkWorkspacePaths(text.slice(cursor));
+  return html;
+}
+
+function linkWorkspacePaths(text) {
+  const pathPattern =
+    /(?:\.\/)?(?:agents|shared|docs|assets|artifacts|outputs|builds|release|releases)\/[A-Za-z0-9._~@%+\-/]+|(?:\.\/)?[A-Za-z0-9._~@%+-]+\/[A-Za-z0-9._~@%+\-/]*[A-Za-z0-9._~@%+-]\.[A-Za-z0-9]{2,10}/g;
+  let cursor = 0;
+  let html = "";
+  for (const match of text.matchAll(pathPattern)) {
+    const raw = match[0];
+    const candidate = normalizeWorkspacePathCandidate(raw);
+    if (!candidate) {
+      continue;
+    }
+
+    html += escapeHtml(text.slice(cursor, match.index));
+    html += workspacePathLink(candidate.path, candidate.label);
+    cursor = (match.index ?? 0) + raw.length;
+  }
+
+  html += escapeHtml(text.slice(cursor));
+  return html;
+}
+
+function normalizeWorkspacePathCandidate(value) {
+  const original = String(value ?? "");
+  let candidate = original.trim();
+  if (!candidate || candidate.includes("://") || candidate.startsWith("/") || candidate.includes("..")) {
+    return undefined;
+  }
+
+  candidate = candidate.replace(/^\.\/+/, "");
+  const trimmed = candidate.replace(/[，。；、,;:!?！？)\]}]+$/g, "");
+  if (!trimmed || !trimmed.includes("/") || trimmed.includes("..")) {
+    return undefined;
+  }
+
+  const startsWithWorkspaceRoot = /^(agents|shared|docs|assets|artifacts|outputs|builds|release|releases)\//.test(trimmed);
+  const hasFileExtension = /\.[A-Za-z0-9]{2,10}$/.test(trimmed);
+  if (!startsWithWorkspaceRoot && !hasFileExtension) {
+    return undefined;
+  }
+
+  return {
+    path: trimmed,
+    label: original.slice(0, original.indexOf(trimmed) + trimmed.length) || trimmed
+  };
+}
+
+function workspacePathLink(path, label) {
+  return `<button class="workspace-path-link" type="button" data-open-workspace-path="${escapeHtml(path)}" title="在 Finder 中打开 ${escapeHtml(path)}">${escapeHtml(label)}</button>`;
+}
+
+function renderTypingIndicator(indicator) {
+  const targetNames = indicator.targetAgentIds.map((agentId) => agentName(agentId));
+  const sender = targetNames.length ? targetNames.join("、") : "相关 Agent";
+  const senderId = indicator.targetAgentIds[0] ?? "agent_typing";
+  return `<article class="message agent message-typing">
+    ${avatarMarkup(senderId, sender)}
+    <div class="message-body">
+      <div class="message-meta">
+        <span>${escapeHtml(sender)} · 正在输入</span>
+        <span>${new Date(indicator.createdAt).toLocaleTimeString()}</span>
+      </div>
+      <div class="typing-indicator" aria-label="${escapeHtml(sender)} 正在输入">
+        <span></span><span></span><span></span>
+      </div>
+    </div>
+  </article>`;
 }
 
 function renderTaskBoard() {
@@ -1377,6 +1515,15 @@ async function openArtifactInFinder(artifactId) {
   showToast("已在 Finder 中打开交付物位置。");
 }
 
+async function openWorkspacePath(path) {
+  ensureProject();
+  await request(`/projects/${state.projectId}/workspace/open`, {
+    method: "POST",
+    body: JSON.stringify({ path })
+  });
+  showToast("已在 Finder 中打开本地资源。");
+}
+
 function closeArtifactPreview() {
   activePreviewArtifactId = null;
   artifactPreviewDialog.close();
@@ -1478,6 +1625,21 @@ function isProjectStarted() {
 
 function canAgentsReceiveMessages() {
   return currentExecutionStatus() === "running";
+}
+
+function activeRoomName() {
+  const room = state.rooms.find((candidate) => candidate.kind === state.activeRoomKind);
+  return roomLabels[room?.kind ?? state.activeRoomKind] ?? room?.name ?? roomLabels[state.activeRoomKind] ?? "主群聊";
+}
+
+function mentionedAgentIds(content) {
+  const lowerContent = String(content).toLowerCase();
+  return mentionCandidates
+    .filter((candidate) => {
+      const tokens = [candidate.token, candidate.agentId, candidate.label, ...candidate.aliases];
+      return tokens.some((token) => lowerContent.includes(`@${String(token).toLowerCase()}`));
+    })
+    .map((candidate) => candidate.agentId);
 }
 
 function avatarMarkup(agentId, label) {
