@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { dirname, extname, join, normalize, relative, sep } from "node:path";
+import { dirname, extname, isAbsolute, join, normalize, relative, sep } from "node:path";
 import type { Artifact, MemoryRecord, StudioMessage, Task } from "@game-pipeline/shared-schemas";
 import type { StudioKernel } from "@game-pipeline/agent-runtime";
 
@@ -24,6 +24,8 @@ export interface ArtifactWorkspaceTarget {
   sizeBytes?: number;
   updatedAt?: string;
 }
+
+export type WorkspacePathTarget = ArtifactWorkspaceTarget;
 
 export interface ArtifactPreviewResult {
   artifact: Artifact;
@@ -108,6 +110,39 @@ export function resolveArtifactWorkspaceTarget(
   const absolutePath = join(projectRoot, relativePath);
   if (!isInsideRoot(projectRoot, absolutePath)) {
     throw new Error(`Unsafe artifact path: ${artifact.path}`);
+  }
+
+  if (!existsSync(absolutePath)) {
+    return {
+      projectRoot,
+      relativePath: relativePath.split(sep).join("/"),
+      absolutePath,
+      exists: false
+    };
+  }
+
+  const stats = statSync(absolutePath);
+  return {
+    projectRoot,
+    relativePath: relative(projectRoot, absolutePath).split(sep).join("/"),
+    absolutePath,
+    exists: true,
+    type: stats.isDirectory() ? "directory" : "file",
+    ...(stats.isFile() ? { sizeBytes: stats.size } : {}),
+    updatedAt: stats.mtime.toISOString()
+  };
+}
+
+export function resolveWorkspacePathTarget(
+  projectId: string,
+  path: string,
+  workspaceRoot = defaultWorkspaceRoot()
+): WorkspacePathTarget {
+  const projectRoot = join(workspaceRoot, projectId);
+  const relativePath = safeWorkspacePath(path);
+  const absolutePath = join(projectRoot, relativePath);
+  if (!isInsideRoot(projectRoot, absolutePath)) {
+    throw new Error(`Unsafe workspace path: ${path}`);
   }
 
   if (!existsSync(absolutePath)) {
@@ -276,7 +311,7 @@ export function artifactFilePath(artifact: Artifact): string {
 
 function safeWorkspacePath(path: string): string {
   const safePath = normalize(path);
-  if (safePath.startsWith("..") || safePath.includes(`${sep}..${sep}`)) {
+  if (isAbsolute(safePath) || safePath.startsWith("..") || safePath.includes(`${sep}..${sep}`)) {
     throw new Error(`Unsafe workspace path: ${path}`);
   }
 

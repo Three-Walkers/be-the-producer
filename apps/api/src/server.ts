@@ -268,6 +268,15 @@ export async function handleRequest(request: IncomingMessage, response: ServerRe
       return;
     }
 
+    if (request.method === "POST" && resource === "workspace" && childId === "open") {
+      const input = await readJson<{ path?: string }>(request);
+      if (!input.path) {
+        throw new HttpError(400, "path is required");
+      }
+      sendJson(response, 200, studioStore.openWorkspacePath(projectRoute.projectId, input.path));
+      return;
+    }
+
     if (request.method === "GET" && resource === "artifacts" && childId && nested === "preview") {
       sendJson(response, 200, studioStore.readArtifactPreview(projectRoute.projectId, childId));
       return;

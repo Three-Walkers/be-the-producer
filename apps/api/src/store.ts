@@ -9,8 +9,10 @@ import {
   readArtifactPreview,
   readWorkspaceTree,
   resolveArtifactWorkspaceTarget,
+  resolveWorkspacePathTarget,
   syncProjectWorkspace,
   type ArtifactPreviewResult,
+  type WorkspacePathTarget,
   type WorkspaceSyncResult,
   type WorkspaceTreeEntry
 } from "./workspaceWriter.js";
@@ -265,6 +267,24 @@ export class StudioProjectStore {
     const target = resolveArtifactWorkspaceTarget(projectId, artifact);
     if (!target.exists) {
       throw new HttpError(404, "交付物文件尚未写入本地工作空间。");
+    }
+
+    openLocalPath(target.absolutePath, target.type ?? "file");
+    return {
+      opened: true,
+      target
+    };
+  }
+
+  openWorkspacePath(projectId: string, path: string): {
+    opened: boolean;
+    target: WorkspacePathTarget;
+  } {
+    const kernel = this.getKernel(projectId);
+    syncProjectWorkspace(kernel);
+    const target = resolveWorkspacePathTarget(projectId, path);
+    if (!target.exists) {
+      throw new HttpError(404, `本地工作空间中未找到该路径：${target.relativePath}`);
     }
 
     openLocalPath(target.absolutePath, target.type ?? "file");
