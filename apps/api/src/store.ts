@@ -1,6 +1,7 @@
-import { createStudioKernel, LocalAgentRuntime, type StudioKernel } from "@game-pipeline/agent-runtime";
+import { createRestartedStudioKernel, createStudioKernel, LocalAgentRuntime, type StudioKernel } from "@game-pipeline/agent-runtime";
 import type { MessageType, RoomKind, StudioMessage } from "@game-pipeline/shared-schemas";
-import { readWorkspaceTree, syncProjectWorkspace, type WorkspaceSyncResult, type WorkspaceTreeEntry } from "./workspaceWriter.js";
+import { ProjectPersistenceStore, type ProjectSummary } from "./projectPersistence.js";
+import { deleteProjectWorkspace, readWorkspaceTree, syncProjectWorkspace, type WorkspaceSyncResult, type WorkspaceTreeEntry } from "./workspaceWriter.js";
 
 export interface CreateProjectInput {
   name: string;
@@ -19,6 +20,18 @@ export interface PostMessageInput {
 export class StudioProjectStore {
   private readonly projects = new Map<string, StudioKernel>();
   private readonly runtime = new LocalAgentRuntime();
+  private readonly persistence = new ProjectPersistenceStore();
+
+  constructor() {
+    for (const kernel of this.persistence.loadAll()) {
+      this.projects.set(kernel.project.projectId, kernel);
+      syncProjectWorkspace(kernel);
+    }
+  }
+
+  listProjects(): ProjectSummary[] {
+    return this.persistence.listSummaries();
+  }
 
   createProject(input: CreateProjectInput): {
     project: StudioKernel["project"];
@@ -27,8 +40,9 @@ export class StudioProjectStore {
     bootstrap?: ReturnType<LocalAgentRuntime["handleProducerMessage"]>;
   } {
     const projectId = `game_${Date.now().toString(36)}`;
-    const kernel = createStudioKernel(projectId, input.name, input.producerId ?? "producer_local");
+    const kernel = createStudioKernel(projectId, input.name, input.producerId ?? "producer_local", input.idea);
     this.projects.set(projectId, kernel);
+    this.persistence.save(kernel);
 
     const result: {
       project: StudioKernel["project"];
@@ -41,20 +55,53 @@ export class StudioProjectStore {
       workspace: syncProjectWorkspace(kernel)
     };
 
-    if (input.idea) {
-      result.bootstrap = this.postProducerMessage(projectId, {
-        roomKind: "studio-main",
-        content: input.idea,
-        messageType: "plan_submission"
-      });
-      result.workspace = syncProjectWorkspace(kernel);
-    }
-
+    this.persistence.save(kernel);
     return result;
   }
 
+  startProject(projectId: string): ReturnType<LocalAgentRuntime["handleProducerMessage"]> & {
+    project: StudioKernel["project"];
+    rooms: ReturnType<StudioKernel["listRooms"]>;
+    workspace: WorkspaceSyncResult;
+  } {
+    const existing = this.getKernel(projectId);
+    const initialIdea =
+      existing.project.initialIdea ??
+      existing.listMessages().find((message) => message.senderType === "producer" && message.messageType === "plan_submission")?.content;
+    if (!initialIdea) {
+      throw new HttpError(400, "Project has no initial idea to start from");
+    }
+
+    const now = new Date().toISOString();
+    for (const kernel of this.projects.values()) {
+      if (kernel.project.projectId !== projectId && kernel.project.executionStatus === "running") {
+        kernel.updateProject({
+          executionStatus: "paused",
+          updatedAt: now
+        });
+        this.persistence.save(kernel);
+      }
+    }
+
+    existing.updateProject({ initialIdea });
+    const restarted = createRestartedStudioKernel(existing.project);
+    this.projects.set(projectId, restarted);
+    const result = this.postProducerMessage(projectId, {
+      roomKind: "studio-main",
+      content: initialIdea,
+      messageType: "plan_submission"
+    });
+    const kernel = this.getKernel(projectId);
+    return {
+      ...result,
+      project: kernel.project,
+      rooms: kernel.listRooms(),
+      workspace: syncProjectWorkspace(kernel)
+    };
+  }
+
   getKernel(projectId: string): StudioKernel {
-    const kernel = this.projects.get(projectId);
+    const kernel = this.projects.get(projectId) ?? this.loadProject(projectId);
     if (!kernel) {
       throw new HttpError(404, `Project not found: ${projectId}`);
     }
@@ -89,6 +136,7 @@ export class StudioProjectStore {
     };
 
     const result = this.runtime.handleProducerMessage(kernel, message);
+    this.persistence.save(kernel);
     return {
       ...result,
       workspace: syncProjectWorkspace(kernel)
@@ -96,7 +144,9 @@ export class StudioProjectStore {
   }
 
   syncWorkspace(projectId: string): WorkspaceSyncResult {
-    return syncProjectWorkspace(this.getKernel(projectId));
+    const kernel = this.getKernel(projectId);
+    this.persistence.save(kernel);
+    return syncProjectWorkspace(kernel);
   }
 
   readWorkspaceTree(projectId: string): {
@@ -105,6 +155,23 @@ export class StudioProjectStore {
   } {
     this.getKernel(projectId);
     return readWorkspaceTree(projectId);
+  }
+
+  deleteProject(projectId: string): { projectId: string } {
+    this.getKernel(projectId);
+    this.projects.delete(projectId);
+    this.persistence.delete(projectId);
+    deleteProjectWorkspace(projectId);
+    return { projectId };
+  }
+
+  private loadProject(projectId: string): StudioKernel | undefined {
+    const kernel = this.persistence.load(projectId);
+    if (kernel) {
+      this.projects.set(projectId, kernel);
+      syncProjectWorkspace(kernel);
+    }
+    return kernel;
   }
 }
 

@@ -131,6 +131,11 @@ export async function handleRequest(request: IncomingMessage, response: ServerRe
       }
     }
 
+    if (request.method === "GET" && url.pathname === "/projects") {
+      sendJson(response, 200, { projects: studioStore.listProjects() });
+      return;
+    }
+
     if (request.method === "POST" && url.pathname === "/projects") {
       const input = await readJson<CreateProjectInput>(request);
       if (!input.name) {
@@ -151,6 +156,19 @@ export async function handleRequest(request: IncomingMessage, response: ServerRe
 
     if (request.method === "GET" && !resource) {
       sendJson(response, 200, { project: kernel.project });
+      return;
+    }
+
+    if (request.method === "DELETE" && !resource) {
+      sendJson(response, 200, { deleted: studioStore.deleteProject(projectRoute.projectId) });
+      return;
+    }
+
+    if (request.method === "POST" && resource === "start") {
+      sendJson(response, 202, {
+        ...studioStore.startProject(projectRoute.projectId),
+        taskBoard: studioStore.getKernel(projectRoute.projectId).buildTaskBoard()
+      });
       return;
     }
 

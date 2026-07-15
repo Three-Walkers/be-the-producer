@@ -97,8 +97,11 @@ export interface Project {
   projectId: ProjectId;
   name: string;
   status: "active" | "archived";
+  executionStatus?: "draft" | "running" | "paused" | "completed";
   currentStage: StageId;
   producerId: string;
+  initialIdea?: string;
+  startedAt?: string;
   createdAt: string;
   updatedAt: string;
 }

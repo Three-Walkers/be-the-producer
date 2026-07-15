@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, extname, join, normalize, relative, sep } from "node:path";
 import type { Artifact, MemoryRecord, StudioMessage, Task } from "@game-pipeline/shared-schemas";
 import type { StudioKernel } from "@game-pipeline/agent-runtime";
@@ -70,6 +70,13 @@ export function readWorkspaceTree(projectId: string, workspaceRoot = defaultWork
     projectRoot,
     entries: listWorkspaceEntries(projectRoot, projectRoot)
   };
+}
+
+export function deleteProjectWorkspace(projectId: string, workspaceRoot = defaultWorkspaceRoot()): void {
+  rmSync(join(workspaceRoot, projectId), {
+    recursive: true,
+    force: true
+  });
 }
 
 function listWorkspaceEntries(root: string, current: string): WorkspaceTreeEntry[] {

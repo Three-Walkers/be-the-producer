@@ -1,7 +1,11 @@
 import type { AuditEvent, AuditEventId, ProjectId } from "@game-pipeline/shared-schemas";
 
 export class InMemoryAuditLog {
-  private readonly events: AuditEvent[] = [];
+  private readonly events: AuditEvent[];
+
+  constructor(events: AuditEvent[] = []) {
+    this.events = [...events];
+  }
 
   append(event: AuditEvent): AuditEvent {
     this.events.push(event);

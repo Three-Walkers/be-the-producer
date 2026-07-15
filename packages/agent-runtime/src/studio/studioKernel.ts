@@ -28,6 +28,13 @@ export interface StudioKernelState {
   artifacts: Artifact[];
 }
 
+export interface StudioKernelSnapshot extends StudioKernelState {
+  version: 1;
+  savedAt: string;
+  memoryRecords: MemoryRecord[];
+  auditEvents: AuditEvent[];
+}
+
 export class StudioKernel {
   readonly agents: AgentRegistry;
   readonly router: RoleAwareRouter;
@@ -37,23 +44,36 @@ export class StudioKernel {
 
   private readonly state: StudioKernelState;
 
-  constructor(project: Project) {
+  constructor(
+    project: Project,
+    restoredState: Partial<Omit<StudioKernelState, "project">> & {
+      memoryRecords?: MemoryRecord[];
+      auditEvents?: AuditEvent[];
+    } = {}
+  ) {
     this.agents = new AgentRegistry(defaultAgentContracts);
     this.router = new RoleAwareRouter(this.agents);
-    this.memory = new InMemoryProductionMemory();
-    this.auditLog = new InMemoryAuditLog();
+    this.memory = new InMemoryProductionMemory(restoredState.memoryRecords);
+    this.auditLog = new InMemoryAuditLog(restoredState.auditEvents);
     this.taskBoard = new TaskBoardBuilder();
     this.state = {
       project,
-      rooms: createDefaultRooms(project.projectId),
-      messages: [],
-      tasks: [],
-      artifacts: []
+      rooms: restoredState.rooms ?? createDefaultRooms(project.projectId),
+      messages: restoredState.messages ?? [],
+      tasks: restoredState.tasks ?? [],
+      artifacts: restoredState.artifacts ?? []
     };
   }
 
   get project(): Project {
     return this.state.project;
+  }
+
+  updateProject(fields: Partial<Pick<Project, "executionStatus" | "initialIdea" | "startedAt" | "updatedAt">>): void {
+    this.state.project = {
+      ...this.state.project,
+      ...fields
+    };
   }
 
   setStage(stageId: StageId, updatedAt = new Date().toISOString()): void {
@@ -223,6 +243,20 @@ export class StudioKernel {
     return this.auditLog.list(this.state.project.projectId);
   }
 
+  toSnapshot(savedAt = new Date().toISOString()): StudioKernelSnapshot {
+    return {
+      version: 1,
+      savedAt,
+      project: this.state.project,
+      rooms: this.state.rooms,
+      messages: this.state.messages,
+      tasks: this.state.tasks,
+      artifacts: this.state.artifacts,
+      memoryRecords: this.memory.list(this.state.project.projectId),
+      auditEvents: this.auditLog.list(this.state.project.projectId)
+    };
+  }
+
   private appendTaskEvent(task: Task, eventType: "TASK_CREATED" | "TASK_STATUS_CHANGED"): void {
     this.auditLog.append({
       eventId: `evt_${eventType.toLowerCase()}_${task.taskId}_${Date.now()}`,
@@ -245,15 +279,39 @@ export class StudioKernel {
   }
 }
 
-export function createStudioKernel(projectId: ProjectId, name: string, producerId: string): StudioKernel {
+export function createStudioKernel(projectId: ProjectId, name: string, producerId: string, initialIdea?: string): StudioKernel {
   const now = new Date().toISOString();
   return new StudioKernel({
     projectId,
     name,
     status: "active",
+    executionStatus: "draft",
     currentStage: "concept_discussion",
     producerId,
+    ...(initialIdea ? { initialIdea } : {}),
     createdAt: now,
     updatedAt: now
+  });
+}
+
+export function createRestartedStudioKernel(project: Project): StudioKernel {
+  const now = new Date().toISOString();
+  return new StudioKernel({
+    ...project,
+    executionStatus: "running",
+    currentStage: "concept_discussion",
+    startedAt: now,
+    updatedAt: now
+  });
+}
+
+export function createStudioKernelFromSnapshot(snapshot: StudioKernelSnapshot): StudioKernel {
+  return new StudioKernel(snapshot.project, {
+    rooms: snapshot.rooms,
+    messages: snapshot.messages,
+    tasks: snapshot.tasks,
+    artifacts: snapshot.artifacts,
+    memoryRecords: snapshot.memoryRecords,
+    auditEvents: snapshot.auditEvents
   });
 }

@@ -20,11 +20,23 @@ export interface MemoryQuery {
 }
 
 export class InMemoryProductionMemory {
-  private readonly records: MemoryRecord[] = [];
+  private readonly records: MemoryRecord[];
+
+  constructor(records: MemoryRecord[] = []) {
+    this.records = [...records];
+  }
 
   write(record: MemoryRecord): MemoryRecord {
     this.records.push(record);
     return record;
+  }
+
+  list(projectId?: ProjectId): MemoryRecord[] {
+    if (!projectId) {
+      return [...this.records];
+    }
+
+    return this.records.filter((record) => record.projectId === projectId);
   }
 
   query(query: MemoryQuery): MemoryRecord[] {
