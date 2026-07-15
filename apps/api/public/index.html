@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Game Pipeline Agents</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">GP</div>
+          <div>
+            <h1>Game Pipeline Agents</h1>
+            <p>全流程微信小游戏 Agent Studio</p>
+          </div>
+        </div>
+
+        <section class="panel model-settings">
+          <div class="panel-heading">
+            <h2>模型配置</h2>
+            <span id="model-config-summary">未配置</span>
+          </div>
+          <form id="model-settings-form">
+            <label>
+              Provider
+              <select id="model-provider-select"></select>
+            </label>
+            <label>
+              Base URL
+              <input id="model-base-url" autocomplete="off" placeholder="https://api.example.com/v1" />
+            </label>
+            <label>
+              默认模型
+              <input id="model-name" autocomplete="off" placeholder="由 provider 或自定义网关决定" />
+            </label>
+            <label>
+              API Key
+              <input id="model-api-key" type="password" autocomplete="off" placeholder="保存后不会回显明文" />
+            </label>
+            <div class="key-actions">
+              <button type="submit">保存模型配置</button>
+              <button id="clear-model-key" type="button">清除 Key</button>
+            </div>
+          </form>
+          <div id="model-provider-status" class="provider-status"></div>
+        </section>
+
+        <form id="project-form" class="project-form">
+          <label>
+            项目名称
+            <input id="project-name" value="毛线球防守" autocomplete="off" />
+          </label>
+          <label>
+            初始 idea
+            <textarea id="project-idea" rows="7">做一个微信小游戏，玩家用点击防守毛线球，不让它们滚出篮子，单局一分钟，画风轻松可爱。</textarea>
+          </label>
+          <button type="submit">创建项目并启动 Agents</button>
+        </form>
+
+        <section class="panel">
+          <h2>房间</h2>
+          <div id="room-list" class="room-list"></div>
+        </section>
+      </aside>
+
+      <main class="chat-column">
+        <header class="topbar">
+          <div>
+            <div class="eyebrow">当前项目</div>
+            <h2 id="project-title">未创建</h2>
+          </div>
+          <div class="stage-pill" id="project-stage">等待 idea</div>
+        </header>
+
+        <section class="chat-panel">
+          <div id="message-list" class="message-list empty-state">创建项目后，策划和美术 Agent 会先进入开局讨论。</div>
+        </section>
+
+        <section class="composer">
+          <div class="quick-actions">
+            <button data-preset="stage1" type="button">确认立项</button>
+            <button data-preset="playable" type="button">首个可玩通过</button>
+            <button data-preset="release" type="button">批准发布</button>
+            <button data-preset="progress" type="button">询问进度</button>
+          </div>
+          <div class="composer-row">
+            <select id="message-type">
+              <option value="plan_submission">计划/需求</option>
+              <option value="decision_record">制作人决策</option>
+              <option value="change_request">变更请求</option>
+              <option value="progress_update">进度询问</option>
+            </select>
+            <textarea id="message-content" rows="3" placeholder="在当前房间向 Agent 群聊发送消息"></textarea>
+            <button id="send-message" type="button">发送</button>
+          </div>
+        </section>
+      </main>
+
+      <aside class="workspace-column">
+        <section class="panel">
+          <div class="panel-heading">
+            <h2>任务板</h2>
+            <span id="task-summary">0</span>
+          </div>
+          <div id="task-board" class="task-board"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-heading">
+            <h2>产物</h2>
+            <span id="artifact-summary">0</span>
+          </div>
+          <div id="artifact-list" class="artifact-list"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-heading">
+            <h2>Workspace</h2>
+            <span id="workspace-root">未生成</span>
+          </div>
+          <div id="workspace-tree" class="workspace-tree"></div>
+        </section>
+      </aside>
+    </div>
+
+    <div id="toast" class="toast" hidden></div>
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>
