@@ -142,8 +142,8 @@ export const defaultAgentContracts: AgentContract[] = [
   },
   {
     agentId: "cocos_tech_lead",
-    displayName: "Cocos Tech Lead Agent",
-    roleScope: "Owns Cocos architecture, scene strategy, asset loading, module boundaries, and performance budgets.",
+    displayName: "Cocos Architecture Agent",
+    roleScope: "Owns Cocos project architecture, scene blueprint strategy, asset loading contracts, module boundaries, and performance budgets without writing gameplay code or operating editor builds directly.",
     roomMemberships: ["engineering-room", "studio-main", "qa-room"],
     stageLeads: ["production"],
     modelProfile: {

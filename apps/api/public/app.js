@@ -82,7 +82,7 @@ const agentLabels = {
   game_designer: "策划 Agent",
   art_director: "美术导演 Agent",
   asset_production: "资产生产 Agent",
-  cocos_tech_lead: "Cocos 技术负责人",
+  cocos_tech_lead: "Cocos 架构 Agent",
   gameplay_programmer: "玩法程序 Agent",
   cocos_automation: "Cocos 自动化 Agent",
   qa_evaluator: "测试评估 Agent",
@@ -105,7 +105,7 @@ const mentionCandidates = [
   { agentId: "game_designer", token: "策划", aliases: ["game_designer", "游戏策划", "designer"] },
   { agentId: "art_director", token: "美术", aliases: ["art_director", "美术导演", "art"] },
   { agentId: "asset_production", token: "资产", aliases: ["asset_production", "资产生产"] },
-  { agentId: "cocos_tech_lead", token: "技术负责人", aliases: ["cocos_tech_lead", "cocos", "架构"] },
+  { agentId: "cocos_tech_lead", token: "架构", aliases: ["cocos_tech_lead", "cocos", "技术负责人", "工程结构"] },
   { agentId: "gameplay_programmer", token: "程序", aliases: ["gameplay_programmer", "玩法程序", "开发"] },
   { agentId: "cocos_automation", token: "自动化", aliases: ["cocos_automation", "编辑器"] },
   { agentId: "qa_evaluator", token: "QA", aliases: ["qa_evaluator", "测试", "评估"] },
@@ -116,6 +116,22 @@ const mentionCandidates = [
   ...candidate,
   label: agentLabels[candidate.agentId] ?? candidate.agentId
 }));
+
+const avatarThemes = {
+  producer: { initial: "制", color: "#8a6a2a" },
+  studio_orchestrator: { initial: "总", color: "#2f7d66" },
+  game_designer: { initial: "策", color: "#4f6fb3" },
+  producer_agent: { initial: "制", color: "#8a6a2a" },
+  art_director: { initial: "美", color: "#b45a7f" },
+  asset_production: { initial: "资", color: "#a0672b" },
+  cocos_tech_lead: { initial: "架", color: "#52606d" },
+  gameplay_programmer: { initial: "程", color: "#2d6d91" },
+  cocos_automation: { initial: "构", color: "#5b6cbb" },
+  qa_evaluator: { initial: "测", color: "#7a5aa8" },
+  wechat_platform: { initial: "微", color: "#23874f" },
+  devops: { initial: "运", color: "#6f6a43" },
+  liveops_analytics: { initial: "数", color: "#7a6650" }
+};
 
 const teamDefinitions = [
   {
@@ -185,11 +201,13 @@ const $ = (selector) => document.querySelector(selector);
 const settingsDialog = $("#settings-dialog");
 const startConfirmDialog = $("#start-confirm-dialog");
 const deleteConfirmDialog = $("#delete-confirm-dialog");
+const artifactPreviewDialog = $("#artifact-preview-dialog");
 const messageContentInput = $("#message-content");
 const mentionSuggestions = $("#mention-suggestions");
 let pendingStartProjectId = null;
 let pendingStartMode = "start";
 let pendingDeleteProjectId = null;
+let activePreviewArtifactId = null;
 let mentionState = {
   active: false,
   start: -1,
@@ -289,6 +307,24 @@ deleteConfirmDialog.addEventListener("click", (event) => {
   if (event.target === deleteConfirmDialog) {
     pendingDeleteProjectId = null;
     deleteConfirmDialog.close();
+  }
+});
+
+$("#close-artifact-preview").addEventListener("click", () => {
+  closeArtifactPreview();
+});
+
+$("#open-artifact-finder").addEventListener("click", () => {
+  if (!activePreviewArtifactId) {
+    showToast("请先选择一个交付物。");
+    return;
+  }
+  openArtifactInFinder(activePreviewArtifactId).catch((error) => showToast(error.message));
+});
+
+artifactPreviewDialog.addEventListener("click", (event) => {
+  if (event.target === artifactPreviewDialog) {
+    closeArtifactPreview();
   }
 });
 
@@ -489,13 +525,19 @@ $("#send-message").addEventListener("click", async () => {
       return;
     }
 
-    await sendProducerMessage({
+    ensureProject();
+    if (!canAgentsReceiveMessages()) {
+      throw new Error("项目未运行。请先启动或继续项目后再让 Agents 评审或执行。");
+    }
+
+    const payload = {
       roomKind: state.activeRoomKind,
       messageType: $("#message-type").value,
       content
-    });
+    };
     messageContentInput.value = "";
     hideMentionSuggestions();
+    await sendProducerMessage(payload);
   } catch (error) {
     showToast(error.message);
   }
@@ -577,11 +619,60 @@ async function sendProducerMessage(input) {
     throw new Error("项目未运行。请先启动或继续项目后再让 Agents 评审或执行。");
   }
 
-  await request(`/projects/${state.projectId}/messages`, {
-    method: "POST",
-    body: JSON.stringify(input)
+  const optimisticMessageId = appendOptimisticProducerMessage(input);
+  try {
+    await request(`/projects/${state.projectId}/messages`, {
+      method: "POST",
+      body: JSON.stringify(input)
+    });
+    await refreshProject();
+  } catch (error) {
+    markOptimisticMessageFailed(optimisticMessageId);
+    throw error;
+  }
+}
+
+function appendOptimisticProducerMessage(input) {
+  const activeRoom = state.rooms.find((room) => room.kind === (input.roomKind ?? state.activeRoomKind)) ?? state.rooms[0];
+  const messageId = `local_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const message = {
+    messageId,
+    projectId: state.projectId,
+    roomId: input.roomId ?? activeRoom?.roomId ?? state.activeRoomKind,
+    senderType: "producer",
+    senderId: state.project?.producerId ?? "producer_web",
+    messageType: input.messageType ?? "plan_submission",
+    content: input.content,
+    mentions: input.mentions ?? [],
+    relatedTaskIds: [],
+    relatedArtifactIds: [],
+    metadata: {
+      clientStatus: "pending"
+    },
+    createdAt: new Date().toISOString()
+  };
+  state.messages = [...state.messages, message];
+  renderRooms();
+  renderMessages();
+  return messageId;
+}
+
+function markOptimisticMessageFailed(messageId) {
+  state.messages = state.messages.map((message) => {
+    if (message.messageId !== messageId) {
+      return message;
+    }
+
+    return {
+      ...message,
+      metadata: {
+        ...(message.metadata ?? {}),
+        clientStatus: "failed"
+      }
+    };
   });
-  await refreshProject();
+  renderRooms();
+  renderMessages();
 }
 
 function buildPresetMessage(presetId, preset) {
@@ -894,16 +985,20 @@ function renderAgentAssignments() {
       const options = state.modelProviders
         .map(
           (provider) =>
-            `<option value="${escapeHtml(provider.providerId)}" ${provider.providerId === assignment.providerId ? "selected" : ""}>${escapeHtml(provider.label)}</option>`
+            `<option value="${escapeHtml(provider.providerId)}" ${provider.providerId === assignment.providerId ? "selected" : ""}>${escapeHtml(providerDisplayName(provider))}</option>`
         )
         .join("");
       return `<div class="assignment-row" data-agent-id="${escapeHtml(assignment.agentId)}">
-        <div class="assignment-meta">
-          <strong>${escapeHtml(displayName)}</strong>
-          <span>${escapeHtml(assignment.agentId)} · ${escapeHtml(capability)}</span>
+        <div class="assignment-agent">
+          ${avatarMarkup(assignment.agentId, displayName)}
+          <div class="assignment-meta">
+            <strong>${escapeHtml(displayName)}</strong>
+            <span>${escapeHtml(assignment.agentId)} · ${escapeHtml(capability)}</span>
+          </div>
         </div>
         <select data-assignment-provider>${options}</select>
-        <input data-assignment-model value="${escapeHtml(assignment.model)}" placeholder="使用 provider 默认模型" />
+        <input data-assignment-model value="${escapeHtml(assignment.model)}" placeholder="使用连接默认模型" />
+        <input data-assignment-avatar value="${escapeHtml(assignment.avatarUrl ?? "")}" placeholder="头像 URL（可选）" />
         <button data-save-assignment type="button">保存</button>
       </div>`;
     })
@@ -918,19 +1013,23 @@ function renderAgentAssignments() {
       try {
         const providerId = row.querySelector("[data-assignment-provider]").value;
         const model = row.querySelector("[data-assignment-model]").value;
-        await request(`/settings/model-assignments/${row.dataset.agentId}`, {
+        const avatarUrl = row.querySelector("[data-assignment-avatar]").value;
+        await request(`/settings/model-assignments/${encodeURIComponent(row.dataset.agentId)}`, {
           method: "PUT",
           body: JSON.stringify({
             providerId,
-            model
+            model,
+            avatarUrl
           })
         });
         const assignment = state.modelAssignments.find((candidate) => candidate.agentId === row.dataset.agentId);
         if (assignment) {
           assignment.providerId = providerId;
           assignment.model = model.trim();
+          assignment.avatarUrl = avatarUrl.trim();
         }
         button.textContent = "已保存";
+        renderMessages();
       } catch (error) {
         button.textContent = "失败";
         showToast(error.message);
@@ -1141,13 +1240,19 @@ function renderMessages() {
   list.innerHTML = messages
     .map((message) => {
       const senderClass = message.senderType === "producer" ? "producer" : "agent";
-      const sender = message.senderType === "producer" ? "制作人" : message.senderId;
-      return `<article class="message ${senderClass}">
-        <div class="message-meta">
-          <span>${escapeHtml(sender)} · ${escapeHtml(message.messageType)}</span>
-          <span>${new Date(message.createdAt).toLocaleTimeString()}</span>
+      const senderId = message.senderType === "producer" ? "producer" : message.senderId;
+      const sender = message.senderType === "producer" ? "制作人" : agentName(message.senderId);
+      const clientStatus = message.metadata?.clientStatus;
+      const statusText = clientStatus === "pending" ? " · 发送中" : clientStatus === "failed" ? " · 发送失败" : "";
+      return `<article class="message ${senderClass} ${clientStatus ? `message-${escapeHtml(clientStatus)}` : ""}">
+        ${avatarMarkup(senderId, sender)}
+        <div class="message-body">
+          <div class="message-meta">
+            <span>${escapeHtml(sender)} · ${escapeHtml(message.messageType)}${escapeHtml(statusText)}</span>
+            <span>${new Date(message.createdAt).toLocaleTimeString()}</span>
+          </div>
+          <div class="message-content">${escapeHtml(message.content)}</div>
         </div>
-        <div class="message-content">${escapeHtml(message.content)}</div>
       </article>`;
     })
     .join("");
@@ -1204,17 +1309,77 @@ function renderArtifacts() {
   $("#artifact-summary").textContent = String(deliverables.length);
   $("#artifact-list").innerHTML =
     deliverables
-      .map((artifact) => `<div class="deliverable-item">
-        <div>
-          <strong>${escapeHtml(deliverableName(artifact))}</strong>
-          <span>${escapeHtml(agentName(artifact.ownerAgentId))} · ${escapeHtml(stageLabels[artifact.stageId] ?? artifact.stageId)}</span>
-        </div>
-        <span class="status-pill status-${escapeHtml(artifact.status)}">${escapeHtml(localStatus(artifact.status))}</span>
+      .map((artifact) => `<div class="deliverable-row" data-artifact-id="${escapeHtml(artifact.artifactId)}">
+        <button class="deliverable-item" data-preview-artifact type="button" title="预览交付物">
+          <div>
+            <strong>${escapeHtml(deliverableName(artifact))}</strong>
+            <span>${escapeHtml(agentName(artifact.ownerAgentId))} · ${escapeHtml(stageLabels[artifact.stageId] ?? artifact.stageId)}</span>
+          </div>
+          <span class="status-pill status-${escapeHtml(artifact.status)}">${escapeHtml(localStatus(artifact.status))}</span>
+        </button>
+        <button class="deliverable-action-button" data-open-artifact type="button" title="在 Finder 打开" aria-label="在 Finder 打开">${folderIcon()}</button>
       </div>`)
       .join("") || `<div class="producer-empty-panel">
         <strong>暂无可评审交付物</strong>
         <span>Agent 完成阶段输出后会在这里出现。</span>
       </div>`;
+
+  $("#artifact-list").querySelectorAll("[data-preview-artifact]").forEach((button) => {
+    button.addEventListener("click", () => {
+      previewArtifact(button.closest("[data-artifact-id]").dataset.artifactId).catch((error) => showToast(error.message));
+    });
+  });
+  $("#artifact-list").querySelectorAll("[data-open-artifact]").forEach((button) => {
+    button.addEventListener("click", () => {
+      openArtifactInFinder(button.closest("[data-artifact-id]").dataset.artifactId).catch((error) => showToast(error.message));
+    });
+  });
+}
+
+async function previewArtifact(artifactId) {
+  ensureProject();
+  activePreviewArtifactId = artifactId;
+  const artifact = state.artifacts.find((candidate) => candidate.artifactId === artifactId);
+  $("#artifact-preview-title").textContent = artifact ? deliverableName(artifact) : "交付物预览";
+  $("#artifact-preview-path").textContent = "正在读取本地工作空间...";
+  $("#artifact-preview-body").innerHTML = '<div class="producer-empty-panel"><strong>正在加载</strong><span>正在读取交付物预览。</span></div>';
+  if (!artifactPreviewDialog.open) {
+    artifactPreviewDialog.showModal();
+  }
+
+  const preview = await request(`/projects/${state.projectId}/artifacts/${encodeURIComponent(artifactId)}/preview`);
+  renderArtifactPreview(preview);
+}
+
+function renderArtifactPreview(preview) {
+  const artifact = preview.artifact;
+  activePreviewArtifactId = artifact.artifactId;
+  $("#artifact-preview-title").textContent = deliverableName(artifact);
+  $("#artifact-preview-path").textContent = preview.target?.relativePath ?? artifact.path;
+  $("#open-artifact-finder").disabled = !preview.target?.exists;
+  if (!preview.previewable) {
+    $("#artifact-preview-body").innerHTML = `<div class="producer-empty-panel">
+      <strong>暂不支持内嵌预览</strong>
+      <span>${escapeHtml(preview.reason ?? "该交付物需要在本地应用中查看。")}</span>
+    </div>`;
+    return;
+  }
+
+  const languageClass = preview.language ? ` artifact-preview-${escapeHtml(preview.language)}` : "";
+  $("#artifact-preview-body").innerHTML = `<pre class="artifact-preview-document${languageClass}">${escapeHtml(preview.content ?? "")}</pre>`;
+}
+
+async function openArtifactInFinder(artifactId) {
+  ensureProject();
+  await request(`/projects/${state.projectId}/artifacts/${encodeURIComponent(artifactId)}/open`, {
+    method: "POST"
+  });
+  showToast("已在 Finder 中打开交付物位置。");
+}
+
+function closeArtifactPreview() {
+  activePreviewArtifactId = null;
+  artifactPreviewDialog.close();
 }
 
 function renderWorkspace() {
@@ -1439,6 +1604,10 @@ function playIcon() {
 
 function pauseIcon() {
   return '<svg aria-hidden="true" viewBox="0 0 24 24" width="16" height="16"><path d="M7 5h4v14H7V5Zm6 0h4v14h-4V5Z" fill="currentColor"></path></svg>';
+}
+
+function folderIcon() {
+  return '<svg aria-hidden="true" viewBox="0 0 24 24" width="16" height="16"><path d="M3 6a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v1H3V6Zm0 5h18l-2 8H5l-2-8Z" fill="currentColor"></path></svg>';
 }
 
 function trashIcon() {

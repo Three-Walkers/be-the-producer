@@ -199,6 +199,22 @@
       </div>
     </dialog>
 
+    <dialog id="artifact-preview-dialog" class="artifact-preview-dialog">
+      <div class="artifact-preview-surface">
+        <header class="artifact-preview-header">
+          <div>
+            <h2 id="artifact-preview-title">交付物预览</h2>
+            <p id="artifact-preview-path">等待选择交付物</p>
+          </div>
+          <div class="artifact-preview-actions">
+            <button id="open-artifact-finder" type="button">在 Finder 打开</button>
+            <button id="close-artifact-preview" class="icon-button" type="button" aria-label="关闭预览" title="关闭">×</button>
+          </div>
+        </header>
+        <div id="artifact-preview-body" class="artifact-preview-body"></div>
+      </div>
+    </dialog>
+
     <div id="toast" class="toast" hidden></div>
     <script src="/app.js" type="module"></script>
   </body>
