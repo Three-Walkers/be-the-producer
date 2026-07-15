@@ -3,11 +3,13 @@ const state = {
   project: null,
   rooms: [],
   activeRoomKind: "studio-main",
+  projectSummaries: [],
   messages: [],
   taskBoard: null,
   artifacts: [],
   workspace: null,
   modelProviders: [],
+  modelAssignments: [],
   selectedModelProviderId: "openai"
 };
 
@@ -54,10 +56,195 @@ const roomLabels = {
   "release-room": "发布运维室"
 };
 
+const agentLabels = {
+  studio_orchestrator: "总控 Agent",
+  producer: "制作人协调",
+  game_designer: "策划 Agent",
+  art_director: "美术导演 Agent",
+  asset_production: "资产生产 Agent",
+  cocos_tech_lead: "Cocos 技术负责人",
+  gameplay_programmer: "玩法程序 Agent",
+  cocos_automation: "Cocos 自动化 Agent",
+  qa_evaluator: "测试评估 Agent",
+  wechat_platform: "微信平台 Agent",
+  devops: "运维 Agent",
+  liveops_analytics: "运营分析 Agent"
+};
+
+const teamDefinitions = [
+  {
+    teamId: "design",
+    name: "策划团队",
+    agents: ["game_designer", "producer"],
+    idle: "等待项目启动，启动后先进行立项、机制和第一可玩范围讨论。"
+  },
+  {
+    teamId: "art",
+    name: "美术团队",
+    agents: ["art_director", "asset_production"],
+    idle: "等待项目启动，启动后确认视觉方向并进入资产生产。"
+  },
+  {
+    teamId: "engineering",
+    name: "程序团队",
+    agents: ["cocos_tech_lead", "gameplay_programmer", "cocos_automation"],
+    idle: "等待策划和美术基线确认后，推进 Cocos 工程、玩法实现和构建。"
+  },
+  {
+    teamId: "qa",
+    name: "测试评估团队",
+    agents: ["qa_evaluator"],
+    idle: "等待可玩版本生成后，执行试玩、门禁和问题评估。"
+  },
+  {
+    teamId: "release",
+    name: "发布运维团队",
+    agents: ["wechat_platform", "devops", "liveops_analytics"],
+    idle: "等待发布审批后，负责微信发布、部署记录、回滚和运营迭代。"
+  }
+];
+
+const artifactTypeLabels = {
+  gdd: "玩法方案",
+  art_bible: "美术方向",
+  asset_spec: "资产规格",
+  asset: "美术资产",
+  asset_manifest: "资产清单",
+  scene_blueprint: "场景蓝图",
+  source_code: "代码变更",
+  build: "可玩构建",
+  qa_report: "测试报告",
+  bug_report: "问题报告",
+  deployment_report: "部署记录",
+  rollback_plan: "回滚方案",
+  release_notes: "运营迭代说明"
+};
+
+const statusLabels = {
+  todo: "待办",
+  doing: "进行中",
+  review: "评审中",
+  blocked: "阻塞",
+  done: "完成",
+  cancelled: "已取消",
+  draft: "草案",
+  submitted: "已提交",
+  approved: "已批准",
+  change_requested: "需调整",
+  rejected: "已驳回",
+  superseded: "已替换"
+};
+
 const $ = (selector) => document.querySelector(selector);
+const settingsDialog = $("#settings-dialog");
+const startConfirmDialog = $("#start-confirm-dialog");
+const deleteConfirmDialog = $("#delete-confirm-dialog");
+let pendingStartProjectId = null;
+let pendingDeleteProjectId = null;
+
+$("#open-settings").addEventListener("click", () => {
+  settingsDialog.showModal();
+});
+
+$("#close-settings").addEventListener("click", () => {
+  settingsDialog.close();
+});
+
+settingsDialog.addEventListener("click", (event) => {
+  if (event.target === settingsDialog) {
+    settingsDialog.close();
+  }
+});
+
+$("#cancel-start-project").addEventListener("click", () => {
+  pendingStartProjectId = null;
+  startConfirmDialog.close();
+});
+
+$("#confirm-start-project").addEventListener("click", async () => {
+  if (!pendingStartProjectId) {
+    return;
+  }
+
+  const button = $("#confirm-start-project");
+  const projectId = pendingStartProjectId;
+  button.disabled = true;
+  button.textContent = "启动中";
+  try {
+    const started = await request(`/projects/${projectId}/start`, {
+      method: "POST"
+    });
+    state.projectId = started.project.projectId;
+    state.project = started.project;
+    state.rooms = started.rooms;
+    state.workspace = started.workspace;
+    state.activeRoomKind = "studio-main";
+    pendingStartProjectId = null;
+    startConfirmDialog.close();
+    await loadProjects({ autoOpenLatest: false });
+    await refreshProject();
+    showToast("项目已启动，Agents 已从初始 idea 重新开始。");
+  } catch (error) {
+    showToast(error.message);
+  } finally {
+    button.disabled = false;
+    button.textContent = "确认启动";
+  }
+});
+
+startConfirmDialog.addEventListener("click", (event) => {
+  if (event.target === startConfirmDialog) {
+    pendingStartProjectId = null;
+    startConfirmDialog.close();
+  }
+});
+
+$("#cancel-delete-project").addEventListener("click", () => {
+  pendingDeleteProjectId = null;
+  deleteConfirmDialog.close();
+});
+
+$("#confirm-delete-project").addEventListener("click", async () => {
+  if (!pendingDeleteProjectId) {
+    return;
+  }
+
+  const button = $("#confirm-delete-project");
+  const projectId = pendingDeleteProjectId;
+  button.disabled = true;
+  button.textContent = "删除中";
+  try {
+    await request(`/projects/${projectId}`, {
+      method: "DELETE"
+    });
+    if (state.projectId === projectId) {
+      clearCurrentProject();
+    }
+    pendingDeleteProjectId = null;
+    deleteConfirmDialog.close();
+    await loadProjects({ autoOpenLatest: !state.projectId });
+    showToast("项目已删除。");
+  } catch (error) {
+    showToast(error.message);
+  } finally {
+    button.disabled = false;
+    button.textContent = "确认删除";
+  }
+});
+
+deleteConfirmDialog.addEventListener("click", (event) => {
+  if (event.target === deleteConfirmDialog) {
+    pendingDeleteProjectId = null;
+    deleteConfirmDialog.close();
+  }
+});
 
 $("#model-settings-form").addEventListener("submit", async (event) => {
   event.preventDefault();
+  const button = $("#model-settings-form button[type='submit']");
+  const originalText = button.textContent;
+  button.disabled = true;
+  button.textContent = "保存中";
   try {
     const providerId = $("#model-provider-select").value;
     const apiKey = $("#model-api-key").value.trim();
@@ -75,9 +262,15 @@ $("#model-settings-form").addEventListener("submit", async (event) => {
     });
     $("#model-api-key").value = "";
     await loadModelProviders();
-    showToast("模型配置已保存到本机 secret store。");
+    button.textContent = "已保存";
   } catch (error) {
+    button.textContent = "失败";
     showToast(error.message);
+  } finally {
+    setTimeout(() => {
+      button.disabled = false;
+      button.textContent = originalText;
+    }, 1200);
   }
 });
 
@@ -87,6 +280,10 @@ $("#model-provider-select").addEventListener("change", () => {
 });
 
 $("#clear-model-key").addEventListener("click", async () => {
+  const button = $("#clear-model-key");
+  const originalText = button.textContent;
+  button.disabled = true;
+  button.textContent = "清除中";
   try {
     const providerId = $("#model-provider-select").value;
     await request(`/settings/model-providers/${providerId}`, {
@@ -94,9 +291,15 @@ $("#clear-model-key").addEventListener("click", async () => {
     });
     $("#model-api-key").value = "";
     await loadModelProviders();
-    showToast("模型 API key 已清除。");
+    button.textContent = "已清除";
   } catch (error) {
+    button.textContent = "失败";
     showToast(error.message);
+  } finally {
+    setTimeout(() => {
+      button.disabled = false;
+      button.textContent = originalText;
+    }, 1200);
   }
 });
 
@@ -120,7 +323,8 @@ $("#project-form").addEventListener("submit", async (event) => {
     state.workspace = created.workspace;
     state.activeRoomKind = "studio-main";
     await refreshProject();
-    showToast("项目已创建，策划和美术 Agent 已开始开局讨论。");
+    await loadProjects({ autoOpenLatest: false });
+    showToast("项目已创建。点击项目列表里的启动图标后，Agents 才会开始执行。");
   } catch (error) {
     showToast(error.message);
   }
@@ -189,9 +393,25 @@ async function refreshProject() {
   render();
 }
 
+async function loadProjects({ autoOpenLatest = true } = {}) {
+  const listing = await request("/projects");
+  state.projectSummaries = listing.projects;
+  renderProjectList();
+  if (autoOpenLatest && !state.projectId && state.projectSummaries.length > 0) {
+    await loadProject(state.projectSummaries[0].projectId);
+  }
+}
+
+async function loadProject(projectId) {
+  state.projectId = projectId;
+  state.activeRoomKind = "studio-main";
+  await refreshProject();
+}
+
 function render() {
   renderModelSettings();
   renderProjectHeader();
+  renderProjectList();
   renderRooms();
   renderMessages();
   renderTaskBoard();
@@ -202,6 +422,7 @@ function render() {
 async function loadModelProviders() {
   const settings = await request("/settings/model-providers");
   state.modelProviders = settings.providers;
+  state.modelAssignments = settings.assignments ?? [];
   if (!state.modelProviders.some((provider) => provider.providerId === state.selectedModelProviderId)) {
     state.selectedModelProviderId = state.modelProviders[0]?.providerId ?? "openai";
   }
@@ -214,6 +435,7 @@ function renderModelSettings() {
     select.innerHTML = "";
     $("#model-config-summary").textContent = "未加载";
     $("#model-provider-status").innerHTML = '<div class="empty-state compact">正在读取模型配置</div>';
+    $("#agent-model-assignments").innerHTML = '<div class="empty-state compact">正在读取角色模型分配</div>';
     return;
   }
 
@@ -243,11 +465,174 @@ function renderModelSettings() {
       renderModelSettings();
     });
   });
+  renderAgentAssignments();
+}
+
+function renderAgentAssignments() {
+  const container = $("#agent-model-assignments");
+  $("#assignment-summary").textContent = `${state.modelAssignments.length} roles`;
+  if (!state.modelAssignments.length) {
+    container.innerHTML = '<div class="empty-state compact">暂无角色模型分配</div>';
+    return;
+  }
+
+  container.innerHTML = state.modelAssignments
+    .map((assignment) => {
+      const options = state.modelProviders
+        .map(
+          (provider) =>
+            `<option value="${escapeHtml(provider.providerId)}" ${provider.providerId === assignment.providerId ? "selected" : ""}>${escapeHtml(provider.label)}</option>`
+        )
+        .join("");
+      return `<div class="assignment-row" data-agent-id="${escapeHtml(assignment.agentId)}">
+        <div class="assignment-meta">
+          <strong>${escapeHtml(assignment.displayName)}</strong>
+          <span>${escapeHtml(assignment.agentId)} · ${escapeHtml(assignment.capability)}</span>
+        </div>
+        <select data-assignment-provider>${options}</select>
+        <input data-assignment-model value="${escapeHtml(assignment.model)}" placeholder="使用 provider 默认模型" />
+        <button data-save-assignment type="button">保存</button>
+      </div>`;
+    })
+    .join("");
+
+  container.querySelectorAll("[data-save-assignment]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const row = button.closest("[data-agent-id]");
+      const originalText = button.textContent;
+      button.disabled = true;
+      button.textContent = "保存中";
+      try {
+        const providerId = row.querySelector("[data-assignment-provider]").value;
+        const model = row.querySelector("[data-assignment-model]").value;
+        await request(`/settings/model-assignments/${row.dataset.agentId}`, {
+          method: "PUT",
+          body: JSON.stringify({
+            providerId,
+            model
+          })
+        });
+        const assignment = state.modelAssignments.find((candidate) => candidate.agentId === row.dataset.agentId);
+        if (assignment) {
+          assignment.providerId = providerId;
+          assignment.model = model.trim();
+        }
+        button.textContent = "已保存";
+      } catch (error) {
+        button.textContent = "失败";
+        showToast(error.message);
+      } finally {
+        setTimeout(() => {
+          button.disabled = false;
+          button.textContent = originalText;
+        }, 1200);
+      }
+    });
+  });
 }
 
 function renderProjectHeader() {
   $("#project-title").textContent = state.project?.name ?? "未创建";
-  $("#project-stage").textContent = state.project ? stageLabels[state.project.currentStage] ?? state.project.currentStage : "等待 idea";
+  if (!state.project) {
+    $("#project-stage").textContent = "等待 idea";
+    return;
+  }
+
+  $("#project-stage").textContent = isProjectStarted()
+    ? `${stageLabels[state.project.currentStage] ?? state.project.currentStage} · ${executionLabel(currentExecutionStatus())}`
+    : "未启动";
+}
+
+function renderProjectList() {
+  const list = $("#project-list");
+  $("#project-list-summary").textContent = String(state.projectSummaries.length);
+  if (!state.projectSummaries.length) {
+    list.innerHTML = '<div class="empty-state compact">暂无已保存项目</div>';
+    return;
+  }
+
+  list.innerHTML = state.projectSummaries
+    .map((project) => {
+      const active = project.projectId === state.projectId ? " active" : "";
+      const stage = stageLabels[project.currentStage] ?? project.currentStage;
+      const execution = project.executionStatus ?? "draft";
+      const startLabel = execution === "running" ? "重新启动项目" : "启动项目";
+      return `<div class="project-row${active}" data-project-id="${escapeHtml(project.projectId)}">
+        <button class="project-open" data-open-project type="button" title="打开项目" aria-label="打开项目">
+          <span>
+            <strong>${escapeHtml(project.name)}</strong>
+            <small>${escapeHtml(stage)} · ${escapeHtml(executionLabel(execution))} · ${new Date(project.savedAt).toLocaleString()}</small>
+          </span>
+        </button>
+        <div class="project-actions">
+          <button class="project-action-button" data-start-project type="button" title="${startLabel}" aria-label="${startLabel}">${playIcon()}</button>
+          <button class="project-action-button danger-icon-button" data-delete-project type="button" title="删除项目" aria-label="删除项目">${trashIcon()}</button>
+        </div>
+      </div>`;
+    })
+    .join("");
+
+  list.querySelectorAll("[data-open-project]").forEach((button) => {
+    button.addEventListener("click", () => {
+      loadProject(button.closest("[data-project-id]").dataset.projectId).catch((error) => showToast(error.message));
+    });
+  });
+  list.querySelectorAll("[data-start-project]").forEach((button) => {
+    button.addEventListener("click", () => {
+      requestStartProject(button.closest("[data-project-id]").dataset.projectId);
+    });
+  });
+  list.querySelectorAll("[data-delete-project]").forEach((button) => {
+    button.addEventListener("click", () => {
+      requestDeleteProject(button.closest("[data-project-id]").dataset.projectId);
+    });
+  });
+}
+
+function requestStartProject(projectId) {
+  const target = state.projectSummaries.find((project) => project.projectId === projectId);
+  const running = state.projectSummaries.find((project) => project.executionStatus === "running");
+  pendingStartProjectId = projectId;
+  const base = `即将启动「${target?.name ?? projectId}」，Agents 会从该项目的初始 idea 重新开始流程。`;
+  const interruption =
+    running && running.projectId !== projectId
+      ? `当前正在执行「${running.name}」，确认后会先暂停它，再切换到新项目。`
+      : "确认后会清空该项目当前运行态并重新开始。";
+  $("#start-confirm-message").textContent = `${base}${interruption}`;
+  startConfirmDialog.showModal();
+}
+
+function requestDeleteProject(projectId) {
+  const target = state.projectSummaries.find((project) => project.projectId === projectId);
+  pendingDeleteProjectId = projectId;
+  $("#delete-confirm-message").textContent = `确认删除「${target?.name ?? projectId}」？删除后会移除本地进度、任务记录和工作空间文件。`;
+  deleteConfirmDialog.showModal();
+}
+
+function executionLabel(status) {
+  switch (status) {
+    case "running":
+      return "执行中";
+    case "paused":
+      return "已暂停";
+    case "completed":
+      return "已完成";
+    case "draft":
+    default:
+      return "未启动";
+  }
+}
+
+function clearCurrentProject() {
+  state.projectId = null;
+  state.project = null;
+  state.rooms = [];
+  state.activeRoomKind = "studio-main";
+  state.messages = [];
+  state.taskBoard = null;
+  state.artifacts = [];
+  state.workspace = null;
+  render();
 }
 
 function renderRooms() {
@@ -303,25 +688,34 @@ function renderMessages() {
 
 function renderTaskBoard() {
   const board = $("#task-board");
-  if (!state.taskBoard) {
+  if (!isProjectStarted()) {
+    $("#task-summary").textContent = "未启动";
+    board.innerHTML = `<div class="producer-empty-panel">
+      <strong>项目尚未启动</strong>
+      <span>点击项目列表中的启动图标并确认后，Agents 才会生成任务和进入执行状态。</span>
+    </div>`;
+    return;
+  }
+
+  if (!state.taskBoard || state.taskBoard.total === 0) {
     $("#task-summary").textContent = "0";
-    board.innerHTML = '<div class="empty-state">暂无任务</div>';
+    board.innerHTML = '<div class="producer-empty-panel"><strong>暂无任务</strong><span>等待 Agent 创建阶段任务。</span></div>';
     return;
   }
 
   const buckets = state.taskBoard.buckets;
-  $("#task-summary").textContent = `${state.taskBoard.total} tasks · done ${buckets.done}`;
+  $("#task-summary").textContent = `${state.taskBoard.total} 项 · 完成 ${buckets.done}`;
   board.innerHTML = state.taskBoard.taskGroups
     .map((group) => `<section class="task-group">
       <div class="task-title">
         <span>${escapeHtml(group.title)}</span>
-        <span class="status-${escapeHtml(group.status)}">${escapeHtml(group.status)}</span>
+        <span class="status-pill status-${escapeHtml(group.status)}">${escapeHtml(localStatus(group.status))}</span>
       </div>
       ${group.tasks
         .map((task) => `<div class="task-item">
           <strong>${escapeHtml(task.title)}</strong>
-          <div>${escapeHtml(task.ownerAgentId)} · <span class="status-${escapeHtml(task.status)}">${escapeHtml(task.status)}</span> · ${task.progressPercent ?? 0}%</div>
-          ${task.blockers.length ? `<div>Blockers: ${escapeHtml(task.blockers.join("; "))}</div>` : ""}
+          <div>${escapeHtml(agentName(task.ownerAgentId))} · <span class="status-${escapeHtml(task.status)}">${escapeHtml(localStatus(task.status))}</span> · ${task.progressPercent ?? 0}%</div>
+          ${task.blockers.length ? `<div>阻塞：${escapeHtml(task.blockers.join("；"))}</div>` : ""}
         </div>`)
         .join("")}
     </section>`)
@@ -329,32 +723,161 @@ function renderTaskBoard() {
 }
 
 function renderArtifacts() {
-  $("#artifact-summary").textContent = String(state.artifacts.length);
-  $("#artifact-list").innerHTML =
-    state.artifacts
-      .map((artifact) => `<div class="artifact-item">
-        <strong>${escapeHtml(artifact.type)}</strong> · ${escapeHtml(artifact.ownerAgentId)} · <span class="status-${escapeHtml(artifact.status)}">${escapeHtml(artifact.status)}</span>
-        <code>${escapeHtml(artifact.path)}</code>
-      </div>`)
-      .join("") || '<div class="empty-state">暂无产物</div>';
-}
-
-function renderWorkspace() {
-  if (!state.workspace) {
-    $("#workspace-root").textContent = "未生成";
-    $("#workspace-tree").innerHTML = '<div class="empty-state">暂无工作空间</div>';
+  if (!isProjectStarted()) {
+    $("#artifact-summary").textContent = "待启动";
+    $("#artifact-list").innerHTML = `<div class="producer-empty-panel">
+      <strong>暂无可评审交付物</strong>
+      <span>项目启动后，这里只展示需要制作人查看或审批的交付内容，不展示内部文档路径。</span>
+    </div>`;
     return;
   }
 
-  $("#workspace-root").textContent = state.workspace.projectRoot.split("/").slice(-2).join("/");
-  const files = state.workspace.entries.filter((entry) => entry.type === "file").slice(0, 80);
-  $("#workspace-tree").innerHTML =
-    files
-      .map((entry) => `<div class="tree-item">
-        ${entry.sizeBytes ?? 0} bytes
-        <code>${escapeHtml(entry.path)}</code>
+  const deliverables = state.artifacts.filter((artifact) => artifact.status !== "superseded" && artifact.status !== "rejected");
+  $("#artifact-summary").textContent = String(deliverables.length);
+  $("#artifact-list").innerHTML =
+    deliverables
+      .map((artifact) => `<div class="deliverable-item">
+        <div>
+          <strong>${escapeHtml(deliverableName(artifact))}</strong>
+          <span>${escapeHtml(agentName(artifact.ownerAgentId))} · ${escapeHtml(stageLabels[artifact.stageId] ?? artifact.stageId)}</span>
+        </div>
+        <span class="status-pill status-${escapeHtml(artifact.status)}">${escapeHtml(localStatus(artifact.status))}</span>
       </div>`)
-      .join("") || '<div class="empty-state">暂无工作空间文件</div>';
+      .join("") || `<div class="producer-empty-panel">
+        <strong>暂无可评审交付物</strong>
+        <span>Agent 完成阶段输出后会在这里出现。</span>
+      </div>`;
+}
+
+function renderWorkspace() {
+  $("#workspace-root").textContent = isProjectStarted() ? executionLabel(currentExecutionStatus()) : "制作人视图";
+
+  if (!state.project) {
+    $("#workspace-tree").innerHTML = '<div class="producer-empty-panel"><strong>暂无项目</strong><span>创建项目后，这里会展示各团队最新进展。</span></div>';
+    return;
+  }
+
+  if (!isProjectStarted()) {
+    $("#workspace-tree").innerHTML = teamDefinitions
+      .map((team) => `<div class="team-progress-item">
+        <div class="team-progress-head">
+          <strong>${escapeHtml(team.name)}</strong>
+          <span class="status-pill status-todo">待启动</span>
+        </div>
+        <p>${escapeHtml(team.idle)}</p>
+      </div>`)
+      .join("");
+    return;
+  }
+
+  $("#workspace-tree").innerHTML = teamDefinitions
+    .map((team) => renderTeamProgress(team))
+    .join("");
+}
+
+function renderTeamProgress(team) {
+  const tasks = collectTaskItems().filter((task) => team.agents.includes(task.ownerAgentId));
+  const recentMessage = [...state.messages].reverse().find((message) => team.agents.includes(message.senderId));
+  const activeTask = pickActiveTask(tasks);
+  const doneCount = tasks.filter((task) => task.status === "done").length;
+  const blockedCount = tasks.filter((task) => task.status === "blocked").length;
+  const status = blockedCount > 0 ? "blocked" : activeTask?.status ?? (doneCount > 0 ? "done" : "todo");
+  const progress = tasks.length ? Math.round(tasks.reduce((sum, task) => sum + (task.progressPercent ?? statusProgress(task.status)), 0) / tasks.length) : 0;
+  const headline = activeTask
+    ? `${localStatus(activeTask.status)}：${activeTask.title}`
+    : recentMessage
+      ? "暂无进行中任务，已记录最近沟通。"
+      : team.idle;
+  const recent = recentMessage ? summarizeText(recentMessage.content, 72) : "暂无最新发言";
+  const agents = team.agents.map((agentId) => agentName(agentId)).join("、");
+
+  return `<div class="team-progress-item">
+    <div class="team-progress-head">
+      <strong>${escapeHtml(team.name)}</strong>
+      <span class="status-pill status-${escapeHtml(status)}">${escapeHtml(localStatus(status))}</span>
+    </div>
+    <p>${escapeHtml(headline)}</p>
+    <div class="team-progress-bar" aria-label="${escapeHtml(team.name)}进度">
+      <span style="width: ${Math.max(0, Math.min(progress, 100))}%"></span>
+    </div>
+    <div class="team-progress-meta">
+      <span>${tasks.length ? `${doneCount}/${tasks.length} 项完成` : "暂无任务"}</span>
+      <span>${progress}%</span>
+    </div>
+    <small>成员：${escapeHtml(agents)}</small>
+    <small>最新：${escapeHtml(recent)}</small>
+  </div>`;
+}
+
+function collectTaskItems() {
+  if (!state.taskBoard) {
+    return [];
+  }
+
+  const items = [];
+  const visit = (task) => {
+    items.push(task);
+    (task.subtasks ?? []).forEach(visit);
+  };
+  state.taskBoard.taskGroups.forEach((group) => {
+    group.tasks.forEach(visit);
+  });
+  return items;
+}
+
+function pickActiveTask(tasks) {
+  return (
+    tasks.find((task) => task.status === "blocked") ??
+    tasks.find((task) => task.status === "doing") ??
+    tasks.find((task) => task.status === "review") ??
+    tasks.find((task) => task.status === "todo") ??
+    tasks[0]
+  );
+}
+
+function currentExecutionStatus() {
+  return state.project?.executionStatus ?? "draft";
+}
+
+function isProjectStarted() {
+  return ["running", "paused", "completed"].includes(currentExecutionStatus());
+}
+
+function agentName(agentId) {
+  return agentLabels[agentId] ?? agentId;
+}
+
+function localStatus(status) {
+  return statusLabels[status] ?? status;
+}
+
+function deliverableName(artifact) {
+  const type = artifactTypeLabels[artifact.type] ?? artifact.type;
+  const version = artifact.version ? ` v${artifact.version}` : "";
+  return `${type}${version}`;
+}
+
+function statusProgress(status) {
+  switch (status) {
+    case "done":
+      return 100;
+    case "review":
+      return 80;
+    case "doing":
+      return 50;
+    case "blocked":
+      return 35;
+    case "cancelled":
+      return 0;
+    case "todo":
+    default:
+      return 0;
+  }
+}
+
+function summarizeText(text, limit) {
+  const normalized = String(text).replace(/\s+/g, " ").trim();
+  return normalized.length > limit ? `${normalized.slice(0, limit - 1)}…` : normalized;
 }
 
 async function request(path, options = {}) {
@@ -389,6 +912,14 @@ function showToast(message) {
   }, 2400);
 }
 
+function playIcon() {
+  return '<svg aria-hidden="true" viewBox="0 0 24 24" width="16" height="16"><path d="M8 5v14l11-7z" fill="currentColor"></path></svg>';
+}
+
+function trashIcon() {
+  return '<svg aria-hidden="true" viewBox="0 0 24 24" width="16" height="16"><path d="M9 3h6l1 2h4v2H4V5h4l1-2Zm1 6h2v9h-2V9Zm4 0h2v9h-2V9ZM7 9h2v10h8V9h2v10a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2V9Z" fill="currentColor"></path></svg>';
+}
+
 function escapeHtml(value) {
   return String(value)
     .replaceAll("&", "&amp;")
@@ -400,3 +931,4 @@ function escapeHtml(value) {
 
 render();
 loadModelProviders().catch((error) => showToast(error.message));
+loadProjects().catch((error) => showToast(error.message));

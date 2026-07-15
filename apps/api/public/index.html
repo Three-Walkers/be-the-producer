@@ -10,42 +10,15 @@
     <div class="app-shell">
       <aside class="sidebar">
         <div class="brand">
-          <div class="brand-mark">GP</div>
-          <div>
-            <h1>Game Pipeline Agents</h1>
-            <p>全流程微信小游戏 Agent Studio</p>
-          </div>
-        </div>
-
-        <section class="panel model-settings">
-          <div class="panel-heading">
-            <h2>模型配置</h2>
-            <span id="model-config-summary">未配置</span>
-          </div>
-          <form id="model-settings-form">
-            <label>
-              Provider
-              <select id="model-provider-select"></select>
-            </label>
-            <label>
-              Base URL
-              <input id="model-base-url" autocomplete="off" placeholder="https://api.example.com/v1" />
-            </label>
-            <label>
-              默认模型
-              <input id="model-name" autocomplete="off" placeholder="由 provider 或自定义网关决定" />
-            </label>
-            <label>
-              API Key
-              <input id="model-api-key" type="password" autocomplete="off" placeholder="保存后不会回显明文" />
-            </label>
-            <div class="key-actions">
-              <button type="submit">保存模型配置</button>
-              <button id="clear-model-key" type="button">清除 Key</button>
+          <div class="brand-main">
+            <div class="brand-mark">GP</div>
+            <div>
+              <h1>Game Pipeline Agents</h1>
+              <p>全流程微信小游戏 Agent Studio</p>
             </div>
-          </form>
-          <div id="model-provider-status" class="provider-status"></div>
-        </section>
+          </div>
+          <button id="open-settings" class="icon-button" type="button" aria-label="打开设置" title="设置">⚙</button>
+        </div>
 
         <form id="project-form" class="project-form">
           <label>
@@ -56,8 +29,16 @@
             初始 idea
             <textarea id="project-idea" rows="7">做一个微信小游戏，玩家用点击防守毛线球，不让它们滚出篮子，单局一分钟，画风轻松可爱。</textarea>
           </label>
-          <button type="submit">创建项目并启动 Agents</button>
+          <button type="submit">创建项目</button>
         </form>
+
+        <section class="panel">
+          <div class="panel-heading">
+            <h2>已有项目</h2>
+            <span id="project-list-summary">0</span>
+          </div>
+          <div id="project-list" class="project-list"></div>
+        </section>
 
         <section class="panel">
           <h2>房间</h2>
@@ -92,7 +73,7 @@
               <option value="change_request">变更请求</option>
               <option value="progress_update">进度询问</option>
             </select>
-            <textarea id="message-content" rows="3" placeholder="在当前房间向 Agent 群聊发送消息"></textarea>
+            <textarea id="message-content" rows="2" placeholder="在当前房间向 Agent 群聊发送消息"></textarea>
             <button id="send-message" type="button">发送</button>
           </div>
         </section>
@@ -109,7 +90,7 @@
 
         <section class="panel">
           <div class="panel-heading">
-            <h2>产物</h2>
+            <h2>交付物</h2>
             <span id="artifact-summary">0</span>
           </div>
           <div id="artifact-list" class="artifact-list"></div>
@@ -117,13 +98,84 @@
 
         <section class="panel">
           <div class="panel-heading">
-            <h2>Workspace</h2>
-            <span id="workspace-root">未生成</span>
+            <h2>团队进展</h2>
+            <span id="workspace-root">制作人视图</span>
           </div>
           <div id="workspace-tree" class="workspace-tree"></div>
         </section>
       </aside>
     </div>
+
+    <dialog id="settings-dialog" class="settings-dialog">
+      <div class="settings-surface">
+        <header class="settings-header">
+          <div>
+            <h2>设置</h2>
+            <p>模型 API key 只保存在本机 secret store，不会在页面回显明文。</p>
+          </div>
+          <button id="close-settings" class="icon-button" type="button" aria-label="关闭设置" title="关闭">×</button>
+        </header>
+
+        <section class="model-settings">
+          <div class="panel-heading">
+            <h2>模型配置</h2>
+            <span id="model-config-summary">未配置</span>
+          </div>
+          <form id="model-settings-form">
+            <label>
+              Provider
+              <select id="model-provider-select"></select>
+            </label>
+            <label>
+              Base URL
+              <input id="model-base-url" autocomplete="off" placeholder="https://api.example.com/v1" />
+            </label>
+            <label>
+              默认模型
+              <input id="model-name" autocomplete="off" placeholder="由 provider 或自定义网关决定" />
+            </label>
+            <label>
+              API Key
+              <input id="model-api-key" type="password" autocomplete="off" placeholder="保存后不会回显明文" />
+            </label>
+            <div class="key-actions">
+              <button type="submit">保存模型配置</button>
+              <button id="clear-model-key" type="button">清除 Key</button>
+            </div>
+          </form>
+          <div id="model-provider-status" class="provider-status"></div>
+          <section class="assignment-section">
+            <div class="panel-heading">
+              <h2>角色模型分配</h2>
+              <span id="assignment-summary">0</span>
+            </div>
+            <div id="agent-model-assignments" class="assignment-list"></div>
+          </section>
+        </section>
+      </div>
+    </dialog>
+
+    <dialog id="start-confirm-dialog" class="confirm-dialog">
+      <div class="confirm-surface">
+        <h2>启动项目</h2>
+        <p id="start-confirm-message">启动后 Agents 会从该项目的初始 idea 重新开始流程。</p>
+        <div class="confirm-actions">
+          <button id="cancel-start-project" type="button">取消</button>
+          <button id="confirm-start-project" type="button">确认启动</button>
+        </div>
+      </div>
+    </dialog>
+
+    <dialog id="delete-confirm-dialog" class="confirm-dialog">
+      <div class="confirm-surface">
+        <h2>删除项目</h2>
+        <p id="delete-confirm-message">删除后会移除该项目的本地进度和工作空间。</p>
+        <div class="confirm-actions">
+          <button id="cancel-delete-project" type="button">取消</button>
+          <button id="confirm-delete-project" class="danger-button" type="button">确认删除</button>
+        </div>
+      </div>
+    </dialog>
 
     <div id="toast" class="toast" hidden></div>
     <script src="/app.js" type="module"></script>
