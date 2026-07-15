@@ -44,6 +44,7 @@ Game Pipeline Agents 是一个面向“AI 虚拟游戏工作室”的正式产�
 - 微信小游戏构建产物。
 - QA 试玩报告、问题报告、截图、录屏和发布门禁报告。
 - 部署方案、部署记录、回滚方案和后续 LiveOps 迭代 backlog。
+- 结构化生产记忆，覆盖项目状态、制作人决策、角色进度、产物、QA 结果、发布记录和可复用游戏开发知识。
 
 ## 多 Agent 游戏工作室模型
 
@@ -52,7 +53,7 @@ Game Pipeline Agents 是一个面向“AI 虚拟游戏工作室”的正式产�
 | Agent | 主要职责 | 典型产物 |
 | --- | --- | --- |
 | Studio Orchestrator | 控制工作流状态、消息路由、任务拆解、阶段门禁和跨 Agent 协作。 | 阶段计划、任务图、决策请求、项目状态。 |
-| Producer Agent | 把制作人的意图转化为范围、排期、风险和里程碑评审。 | 路线图、backlog、风险日志、评审议程、决策日志。 |
+| Producer Agent | 把制作人的意图转化为范围、排期、风险和里程碑评审。 | 生产计划、backlog、风险日志、评审议程、决策日志。 |
 | Game Designer Agent | 设计核心循环、规则、成长、关卡、数值和平衡。 | GDD、核心循环说明、关卡规格、数值规格。 |
 | Art Director Agent | 定义美术风格、UI 方向、可读性规则、色板、动画语气和资产质量标准。 | Art Bible、风格板、UI 视觉规范、资产评审记录。 |
 | Asset Production Agent | 生产、清洗、规格化、打包和版本化游戏资产。 | 精灵图、UI 资产、sprite sheet、动画序列、asset manifest。 |
@@ -235,6 +236,11 @@ flowchart LR
 ```text
 /studio/projects/{game_id}/
   shared/
+    memory/
+      project-memory.jsonl
+      producer-preferences.md
+      knowledge-base/
+      vector-index-metadata.json
     decisions/
     milestones/
     build-artifacts/
@@ -242,12 +248,14 @@ flowchart LR
 
   agents/
     producer/
+      workspace-summary.md
       backlog.md
       sprint-plan.md
       risk-log.md
       decision-log.md
 
     design/
+      workspace-summary.md
       gdd/
       core-loop.md
       level-specs/
@@ -255,6 +263,7 @@ flowchart LR
       change-requests/
 
     art/
+      workspace-summary.md
       art-bible.md
       asset-specs/
       raw-assets/
@@ -264,18 +273,21 @@ flowchart LR
       review-notes.md
 
     engineering/
+      workspace-summary.md
       tech-spec.md
       cocos-scene-blueprints/
       implementation-notes/
       code-change-log.md
 
     cocos-automation/
+      workspace-summary.md
       scene-ops/
       prefab-ops/
       editor-snapshots/
       cocos-build-logs/
 
     qa/
+      workspace-summary.md
       test-plans/
       playtest-reports/
       screenshots/
@@ -284,11 +296,71 @@ flowchart LR
       release-gate-reports/
 
     devops/
+      workspace-summary.md
       deploy-plans/
       server-logs-redacted/
       rollback-plans/
       deployment-reports/
 ```
+
+## 生产记忆系统
+
+记忆系统是面向游戏项目的生产记忆层。它不是泛用聊天记忆，也不是 Agent 人格记忆。它保存端到端游戏交付和持续迭代所需的事实、决策、责任、产物和经验。
+
+记忆范围：
+
+| 记忆范围 | 内容 | 产品作用 |
+| --- | --- | --- |
+| Project Memory | 项目目标、已审批范围、当前阶段、里程碑状态、全局阻塞、当前发布目标。 | 让所有 Agent 共享同一个项目事实源。 |
+| Role Memory | Agent 职责、分配任务、工作空间摘要、交接记录、阻塞项、已交付产物。 | 支持制作人随时询问进度，并获得对应角色的明确回答。 |
+| Decision Memory | 制作人审批、否决、豁免、变更请求、受影响产物、后续任务。 | 防止 Agent 重新启用已否决方案或覆盖已审批方向。 |
+| Artifact Memory | GDD、Art Bible、资产清单、场景蓝图、代码变更、构建产物、部署记录。 | 将每个产物关联到负责人、任务、阶段和决策历史。 |
+| QA Memory | 测试计划、试玩报告、截图、录屏、Bug 报告、发布门禁、验证状态。 | 将 QA 变成持续的游戏作品评估历史，而不是一次性测试输出。 |
+| Release and LiveOps Memory | 发布说明、部署状态、回滚记录、埋点方案、迭代 backlog、调优历史。 | 保证产品具备持续运维和持续更新能力。 |
+| Producer Preference Memory | 制作人明确表达的偏好、风格约束、否决模式、审批习惯、评审意见。 | 在多轮会话和多次迭代中保留制作人的创作方向。 |
+| Knowledge Memory | 从已完成工作中沉淀的 Cocos、微信小游戏、美术、QA、部署经验。 | 将项目经验转化为可复用的生产知识。 |
+
+记忆状态：
+
+- `draft`
+- `active`
+- `superseded`
+- `rejected`
+- `archived`
+
+只有确认后的项目事实进入 durable memory。草案内容保持 `draft`；制作人否决的内容标记为 `rejected`；被替换的决策标记为 `superseded`。Agent 按状态和来源检索记忆，不把所有历史聊天都当成事实。
+
+记忆记录结构：
+
+```json
+{
+  "memory_id": "mem_...",
+  "project_id": "game_...",
+  "stage_id": "stage_1",
+  "scope": "project",
+  "owner_agent": "game_designer",
+  "type": "decision",
+  "status": "active",
+  "content": "已审批的核心循环是 60 秒一局的点击防守玩法。",
+  "source_event_id": "evt_...",
+  "source_artifact": "shared/decisions/decision-004.md",
+  "created_at": "2026-07-15T00:00:00Z",
+  "updated_at": "2026-07-15T00:00:00Z"
+}
+```
+
+Agent 上下文注入使用结构化记忆包：
+
+- 项目简报。
+- 当前阶段快照。
+- 当前有效制作人决策。
+- 角色工作空间摘要。
+- 未完成任务和阻塞项。
+- 相关产物。
+- 最近审计事件。
+- 发布或 QA 门禁状态。
+
+向量检索是覆盖产物、决策、报告和知识条目的辅助检索层。结构化记录始终是事实源。原始凭据、密码、token、私钥和服务器访问密钥不进入记忆系统，只进入 Secret Vault。
 
 ## 白盒留痕与可追溯性
 
@@ -397,6 +469,7 @@ flowchart TB
     CHAT --> ROUTER["按角色自动路由"]
     ROUTER --> ORCH["Studio Orchestrator"]
     ORCH --> TASKS["任务系统 / Mission Hub"]
+    ORCH --> MEMORY["生产记忆系统"]
     ORCH --> AUDIT["Append-Only 审计日志"]
     ORCH --> AGENTS["专业游戏开发 Agents"]
     AGENTS --> WORKSPACE["角色工作空间"]
@@ -407,56 +480,32 @@ flowchart TB
     QA --> REPORTS["QA 报告"]
     RELEASE --> PROD["生产环境"]
     PROD --> LIVEOPS["数据分析和迭代 Backlog"]
+    LIVEOPS --> MEMORY
     LIVEOPS --> CHAT
 ```
 
-## 实现方向
+## 产品能力模块
 
-第一版实现聚焦一个小而完整的 vertical slice：
+Game Pipeline Agents 由一组相互连接的完整产品能力模块组成：
 
-1. 多 Agent 游戏工作室群聊和按角色路由。
-2. 项目和阶段状态机。
-3. 角色工作空间和产物注册表。
-4. GDD 和 Art Bible 生成流程。
-5. Cocos 工程生成和资产导入桥。
-6. 微信小游戏首个可玩版本。
-7. QA 试玩报告和发布门禁。
-8. DevOps 部署记录和回滚方案。
+| 模块 | 职责 |
+| --- | --- |
+| Studio Chat | 制作人房间、按角色路由、Agent 回复、结构化消息类型和跨房间交接。 |
+| Agent Registry | 游戏开发角色、能力、权限、路由规则、可用性和工作空间归属。 |
+| Workflow Orchestrator | 三阶段生产状态机、阶段门禁、任务创建、里程碑流转和制作人审批控制。 |
+| Task and Mission Hub | Backlog、负责人、状态、阻塞、验收标准、关联产物和里程碑可视化。 |
+| Production Memory System | 项目事实、角色进度、制作人决策、产物历史、QA 历史、发布记忆和可复用知识。 |
+| Role Workspaces | 制作人、策划、美术、程序、Cocos 自动化、QA、DevOps 的可见工作区。 |
+| Artifact Registry | GDD、Art Bible、资产、manifest、场景蓝图、代码变更、构建、报告和部署记录。 |
+| Cocos Engine Bridge | Cocos 工程校验、资产导入、场景树检查、蓝图应用、Prefab 更新、脚本生成和构建。 |
+| Asset Pipeline | 美术方向、资产生产、清洗、sprite sheet、动画序列、资产清单和运行时打包。 |
+| QA and Evaluation Harness | 构建验证、运行时可玩性、视觉 QA、试玩自动化、Bug 复现和发布门禁评分。 |
+| WeChat Release Pipeline | 微信小游戏打包、预览、上传准备、包体检查、资源策略和平台就绪性。 |
+| DevOps and LiveOps | 受 Secret 控制的部署、回滚、日志、埋点方案、迭代 backlog 和生产调优。 |
+| Audit and Observability | Append-only 事件、工具调用 trace、消息记录、产物血缘、成本和运行时遥测、脱敏运维日志。 |
 
-整体架构使用 Clowder 一类多 Agent 聊天室系统里的房间、Agent Registry、消息路由、Invocation Queue、Task Store、MCP Callback、Workspace Explorer 和 Append-Only Audit Log 作为协作基础。游戏领域层补充三阶段生产流程、游戏开发角色、美术资产流水线、Cocos 自动化、试玩评估和微信小游戏发布门禁。
-
-## 路线图
-
-### V0：产品骨架
-
-- 创建仓库结构。
-- 定义 Agent 角色和消息 schema。
-- 定义项目、阶段、任务、产物和审计数据模型。
-- 建立 README 和架构文档。
-
-### V1：工作室群聊和策划流程
-
-- 实现制作人主工作室房间。
-- 实现按角色自动路由。
-- 实现阶段 1 的立项讨论流程。
-- 生成 GDD、Art Bible、backlog 和决策日志。
-
-### V2：Cocos 首个可玩版本流程
-
-- 生成 Cocos Creator 项目模板。
-- 实现结构化场景蓝图。
-- 增加资产生产和 asset manifest。
-- 实现一个简单可玩的微信小游戏。
-- 生成 QA 试玩报告。
-
-### V3：发布和 LiveOps 流程
-
-- 自动化微信小游戏构建。
-- 增加部署流程。
-- 增加密钥处理和日志脱敏。
-- 增加发布门禁报告。
-- 增加数据分析和迭代 backlog。
+整体架构使用 Clowder 一类多 Agent 聊天室系统里的房间、Agent Registry、消息路由、Invocation Queue、Task Store、MCP Callback、Workspace Explorer、生产记忆和 Append-Only Audit Log 作为协作基础。游戏领域层补充三阶段生产流程、游戏开发角色、美术资产流水线、Cocos 自动化、试玩评估和微信小游戏发布门禁。
 
 ## 当前状态
 
-当前仓库包含 Game Pipeline Agents 的产品规格。实现从可执行项目骨架、数据模型和第一个游戏工作室群聊流程开始。
+当前仓库包含 Game Pipeline Agents 的产品规格。实现范围覆盖上文描述的完整产品系统：工作室协作、Agent 执行、生产记忆、角色工作空间、Cocos 自动化、QA 评估、发布运维和持续迭代。

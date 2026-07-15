@@ -44,6 +44,7 @@ This system is not a single black-box chatbot that generates a pile of code. It 
 - WeChat mini-game build.
 - QA playtest reports, bug reports, screenshots, recordings, and release gate reports.
 - Deployment plan, deployment record, rollback plan, and live-ops iteration backlog.
+- Structured production memory covering project state, producer decisions, role progress, artifacts, QA results, releases, and reusable game-development knowledge.
 
 ## Multi-Agent Studio Model
 
@@ -52,7 +53,7 @@ The product is organized as a role-based multi-agent studio. Each agent owns a c
 | Agent | Main Responsibility | Typical Deliverables |
 | --- | --- | --- |
 | Studio Orchestrator | Controls workflow state, routing, task creation, phase gates, and cross-agent coordination. | Stage plan, task graph, decision requests, project status. |
-| Producer Agent | Converts producer intent into scope, schedule, risks, and milestone reviews. | Roadmap, backlog, risk log, review agenda, decision log. |
+| Producer Agent | Converts producer intent into scope, schedule, risks, and milestone reviews. | Production plan, backlog, risk log, review agenda, decision log. |
 | Game Designer Agent | Designs core loop, rules, progression, levels, balance, and player goals. | GDD, core loop spec, level specs, economy and balance specs. |
 | Art Director Agent | Defines visual style, UI direction, readability rules, color palette, animation tone, and asset quality bar. | Art Bible, style board, UI visual spec, asset review notes. |
 | Asset Production Agent | Produces, normalizes, packages, and version-controls game assets. | Sprites, UI assets, sprite sheets, animation strips, asset manifest. |
@@ -156,7 +157,7 @@ Exit criteria:
 
 - Approved core loop.
 - Approved project scope.
-- Approved first version of the GDD.
+- Approved GDD baseline.
 - Approved art direction.
 - Initial backlog and milestone plan.
 
@@ -235,6 +236,11 @@ Project layout:
 ```text
 /studio/projects/{game_id}/
   shared/
+    memory/
+      project-memory.jsonl
+      producer-preferences.md
+      knowledge-base/
+      vector-index-metadata.json
     decisions/
     milestones/
     build-artifacts/
@@ -242,12 +248,14 @@ Project layout:
 
   agents/
     producer/
+      workspace-summary.md
       backlog.md
       sprint-plan.md
       risk-log.md
       decision-log.md
 
     design/
+      workspace-summary.md
       gdd/
       core-loop.md
       level-specs/
@@ -255,6 +263,7 @@ Project layout:
       change-requests/
 
     art/
+      workspace-summary.md
       art-bible.md
       asset-specs/
       raw-assets/
@@ -264,18 +273,21 @@ Project layout:
       review-notes.md
 
     engineering/
+      workspace-summary.md
       tech-spec.md
       cocos-scene-blueprints/
       implementation-notes/
       code-change-log.md
 
     cocos-automation/
+      workspace-summary.md
       scene-ops/
       prefab-ops/
       editor-snapshots/
       cocos-build-logs/
 
     qa/
+      workspace-summary.md
       test-plans/
       playtest-reports/
       screenshots/
@@ -284,11 +296,71 @@ Project layout:
       release-gate-reports/
 
     devops/
+      workspace-summary.md
       deploy-plans/
       server-logs-redacted/
       rollback-plans/
       deployment-reports/
 ```
+
+## Production Memory System
+
+The memory system is a production memory layer for game projects. It is not a generic chatbot memory or agent personality store. It preserves the facts, decisions, responsibilities, artifacts, and lessons required for end-to-end game delivery and continuous iteration.
+
+Memory scopes:
+
+| Memory Scope | Content | Product Function |
+| --- | --- | --- |
+| Project Memory | Project goal, approved scope, current stage, milestone state, global blockers, active release target. | Gives every agent the same source of truth for project status. |
+| Role Memory | Agent responsibilities, assigned tasks, workspace summary, handoffs, blocked items, delivered artifacts. | Lets the producer ask progress questions at any time and receive role-specific answers. |
+| Decision Memory | Producer approvals, rejections, waivers, change requests, affected artifacts, follow-up tasks. | Prevents agents from reviving rejected ideas or overwriting approved direction. |
+| Artifact Memory | GDD, Art Bible, asset manifests, scene blueprints, code changes, build outputs, deployment records. | Connects every deliverable to its owner, task, stage, and decision history. |
+| QA Memory | Test plans, playtest reports, screenshots, recordings, bug reports, release gates, verification status. | Turns QA into a persistent game-evaluation history instead of one-off test output. |
+| Release and LiveOps Memory | Release notes, deployment state, rollback records, analytics plans, iteration backlog, tuning history. | Keeps the product ready for ongoing operation and future updates. |
+| Producer Preference Memory | Explicit producer preferences, style constraints, rejected patterns, approval habits, review comments. | Preserves the producer's creative direction across sessions and iterations. |
+| Knowledge Memory | Reusable Cocos, WeChat mini-game, asset, QA, and deployment lessons extracted from completed work. | Converts project experience into reusable production knowledge. |
+
+Memory status values:
+
+- `draft`
+- `active`
+- `superseded`
+- `rejected`
+- `archived`
+
+Only confirmed project facts enter durable memory. Draft ideas stay marked as `draft`; producer-rejected content is marked as `rejected`; replaced decisions are marked as `superseded`. Agents retrieve memory by status and source instead of treating all previous chat as truth.
+
+Memory record schema:
+
+```json
+{
+  "memory_id": "mem_...",
+  "project_id": "game_...",
+  "stage_id": "stage_1",
+  "scope": "project",
+  "owner_agent": "game_designer",
+  "type": "decision",
+  "status": "active",
+  "content": "The approved core loop is a 60-second click-defense session.",
+  "source_event_id": "evt_...",
+  "source_artifact": "shared/decisions/decision-004.md",
+  "created_at": "2026-07-15T00:00:00Z",
+  "updated_at": "2026-07-15T00:00:00Z"
+}
+```
+
+Agent context injection uses structured memory packs:
+
+- Project brief.
+- Current stage snapshot.
+- Active producer decisions.
+- Role workspace summary.
+- Open tasks and blockers.
+- Relevant artifacts.
+- Recent audit events.
+- Release or QA gate state.
+
+Vector search is an auxiliary retrieval layer over artifacts, decisions, reports, and knowledge entries. Structured records remain the source of truth. Raw credentials, passwords, tokens, private keys, and secret server access data never enter memory; they remain in the Secret Vault.
 
 ## White-Box Traceability
 
@@ -389,7 +461,7 @@ Security rules:
 - Logs must redact passwords, tokens, private keys, and server addresses when needed.
 - Every secret write or deployment action must be audited.
 
-## Reference Architecture
+## System Architecture
 
 ```mermaid
 flowchart TB
@@ -397,6 +469,7 @@ flowchart TB
     CHAT --> ROUTER["Role-Aware Agent Router"]
     ROUTER --> ORCH["Studio Orchestrator"]
     ORCH --> TASKS["Task Store / Mission Hub"]
+    ORCH --> MEMORY["Production Memory System"]
     ORCH --> AUDIT["Append-Only Audit Log"]
     ORCH --> AGENTS["Specialized Game Agents"]
     AGENTS --> WORKSPACE["Role Workspaces"]
@@ -407,56 +480,32 @@ flowchart TB
     QA --> REPORTS["QA Reports"]
     RELEASE --> PROD["Production Environment"]
     PROD --> LIVEOPS["Analytics and LiveOps Backlog"]
+    LIVEOPS --> MEMORY
     LIVEOPS --> CHAT
 ```
 
-## Implementation Direction
+## Product Capability Modules
 
-The first implementation focuses on a small but complete vertical slice:
+Game Pipeline Agents is implemented as a complete production system made of connected capability modules:
 
-1. Multi-agent studio chat with role-aware routing.
-2. Project and phase state machine.
-3. Role workspaces and artifact registry.
-4. GDD and Art Bible generation workflow.
-5. Cocos project generation and asset import bridge.
-6. First playable build for WeChat mini-game.
-7. QA playtest report and release gate.
-8. DevOps deployment record and rollback plan.
+| Module | Responsibility |
+| --- | --- |
+| Studio Chat | Producer-facing rooms, role-aware routing, agent replies, structured message types, and cross-room handoff. |
+| Agent Registry | Game-development roles, capabilities, permissions, routing rules, availability, and workspace ownership. |
+| Workflow Orchestrator | Three-stage production state machine, phase gates, task creation, milestone transitions, and producer approval control. |
+| Task and Mission Hub | Backlog, ownership, status, blockers, acceptance criteria, linked artifacts, and milestone visibility. |
+| Production Memory System | Project truth, role progress, producer decisions, artifact history, QA history, release memory, and reusable knowledge. |
+| Role Workspaces | Producer, design, art, engineering, Cocos automation, QA, and DevOps workspaces with visible deliverables. |
+| Artifact Registry | GDD, Art Bible, assets, manifests, scene blueprints, code changes, builds, reports, and deployment records. |
+| Cocos Engine Bridge | Cocos project validation, asset import, scene graph inspection, blueprint application, prefab updates, script generation, and builds. |
+| Asset Pipeline | Art direction, asset production, cleanup, sprite sheets, animation strips, asset manifests, and runtime packaging. |
+| QA and Evaluation Harness | Build verification, runtime playability, visual QA, playtest automation, bug reproduction, and release gate scoring. |
+| WeChat Release Pipeline | WeChat mini-game packaging, preview, upload preparation, package-size checks, resource strategy, and platform readiness. |
+| DevOps and LiveOps | Secret-controlled deployment, rollback, logs, analytics plans, iteration backlog, and production tuning. |
+| Audit and Observability | Append-only events, tool-call traces, message records, artifact lineage, cost and runtime telemetry, and redacted operational logs. |
 
-The architecture uses Clowder-style multi-agent rooms, agent registries, message routing, invocation queues, task stores, MCP callback tools, workspace explorers, and append-only audit logs as collaboration primitives. The game-specific layer adds production phases, game roles, Cocos automation, asset pipelines, playtest evaluation, and WeChat release gates.
-
-## Roadmap
-
-### V0: Product Skeleton
-
-- Create repository structure.
-- Define agent roles and message schema.
-- Define project, stage, task, artifact, and audit data models.
-- Build basic README and architecture documentation.
-
-### V1: Studio Chat and Planning Flow
-
-- Implement producer-facing studio room.
-- Implement role-aware routing.
-- Implement Stage 1 concept discussion.
-- Generate GDD, Art Bible, backlog, and decision log.
-
-### V2: Cocos First Playable Flow
-
-- Generate Cocos Creator project template.
-- Implement structured scene blueprint.
-- Add asset production and asset manifest.
-- Implement simple playable WeChat mini-game.
-- Generate QA playtest report.
-
-### V3: Release and LiveOps Flow
-
-- Automate WeChat build.
-- Add deployment workflow.
-- Add secret handling and redacted logs.
-- Add release gate report.
-- Add analytics and iteration backlog.
+The architecture uses Clowder-style multi-agent rooms, agent registries, message routing, invocation queues, task stores, MCP callback tools, workspace explorers, production memory, and append-only audit logs as collaboration primitives. The game-specific layer adds production phases, game roles, Cocos automation, asset pipelines, playtest evaluation, and WeChat release gates.
 
 ## Current Status
 
-This repository contains the product specification for Game Pipeline Agents. Implementation starts with executable project scaffolding, data models, and the first studio chat workflow.
+This repository contains the product specification for Game Pipeline Agents. The implementation scope covers the complete product system described above: studio collaboration, agent execution, production memory, role workspaces, Cocos automation, QA evaluation, release operations, and continuous iteration.
