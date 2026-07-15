@@ -429,6 +429,16 @@ textarea {
   background: var(--accent-soft);
 }
 
+.pause-icon-button {
+  color: var(--warn);
+}
+
+.pause-icon-button:hover {
+  border-color: var(--warn);
+  background: #fff7e6;
+  color: var(--warn);
+}
+
 .danger-icon-button {
   color: var(--danger);
 }
@@ -476,14 +486,67 @@ textarea {
 
 .key-actions {
   display: grid;
-  grid-template-columns: 1fr auto;
+  grid-template-columns: 1fr auto auto;
   gap: 8px;
+}
+
+.key-actions #test-model-provider {
+  border-color: var(--line-strong);
+  background: #fff;
+  color: var(--accent-strong);
+}
+
+.key-actions #test-model-provider:hover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
 }
 
 .key-actions button:last-child {
   border-color: var(--line);
   background: #fff;
   color: var(--danger);
+}
+
+.model-test-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #fff;
+  color: var(--muted);
+  padding: 7px 10px;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.model-test-status .test-light {
+  width: 9px;
+  height: 9px;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: var(--line-strong);
+}
+
+.model-test-status.success {
+  border-color: #aacdc0;
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+
+.model-test-status.success .test-light {
+  background: var(--accent);
+}
+
+.model-test-status.failure {
+  border-color: #e2b7b7;
+  background: #fff1f1;
+  color: var(--danger);
+}
+
+.model-test-status.failure .test-light {
+  background: var(--danger);
 }
 
 .assignment-section {
@@ -691,6 +754,18 @@ textarea {
   color: var(--accent-strong);
 }
 
+.quick-actions button.pending-confirm {
+  border-color: var(--warn);
+  background: #fff4df;
+  color: var(--warn);
+}
+
+.quick-actions button.pending-confirm:hover {
+  border-color: var(--warn);
+  background: #ffe8ba;
+  color: #805116;
+}
+
 .composer-row {
   display: grid;
   grid-template-columns: minmax(126px, 152px) minmax(0, 1fr) 88px;
@@ -704,11 +779,76 @@ textarea {
   font-weight: 650;
 }
 
+.mention-composer-field {
+  position: relative;
+  min-width: 0;
+}
+
 #message-content {
   min-height: 64px;
   max-height: 128px;
   line-height: 1.45;
   padding: 12px 13px;
+}
+
+.mention-suggestions {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 8px);
+  left: 0;
+  z-index: 30;
+  display: grid;
+  gap: 4px;
+  max-height: 260px;
+  overflow-y: auto;
+  border: 1px solid var(--line-strong);
+  border-radius: 7px;
+  background: #fff;
+  box-shadow: var(--shadow);
+  padding: 6px;
+}
+
+.mention-suggestions[hidden] {
+  display: none;
+}
+
+.mention-suggestion {
+  display: grid;
+  grid-template-columns: minmax(58px, auto) minmax(0, 1fr) auto;
+  justify-content: stretch;
+  width: 100%;
+  min-height: 34px;
+  border-color: transparent;
+  background: #fff;
+  color: var(--text);
+  padding: 7px 8px;
+  text-align: left;
+}
+
+.mention-suggestion:hover,
+.mention-suggestion.active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+
+.mention-suggestion strong,
+.mention-suggestion small {
+  white-space: nowrap;
+}
+
+.mention-suggestion span {
+  min-width: 0;
+  overflow: hidden;
+  color: inherit;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mention-suggestion small {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
 }
 
 #send-message {
