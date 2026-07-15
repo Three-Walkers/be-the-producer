@@ -126,8 +126,20 @@
           </div>
           <form id="model-settings-form">
             <label>
-              Provider
+              选择模型连接
               <select id="model-provider-select"></select>
+            </label>
+            <label>
+              连接名称
+              <input id="model-provider-label" autocomplete="off" placeholder="例如：阿里云百炼 DashScope" />
+            </label>
+            <label>
+              请求协议
+              <select id="model-provider-protocol">
+                <option value="openai-compatible">OpenAI-compatible Chat Completions</option>
+                <option value="anthropic">Anthropic Messages</option>
+                <option value="google">Google Gemini GenerateContent</option>
+              </select>
             </label>
             <label>
               Base URL
@@ -144,6 +156,8 @@
             <div class="key-actions">
               <button type="submit">保存模型配置</button>
               <button id="test-model-provider" type="button">测试连通性</button>
+              <button id="add-model-provider" type="button">新增连接</button>
+              <button id="remove-model-provider" type="button">移除连接</button>
               <button id="clear-model-key" type="button">清除 Key</button>
             </div>
           </form>

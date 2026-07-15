@@ -11,7 +11,7 @@ const state = {
   modelProviders: [],
   modelAssignments: [],
   modelTestResults: {},
-  selectedModelProviderId: "openai"
+  selectedModelProviderId: "dashscope"
 };
 
 const presets = {
@@ -302,6 +302,8 @@ $("#model-settings-form").addEventListener("submit", async (event) => {
     const providerId = $("#model-provider-select").value;
     const apiKey = $("#model-api-key").value.trim();
     const payload = {
+      label: $("#model-provider-label").value.trim(),
+      protocol: $("#model-provider-protocol").value,
       baseUrl: $("#model-base-url").value.trim(),
       defaultModel: $("#model-name").value.trim()
     };
@@ -309,7 +311,7 @@ $("#model-settings-form").addEventListener("submit", async (event) => {
       payload.apiKey = apiKey;
     }
 
-    await request(`/settings/model-providers/${providerId}`, {
+    await request(`/settings/model-providers/${encodeURIComponent(providerId)}`, {
       method: "PUT",
       body: JSON.stringify(payload)
     });
@@ -332,6 +334,68 @@ $("#model-provider-select").addEventListener("change", () => {
   renderModelSettings();
 });
 
+$("#add-model-provider").addEventListener("click", async () => {
+  const button = $("#add-model-provider");
+  const originalText = button.textContent;
+  button.disabled = true;
+  button.textContent = "新增中";
+  try {
+    const count = state.modelProviders.filter((provider) => provider.isCustom).length + 1;
+    const result = await request("/settings/model-providers", {
+      method: "POST",
+      body: JSON.stringify({
+        label: `自定义模型连接 ${count}`,
+        protocol: "openai-compatible",
+        baseUrl: "",
+        defaultModel: ""
+      })
+    });
+    state.selectedModelProviderId = result.provider.providerId;
+    await loadModelProviders();
+    $("#model-provider-label").focus();
+    button.textContent = "已新增";
+  } catch (error) {
+    button.textContent = "失败";
+    showToast(error.message);
+  } finally {
+    setTimeout(() => {
+      button.disabled = false;
+      button.textContent = originalText;
+    }, 1200);
+  }
+});
+
+$("#remove-model-provider").addEventListener("click", async () => {
+  const button = $("#remove-model-provider");
+  const providerId = $("#model-provider-select").value;
+  const selected = state.modelProviders.find((provider) => provider.providerId === providerId);
+  if (!selected?.isCustom || selected.providerId === "custom") {
+    showToast("只能移除通过“新增连接”创建的模型连接。");
+    return;
+  }
+
+  const originalText = button.textContent;
+  button.disabled = true;
+  button.textContent = "移除中";
+  try {
+    await request(`/settings/model-provider-profiles/${encodeURIComponent(providerId)}`, {
+      method: "DELETE"
+    });
+    delete state.modelTestResults[providerId];
+    state.selectedModelProviderId = "dashscope";
+    await loadModelProviders();
+    button.textContent = "已移除";
+  } catch (error) {
+    button.textContent = "失败";
+    showToast(error.message);
+  } finally {
+    setTimeout(() => {
+      button.disabled = false;
+      button.textContent = originalText;
+    }, 1200);
+  }
+});
+
 $("#clear-model-key").addEventListener("click", async () => {
   const button = $("#clear-model-key");
   const originalText = button.textContent;
@@ -339,7 +403,7 @@ $("#clear-model-key").addEventListener("click", async () => {
   button.textContent = "清除中";
   try {
     const providerId = $("#model-provider-select").value;
-    await request(`/settings/model-providers/${providerId}`, {
+    await request(`/settings/model-providers/${encodeURIComponent(providerId)}`, {
       method: "DELETE"
     });
     $("#model-api-key").value = "";
@@ -364,13 +428,12 @@ $("#test-model-provider").addEventListener("click", async () => {
   button.textContent = "测试中";
   try {
     const providerId = $("#model-provider-select").value;
-    const result = await request(`/settings/model-provider-tests/${providerId}`, {
+    const result = await request(`/settings/model-provider-tests/${encodeURIComponent(providerId)}`, {
       method: "POST"
     });
     state.modelTestResults[providerId] = result.result;
     renderModelTestStatus();
     showToast(result.result.message);
-    speakModelTestResult(result.result);
   } catch (error) {
     const providerId = $("#model-provider-select").value;
     const selected = state.modelProviders.find((provider) => provider.providerId === providerId);
@@ -385,7 +448,6 @@ $("#test-model-provider").addEventListener("click", async () => {
     state.modelTestResults[providerId] = result;
     renderModelTestStatus();
     showToast(error.message);
-    speakModelTestResult(result);
   } finally {
     button.disabled = false;
     button.textContent = originalText;
@@ -753,6 +815,8 @@ function renderModelSettings() {
   const select = $("#model-provider-select");
   if (!state.modelProviders.length) {
     select.innerHTML = "";
+    $("#model-provider-label").value = "";
+    $("#model-provider-protocol").value = "openai-compatible";
     $("#model-config-summary").textContent = "未加载";
     $("#model-test-status").className = "model-test-status idle";
     $("#model-test-status").innerHTML = '<span class="test-light"></span><span>正在读取模型配置</span>';
@@ -762,21 +826,29 @@ function renderModelSettings() {
   }
 
   select.innerHTML = state.modelProviders
-    .map((provider) => `<option value="${escapeHtml(provider.providerId)}">${escapeHtml(provider.label)}</option>`)
+    .map((provider) => `<option value="${escapeHtml(provider.providerId)}">${escapeHtml(providerDisplayName(provider))}</option>`)
     .join("");
   select.value = state.selectedModelProviderId;
 
   const selected = state.modelProviders.find((provider) => provider.providerId === state.selectedModelProviderId) ?? state.modelProviders[0];
+  state.selectedModelProviderId = selected.providerId;
+  $("#model-provider-label").value = selected.label ?? "";
+  $("#model-provider-protocol").value = selected.protocol ?? "openai-compatible";
   $("#model-base-url").value = selected.baseUrl ?? "";
   $("#model-name").value = selected.defaultModel ?? "";
   $("#model-config-summary").textContent = `${state.modelProviders.filter((provider) => provider.hasApiKey).length}/${state.modelProviders.length} 已配置`;
+  $("#remove-model-provider").disabled = !selected.isCustom || selected.providerId === "custom";
   renderModelTestStatus();
   $("#model-provider-status").innerHTML = state.modelProviders
     .map((provider) => {
       const status = provider.hasApiKey ? `已配置 · ${provider.keyFingerprint}` : "未配置";
       const active = provider.providerId === state.selectedModelProviderId ? " active" : "";
+      const details = [protocolLabel(provider.protocol), provider.defaultModel || "未设置默认模型"].join(" · ");
       return `<button class="provider-row${active}" data-provider-id="${escapeHtml(provider.providerId)}" type="button">
-        <span><span class="status-dot ${provider.hasApiKey ? "ready" : ""}"></span>${escapeHtml(provider.label)}</span>
+        <span class="provider-row-main">
+          <span><span class="status-dot ${provider.hasApiKey ? "ready" : ""}"></span>${escapeHtml(provider.label)}</span>
+          <small>${escapeHtml(details)}</small>
+        </span>
         <span>${escapeHtml(status)}</span>
       </button>`;
     })
@@ -798,7 +870,7 @@ function renderModelTestStatus() {
   const provider = state.modelProviders.find((candidate) => candidate.providerId === providerId);
   if (!result) {
     container.className = "model-test-status idle";
-    container.innerHTML = `<span class="test-light"></span><span>${escapeHtml(provider?.label ?? providerId)} 尚未测试连通性。</span>`;
+    container.innerHTML = `<span class="test-light"></span><span>${escapeHtml(providerDisplayName(provider) ?? providerId)} 尚未测试连通性。</span>`;
     return;
   }
 
@@ -1243,6 +1315,55 @@ function canAgentsReceiveMessages() {
   return currentExecutionStatus() === "running";
 }
 
+function avatarMarkup(agentId, label) {
+  const theme = avatarThemes[agentId] ?? fallbackAvatarTheme(label);
+  const avatarUrl = avatarUrlFor(agentId);
+  const image = avatarUrl ? `<img src="${escapeHtml(avatarUrl)}" alt="" />` : escapeHtml(theme.initial);
+  return `<span class="role-avatar" style="--avatar-bg: ${escapeHtml(theme.color)}" aria-hidden="true">${image}</span>`;
+}
+
+function avatarUrlFor(agentId) {
+  if (agentId === "producer") {
+    return "";
+  }
+
+  const assignment = state.modelAssignments.find((candidate) => candidate.agentId === agentId);
+  const avatarUrl = assignment?.avatarUrl?.trim() ?? "";
+  return isAvatarImageUrl(avatarUrl) ? avatarUrl : "";
+}
+
+function isAvatarImageUrl(value) {
+  return /^(https?:\/\/|\/|data:image\/)/i.test(value);
+}
+
+function fallbackAvatarTheme(label) {
+  const text = String(label || "A").trim();
+  return {
+    initial: text.slice(0, 1).toUpperCase(),
+    color: "#667085"
+  };
+}
+
+function providerDisplayName(provider) {
+  if (!provider) {
+    return "";
+  }
+  const model = provider.defaultModel?.trim();
+  return model ? `${provider.label} · ${model}` : provider.label;
+}
+
+function protocolLabel(protocol) {
+  switch (protocol) {
+    case "anthropic":
+      return "Anthropic";
+    case "google":
+      return "Gemini";
+    case "openai-compatible":
+    default:
+      return "OpenAI-compatible";
+  }
+}
+
 function agentName(agentId) {
   return agentLabels[agentId] ?? agentId;
 }
@@ -1310,27 +1431,6 @@ function showToast(message) {
   showToast.timer = setTimeout(() => {
     toast.hidden = true;
   }, 2400);
-}
-
-function speakModelTestResult(result) {
-  if (!result.ok) {
-    return;
-  }
-
-  const prefix = result.ok ? "模型连通性测试成功。" : "模型连通性测试失败。";
-  speakText(`${prefix}${result.message}`);
-}
-
-function speakText(message) {
-  if (!("speechSynthesis" in window)) {
-    return;
-  }
-
-  window.speechSynthesis.cancel();
-  const utterance = new SpeechSynthesisUtterance(message);
-  utterance.lang = "zh-CN";
-  utterance.rate = 1;
-  window.speechSynthesis.speak(utterance);
 }
 
 function playIcon() {
