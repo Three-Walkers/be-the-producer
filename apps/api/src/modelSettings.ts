@@ -45,6 +45,16 @@ export interface SaveAgentModelAssignmentInput {
   model?: string;
 }
 
+export interface ModelProviderTestResult {
+  ok: boolean;
+  providerId: ModelProviderId;
+  label: string;
+  model?: string;
+  latencyMs: number;
+  testedAt: string;
+  message: string;
+}
+
 interface ModelSettingsDocument {
   providers: ModelProviderConfig[];
   agentAssignments: AgentModelAssignment[];
@@ -98,6 +108,22 @@ export class ModelSettingsStore {
     return this.load().agentAssignments;
   }
 
+  getProviderConfig(providerId: string): ModelProviderConfig {
+    const provider = this.load().providers.find((candidate) => candidate.providerId === providerId);
+    if (!provider) {
+      throw new Error(`Unsupported model provider: ${providerId}`);
+    }
+    return { ...provider };
+  }
+
+  getAgentAssignment(agentId: string): AgentModelAssignment {
+    const assignment = this.load().agentAssignments.find((candidate) => candidate.agentId === agentId);
+    if (!assignment) {
+      throw new Error(`Unsupported agent: ${agentId}`);
+    }
+    return { ...assignment };
+  }
+
   saveProvider(providerId: string, input: SaveModelProviderInput): PublicModelProviderConfig {
     const document = this.load();
     const provider = document.providers.find((candidate) => candidate.providerId === providerId);
@@ -130,6 +156,15 @@ export class ModelSettingsStore {
     provider.updatedAt = new Date().toISOString();
     this.write(document);
     return toPublicProvider(provider);
+  }
+
+  async testProvider(providerId: string): Promise<ModelProviderTestResult> {
+    const provider = this.load().providers.find((candidate) => candidate.providerId === providerId);
+    if (!provider) {
+      throw new Error(`Unsupported model provider: ${providerId}`);
+    }
+
+    return testProviderConnection(provider);
   }
 
   saveAgentAssignment(agentId: string, input: SaveAgentModelAssignmentInput): AgentModelAssignment {
@@ -240,4 +275,144 @@ function defaultProviderForCapability(capability: string): ModelProviderId {
     return "openai";
   }
   return "openai";
+}
+
+async function testProviderConnection(provider: ModelProviderConfig): Promise<ModelProviderTestResult> {
+  const startedAt = Date.now();
+  const testedAt = new Date().toISOString();
+  const model = provider.defaultModel.trim() || fallbackTestModel(provider.providerId);
+  try {
+    if (!provider.apiKey) {
+      throw new Error("API key 未配置，请先保存 API key。");
+    }
+    if (!provider.baseUrl.trim()) {
+      throw new Error("Base URL 未配置。");
+    }
+    if (!model) {
+      throw new Error("默认模型未配置，请先填写一个可用模型名。");
+    }
+
+    const response = await sendProviderProbe(provider, model);
+    const latencyMs = Date.now() - startedAt;
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(`HTTP ${response.status}: ${summarizeProviderError(body)}`);
+    }
+
+    await response.json().catch(() => undefined);
+    return {
+      ok: true,
+      providerId: provider.providerId,
+      label: provider.label,
+      model,
+      latencyMs,
+      testedAt,
+      message: `${provider.label} 连通性正常，模型 ${model} 可访问。`
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      providerId: provider.providerId,
+      label: provider.label,
+      ...(model ? { model } : {}),
+      latencyMs: Date.now() - startedAt,
+      testedAt,
+      message: `${provider.label} 连通性测试失败：${error instanceof Error ? error.message : String(error)}`
+    };
+  }
+}
+
+async function sendProviderProbe(provider: ModelProviderConfig, model: string): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15_000);
+  try {
+    switch (provider.providerId) {
+      case "anthropic":
+        return await fetch(joinProviderUrl(provider.baseUrl, provider.baseUrl.endsWith("/v1") ? "messages" : "v1/messages"), {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-api-key": provider.apiKey ?? "",
+            "anthropic-version": "2023-06-01"
+          },
+          body: JSON.stringify({
+            model,
+            max_tokens: 1,
+            messages: [{ role: "user", content: "ping" }]
+          }),
+          signal: controller.signal
+        });
+      case "google":
+        return await fetch(
+          `${joinProviderUrl(provider.baseUrl, provider.baseUrl.endsWith("/v1beta") ? `models/${encodeURIComponent(model)}:generateContent` : `v1beta/models/${encodeURIComponent(model)}:generateContent`)}?key=${encodeURIComponent(provider.apiKey ?? "")}`,
+          {
+            method: "POST",
+            headers: {
+              "content-type": "application/json"
+            },
+            body: JSON.stringify({
+              contents: [{ parts: [{ text: "ping" }] }],
+              generationConfig: { maxOutputTokens: 1 }
+            }),
+            signal: controller.signal
+          }
+        );
+      case "openai":
+      case "deepseek":
+      case "custom":
+      default:
+        return await fetch(joinProviderUrl(provider.baseUrl, "chat/completions"), {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            authorization: `Bearer ${provider.apiKey ?? ""}`
+          },
+          body: JSON.stringify({
+            model,
+            messages: [{ role: "user", content: "ping" }],
+            max_tokens: 1,
+            temperature: 0
+          }),
+          signal: controller.signal
+        });
+    }
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function fallbackTestModel(providerId: ModelProviderId): string {
+  switch (providerId) {
+    case "deepseek":
+      return "deepseek-chat";
+    default:
+      return "";
+  }
+}
+
+function joinProviderUrl(baseUrl: string, path: string): string {
+  return `${baseUrl.replace(/\/+$/, "")}/${path.replace(/^\/+/, "")}`;
+}
+
+function summarizeProviderError(body: string): string {
+  if (!body.trim()) {
+    return "无响应正文";
+  }
+
+  try {
+    const parsed = JSON.parse(body) as { error?: unknown; message?: unknown };
+    if (typeof parsed.error === "string") {
+      return parsed.error;
+    }
+    if (parsed.error && typeof parsed.error === "object" && "message" in parsed.error) {
+      return String((parsed.error as { message?: unknown }).message);
+    }
+    if (typeof parsed.message === "string") {
+      return parsed.message;
+    }
+  } catch {
+    // Fall back to compact text below.
+  }
+
+  return body.replace(/\s+/g, " ").slice(0, 220);
 }

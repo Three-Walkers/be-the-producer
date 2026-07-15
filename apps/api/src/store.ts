@@ -1,5 +1,6 @@
-import { createRestartedStudioKernel, createStudioKernel, LocalAgentRuntime, type StudioKernel } from "@game-pipeline/agent-runtime";
+import { createRestartedStudioKernel, createStudioKernel, defaultAgentContracts, LocalAgentRuntime, type StudioKernel } from "@game-pipeline/agent-runtime";
 import type { MessageType, RoomKind, StudioMessage } from "@game-pipeline/shared-schemas";
+import { ModelAgentRuntime } from "./modelAgentRuntime.js";
 import { ProjectPersistenceStore, type ProjectSummary } from "./projectPersistence.js";
 import { deleteProjectWorkspace, readWorkspaceTree, syncProjectWorkspace, type WorkspaceSyncResult, type WorkspaceTreeEntry } from "./workspaceWriter.js";
 
@@ -20,6 +21,7 @@ export interface PostMessageInput {
 export class StudioProjectStore {
   private readonly projects = new Map<string, StudioKernel>();
   private readonly runtime = new LocalAgentRuntime();
+  private readonly modelRuntime = new ModelAgentRuntime();
   private readonly persistence = new ProjectPersistenceStore();
 
   constructor() {
@@ -59,11 +61,11 @@ export class StudioProjectStore {
     return result;
   }
 
-  startProject(projectId: string): ReturnType<LocalAgentRuntime["handleProducerMessage"]> & {
+  async startProject(projectId: string): Promise<ReturnType<LocalAgentRuntime["handleProducerMessage"]> & {
     project: StudioKernel["project"];
     rooms: ReturnType<StudioKernel["listRooms"]>;
     workspace: WorkspaceSyncResult;
-  } {
+  }> {
     const existing = this.getKernel(projectId);
     const initialIdea =
       existing.project.initialIdea ??
@@ -83,17 +85,64 @@ export class StudioProjectStore {
       }
     }
 
+    if (existing.project.executionStatus === "paused") {
+      existing.updateProject({
+        executionStatus: "running",
+        updatedAt: now
+      });
+      this.persistence.save(existing);
+      return {
+        routePlan: {
+          targets: [],
+          orchestratorSummaryRequired: false
+        },
+        agentMessages: [],
+        project: existing.project,
+        rooms: existing.listRooms(),
+        workspace: syncProjectWorkspace(existing)
+      };
+    }
+
     existing.updateProject({ initialIdea });
     const restarted = createRestartedStudioKernel(existing.project);
     this.projects.set(projectId, restarted);
-    const result = this.postProducerMessage(projectId, {
-      roomKind: "studio-main",
-      content: initialIdea,
-      messageType: "plan_submission"
-    });
+    const result = await this.handleProducerInput(
+      projectId,
+      {
+        roomKind: "studio-main",
+        content: initialIdea,
+        messageType: "plan_submission"
+      },
+      {
+        scriptedReplies: true,
+        modelReplies: false
+      }
+    );
     const kernel = this.getKernel(projectId);
     return {
       ...result,
+      project: kernel.project,
+      rooms: kernel.listRooms(),
+      workspace: syncProjectWorkspace(kernel)
+    };
+  }
+
+  pauseProject(projectId: string): {
+    project: StudioKernel["project"];
+    rooms: ReturnType<StudioKernel["listRooms"]>;
+    workspace: WorkspaceSyncResult;
+  } {
+    const kernel = this.getKernel(projectId);
+    if (kernel.project.executionStatus !== "running") {
+      throw new HttpError(409, "只有执行中的项目可以暂停。");
+    }
+
+    kernel.updateProject({
+      executionStatus: "paused",
+      updatedAt: new Date().toISOString()
+    });
+    this.persistence.save(kernel);
+    return {
       project: kernel.project,
       rooms: kernel.listRooms(),
       workspace: syncProjectWorkspace(kernel)
@@ -108,10 +157,27 @@ export class StudioProjectStore {
     return kernel;
   }
 
-  postProducerMessage(projectId: string, input: PostMessageInput): ReturnType<LocalAgentRuntime["handleProducerMessage"]> & {
+  postProducerMessage(projectId: string, input: PostMessageInput): Promise<ReturnType<LocalAgentRuntime["handleProducerMessage"]> & {
     workspace: WorkspaceSyncResult;
-  } {
+  }> {
+    return this.handleProducerInput(projectId, input, {
+      scriptedReplies: false,
+      modelReplies: true
+    });
+  }
+
+  private async handleProducerInput(
+    projectId: string,
+    input: PostMessageInput,
+    options: { scriptedReplies: boolean; modelReplies: boolean }
+  ): Promise<ReturnType<LocalAgentRuntime["handleProducerMessage"]> & {
+    workspace: WorkspaceSyncResult;
+  }> {
     const kernel = this.getKernel(projectId);
+    if (kernel.project.executionStatus !== "running") {
+      throw new HttpError(409, "项目尚未启动或已暂停，请先启动项目后再让 Agents 评审或执行。");
+    }
+
     const room = input.roomId
       ? kernel.listRooms().find((candidate) => candidate.roomId === input.roomId)
       : kernel.getRoom(input.roomKind ?? "studio-main");
@@ -128,14 +194,20 @@ export class StudioProjectStore {
       senderId: kernel.project.producerId,
       messageType: input.messageType ?? "plan_submission",
       content: input.content,
-      mentions: input.mentions ?? [],
+      mentions: uniqueStrings([...(input.mentions ?? []), ...extractMentionedAgents(input.content)]),
       relatedTaskIds: [],
       relatedArtifactIds: [],
       metadata: {},
       createdAt: new Date().toISOString()
     };
 
-    const result = this.runtime.handleProducerMessage(kernel, message);
+    const result = this.runtime.handleProducerMessage(kernel, message, {
+      scriptedReplies: options.scriptedReplies
+    });
+    if (options.modelReplies && result.agentMessages.length === 0) {
+      const modelResult = await this.modelRuntime.respond(kernel, message, result.routePlan);
+      result.agentMessages.push(...modelResult.agentMessages);
+    }
     this.persistence.save(kernel);
     return {
       ...result,
@@ -173,6 +245,36 @@ export class StudioProjectStore {
     }
     return kernel;
   }
+}
+
+const mentionAliases: Record<string, string[]> = {
+  studio_orchestrator: ["studio_orchestrator", "studio orchestrator", "orchestrator", "总控", "调度", "主持人"],
+  producer: ["producer", "producer agent", "制作人协调", "制作"],
+  game_designer: ["game_designer", "game designer", "策划", "游戏策划"],
+  art_director: ["art_director", "art director", "美术", "美术导演"],
+  asset_production: ["asset_production", "asset production", "资产", "资产生产"],
+  cocos_tech_lead: ["cocos_tech_lead", "cocos tech lead", "cocos", "技术负责人", "架构"],
+  gameplay_programmer: ["gameplay_programmer", "gameplay programmer", "程序", "玩法程序", "开发"],
+  cocos_automation: ["cocos_automation", "cocos automation", "自动化", "编辑器"],
+  qa_evaluator: ["qa_evaluator", "game evaluator", "qa", "测试", "评估"],
+  wechat_platform: ["wechat_platform", "wechat platform", "微信", "平台"],
+  devops: ["devops", "运维", "部署"],
+  liveops_analytics: ["liveops_analytics", "liveops", "analytics", "运营", "数据"]
+};
+
+function extractMentionedAgents(content: string): string[] {
+  const normalized = content.toLowerCase();
+  const mentioned = defaultAgentContracts
+    .filter((agent) => {
+      const aliases = [agent.agentId, agent.displayName, ...(mentionAliases[agent.agentId] ?? [])];
+      return aliases.some((alias) => normalized.includes(`@${alias.toLowerCase()}`));
+    })
+    .map((agent) => agent.agentId);
+  return uniqueStrings(mentioned);
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return [...new Set(values.filter(Boolean))];
 }
 
 export class HttpError extends Error {

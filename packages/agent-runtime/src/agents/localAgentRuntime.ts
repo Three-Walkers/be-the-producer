@@ -17,6 +17,10 @@ export interface LocalAgentRunResult {
   agentMessages: StudioMessage[];
 }
 
+export interface LocalAgentRuntimeOptions {
+  scriptedReplies?: boolean;
+}
+
 type Handler = (input: HandlerInput) => void;
 
 interface HandlerInput {
@@ -25,6 +29,43 @@ interface HandlerInput {
   route: AgentRouteScore;
   now: string;
 }
+
+type GateActionId = "stage1" | "playable" | "release";
+
+interface GateAction {
+  actionId: GateActionId;
+  label: string;
+  confirmToken: string;
+  expectedStages: StageId[];
+}
+
+interface GateReviewLine {
+  agentId: AgentId;
+  roomKind: RoomKind;
+  messageType: MessageType;
+  content: string;
+}
+
+const gateActions: Record<GateActionId, GateAction> = {
+  stage1: {
+    actionId: "stage1",
+    label: "确认立项",
+    confirmToken: "执行确认：确认立项",
+    expectedStages: ["concept_discussion"]
+  },
+  playable: {
+    actionId: "playable",
+    label: "首个可玩通过",
+    confirmToken: "执行确认：首个可玩通过",
+    expectedStages: ["production"]
+  },
+  release: {
+    actionId: "release",
+    label: "批准发布",
+    confirmToken: "执行确认：批准发布",
+    expectedStages: ["release_preparation", "release_gate"]
+  }
+};
 
 const emptyChildrenSummary = (): TaskChildrenSummary => ({
   doing: 0,
@@ -50,13 +91,29 @@ export class LocalAgentRuntime {
     liveops_analytics: handleLiveOps
   };
 
-  handleProducerMessage(kernel: StudioKernel, message: StudioMessage): LocalAgentRunResult {
+  handleProducerMessage(kernel: StudioKernel, message: StudioMessage, options: LocalAgentRuntimeOptions = {}): LocalAgentRunResult {
+    const scriptedReplies = options.scriptedReplies ?? true;
     const routePlan = kernel.postMessage(message);
     const before = kernel.listMessages().length;
     const now = new Date().toISOString();
 
     const transitionApplied = applyProducerDecisionFlow(kernel, message, now);
     if (transitionApplied) {
+      return {
+        routePlan,
+        agentMessages: kernel.listMessages().slice(before)
+      };
+    }
+
+    if (isPresencePing(message.content)) {
+      writePresenceResponse(kernel);
+      return {
+        routePlan,
+        agentMessages: kernel.listMessages().slice(before)
+      };
+    }
+
+    if (!scriptedReplies) {
       return {
         routePlan,
         agentMessages: kernel.listMessages().slice(before)
@@ -87,6 +144,11 @@ function handleOrchestrator({ kernel, producerMessage, now }: HandlerInput): voi
     return;
   }
 
+  if (isPresencePing(producerMessage.content)) {
+    writePresenceResponse(kernel);
+    return;
+  }
+
   ensureStageOneTasks(kernel, now);
   writeAgentMessage(kernel, {
     agentId: "studio_orchestrator",
@@ -104,24 +166,283 @@ function handleOrchestrator({ kernel, producerMessage, now }: HandlerInput): voi
   });
 }
 
+function isPresencePing(content: string): boolean {
+  const normalized = content.trim().toLowerCase();
+  return /^(有人吗|有人在吗|在吗|在不在|hello|hi|hey|ping|有人么)[？?!.。！\s]*$/.test(normalized);
+}
+
+function writePresenceResponse(kernel: StudioKernel): void {
+  writeAgentMessage(kernel, {
+    agentId: "studio_orchestrator",
+    roomKind: "studio-main",
+    messageType: "progress_update",
+    content:
+      "我在。当前 Studio Orchestrator 在线，策划、美术、程序、QA 和发布运维角色会根据消息内容自动判断是否需要回复。你可以直接询问进度、提出修改意见，或点右侧项目启动按钮开始正式流程。"
+  });
+}
+
 function applyProducerDecisionFlow(kernel: StudioKernel, message: StudioMessage, now: string): boolean {
-  const content = message.content.toLowerCase();
-  if (isApprovalMessage(content) && kernel.project.currentStage === "concept_discussion") {
-    approveStageOne(kernel, message, now);
+  const gate = detectGateAction(message.content);
+  if (!gate) {
+    return false;
+  }
+
+  if (isGateExecutionConfirmation(message.content, gate)) {
+    executeGateAction(kernel, message, gate, now);
     return true;
   }
 
-  if (isPlayableApprovalMessage(content) && kernel.project.currentStage === "production") {
-    approveFirstPlayable(kernel, message, now);
-    return true;
+  writeGateReview(kernel, message, gate, now);
+  return true;
+}
+
+function executeGateAction(kernel: StudioKernel, message: StudioMessage, gate: GateAction, now: string): void {
+  if (!isGateStageApplicable(kernel, gate)) {
+    writeAgentMessage(kernel, {
+      agentId: "studio_orchestrator",
+      roomKind: "studio-main",
+      messageType: "blocker",
+      content: `无法执行「${gate.label}」：当前阶段是「${stageText(kernel.project.currentStage)}」，该门禁只适用于「${gate.expectedStages.map(stageText).join("、")}」。请先完成前置阶段。`
+    });
+    return;
   }
 
-  if (isReleaseMessage(content) && (kernel.project.currentStage === "release_preparation" || kernel.project.currentStage === "release_gate")) {
-    approveRelease(kernel, message, now);
-    return true;
+  if (!hasRecentGateReview(kernel, gate, message.messageId)) {
+    writeAgentMessage(kernel, {
+      agentId: "studio_orchestrator",
+      roomKind: "studio-main",
+      messageType: "decision_request",
+      content: `无法直接执行「${gate.label}」。制作人决策必须先经过相关 Agent 门禁评审。请先发起「${gate.label}」评审，查看准备度、阻塞和风险后，再使用二次确认口令。`
+    });
+    return;
   }
 
-  return false;
+  switch (gate.actionId) {
+    case "stage1":
+      approveStageOne(kernel, message, now);
+      return;
+    case "playable":
+      approveFirstPlayable(kernel, message, now);
+      return;
+    case "release":
+      approveRelease(kernel, message, now);
+      return;
+  }
+}
+
+function writeGateReview(kernel: StudioKernel, message: StudioMessage, gate: GateAction, now: string): void {
+  const stageApplicable = isGateStageApplicable(kernel, gate);
+  const reviewLines = buildGateReviewLines(kernel, gate, stageApplicable, now);
+  for (const line of reviewLines) {
+    writeAgentMessage(kernel, line);
+  }
+
+  writeProjectMemory(kernel, {
+    memoryId: `mem_gate_review_${gate.actionId}_${message.messageId}`,
+    ownerAgent: "studio_orchestrator",
+    type: "gate_review",
+    content: `制作人请求「${gate.label}」门禁评审。系统已记录相关 Agent 准备度、阻塞和风险；未执行阶段推进。`,
+    now
+  });
+}
+
+function buildGateReviewLines(kernel: StudioKernel, gate: GateAction, stageApplicable: boolean, now: string): GateReviewLine[] {
+  switch (gate.actionId) {
+    case "stage1":
+      ensureStageOneTasks(kernel, now);
+      return buildStageOneReview(kernel, gate, stageApplicable);
+    case "playable":
+      return buildPlayableReview(kernel, gate, stageApplicable);
+    case "release":
+      return buildReleaseReview(kernel, gate, stageApplicable);
+  }
+}
+
+function buildStageOneReview(kernel: StudioKernel, gate: GateAction, stageApplicable: boolean): GateReviewLine[] {
+  const designTask = kernel.findTask("task_stage_1_design_clarification");
+  const artTask = kernel.findTask("task_stage_1_art_direction");
+  const scopeTask = kernel.findTask("task_stage_1_scope_review");
+  const gdd = kernel.listArtifacts().find((artifact) => artifact.artifactId === "artifact_gdd_baseline_draft");
+  const artBible = kernel.listArtifacts().find((artifact) => artifact.artifactId === "artifact_art_bible_baseline_draft");
+  const blockers = [...(designTask?.blockers ?? []), ...(artTask?.blockers ?? []), ...(scopeTask?.blockers ?? [])];
+  const missing = [
+    ...(gdd ? [] : ["GDD baseline 尚未生成"]),
+    ...(artBible ? [] : ["Art Bible baseline 尚未生成"])
+  ];
+  const risks = [
+    ...blockers,
+    ...missing,
+    "强行推进会把未澄清的玩法边界和视觉风格带入开发，后续返工成本会上升。"
+  ];
+
+  return [
+    {
+      agentId: "game_designer",
+      roomKind: "design-room",
+      messageType: "review",
+      content: `门禁评审：${gate.label}。策划准备度：${readinessText(stageApplicable && Boolean(gdd) && !designTask?.blockers.length)}。${taskStatusText(designTask)} 风险：${formatList([...(designTask?.blockers ?? []), "核心操作、胜负条件和第一可玩范围需要制作人明确确认。"])}`
+    },
+    {
+      agentId: "art_director",
+      roomKind: "art-room",
+      messageType: "review",
+      content: `门禁评审：${gate.label}。美术准备度：${readinessText(stageApplicable && Boolean(artBible) && !artTask?.blockers.length)}。${taskStatusText(artTask)} 风险：${formatList([...(artTask?.blockers ?? []), "视觉参考、主色和禁用风格未确认时，资产生产会出现方向返工。"])}`
+    },
+    {
+      agentId: "producer",
+      roomKind: "studio-main",
+      messageType: "review",
+      content: `门禁评审：${gate.label}。制作协调结论：${stageApplicable ? "允许制作人做风险确认，但当前不自动推进。" : "当前阶段不匹配，不能执行该门禁。"} 范围风险：${formatList(risks)}`
+    },
+    gateSummaryLine(kernel, gate, stageApplicable, risks)
+  ];
+}
+
+function buildPlayableReview(kernel: StudioKernel, gate: GateAction, stageApplicable: boolean): GateReviewLine[] {
+  const assetTask = kernel.findTask("task_stage_2_asset_pipeline");
+  const codeTask = kernel.findTask("task_stage_2_cocos_implementation");
+  const qaTask = kernel.findTask("task_stage_2_qa_playtest");
+  const build = kernel.listArtifacts().find((artifact) => artifact.artifactId === "artifact_wechat_dev_build");
+  const qaReport = kernel.listArtifacts().find((artifact) => artifact.artifactId === "artifact_qa_playtest_report");
+  const blockers = [...(assetTask?.blockers ?? []), ...(codeTask?.blockers ?? []), ...(qaTask?.blockers ?? [])];
+  const missing = [
+    ...(build ? [] : ["微信小游戏开发构建尚未生成"]),
+    ...(qaReport ? [] : ["首个可玩 QA 试玩报告尚未生成"])
+  ];
+  const risks = [
+    ...blockers,
+    ...missing,
+    "强行通过首个可玩会跳过可玩性、稳定性和核心循环验证。"
+  ];
+
+  return [
+    {
+      agentId: "gameplay_programmer",
+      roomKind: "engineering-room",
+      messageType: "review",
+      content: `门禁评审：${gate.label}。程序准备度：${readinessText(stageApplicable && Boolean(build) && !codeTask?.blockers.length)}。${taskStatusText(codeTask)} 风险：${formatList([...(codeTask?.blockers ?? []), build ? "已有开发构建，但仍需确认核心循环手感。" : "缺少可运行开发构建。"])}`
+    },
+    {
+      agentId: "cocos_automation",
+      roomKind: "engineering-room",
+      messageType: "review",
+      content: `门禁评审：${gate.label}。Cocos 自动化准备度：${readinessText(stageApplicable && Boolean(build))}。构建状态：${build ? artifactStatusText(build) : "未发现开发构建产物"}。`
+    },
+    {
+      agentId: "qa_evaluator",
+      roomKind: "qa-room",
+      messageType: "review",
+      content: `门禁评审：${gate.label}。QA 准备度：${readinessText(stageApplicable && Boolean(qaReport) && !qaTask?.blockers.length)}。${taskStatusText(qaTask)} 风险：${formatList([...(qaTask?.blockers ?? []), qaReport ? "QA 报告仍需制作人审阅结论。" : "缺少试玩报告、截图或问题清单。"])}`
+    },
+    gateSummaryLine(kernel, gate, stageApplicable, risks)
+  ];
+}
+
+function buildReleaseReview(kernel: StudioKernel, gate: GateAction, stageApplicable: boolean): GateReviewLine[] {
+  const releaseTask = kernel.findTask("task_stage_3_wechat_release");
+  const qaTask = kernel.findTask("task_stage_3_qa_release_gate");
+  const devopsTask = kernel.findTask("task_stage_3_devops_deploy");
+  const releaseBuild = kernel.listArtifacts().find((artifact) => artifact.artifactId === "artifact_wechat_release_build");
+  const releaseGate = kernel.listArtifacts().find((artifact) => artifact.artifactId === "artifact_release_gate_report");
+  const deployment = kernel.listArtifacts().find((artifact) => artifact.artifactId === "artifact_deployment_report");
+  const rollback = kernel.listArtifacts().find((artifact) => artifact.artifactId === "artifact_rollback_plan");
+  const blockers = [...(releaseTask?.blockers ?? []), ...(qaTask?.blockers ?? []), ...(devopsTask?.blockers ?? [])];
+  const missing = [
+    ...(releaseBuild ? [] : ["微信 release 构建尚未生成"]),
+    ...(releaseGate ? [] : ["发布门禁报告尚未生成"]),
+    ...(deployment ? [] : ["部署记录尚未生成"]),
+    ...(rollback ? [] : ["回滚方案尚未生成"])
+  ];
+  const risks = [
+    ...blockers,
+    ...missing,
+    "强行发布会带来线上不可回滚、包体问题、平台审核失败或 QA 未覆盖风险。"
+  ];
+
+  return [
+    {
+      agentId: "wechat_platform",
+      roomKind: "release-room",
+      messageType: "review",
+      content: `门禁评审：${gate.label}。微信平台准备度：${readinessText(stageApplicable && Boolean(releaseBuild) && !releaseTask?.blockers.length)}。${taskStatusText(releaseTask)} 构建状态：${releaseBuild ? artifactStatusText(releaseBuild) : "未发现 release 构建"}。`
+    },
+    {
+      agentId: "qa_evaluator",
+      roomKind: "qa-room",
+      messageType: "review",
+      content: `门禁评审：${gate.label}。发布 QA 准备度：${readinessText(stageApplicable && Boolean(releaseGate) && !qaTask?.blockers.length)}。${taskStatusText(qaTask)} 门禁报告：${releaseGate ? artifactStatusText(releaseGate) : "未生成"}。`
+    },
+    {
+      agentId: "devops",
+      roomKind: "release-room",
+      messageType: "review",
+      content: `门禁评审：${gate.label}。运维准备度：${readinessText(stageApplicable && Boolean(deployment) && Boolean(rollback) && !devopsTask?.blockers.length)}。${taskStatusText(devopsTask)} 风险：${formatList([...(devopsTask?.blockers ?? []), deployment && rollback ? "部署和回滚记录存在，但仍需确认真实凭据引用。" : "缺少部署记录或回滚方案。"])}`
+    },
+    {
+      agentId: "liveops_analytics",
+      roomKind: "studio-main",
+      messageType: "review",
+      content: `门禁评审：${gate.label}。LiveOps 准备度：${readinessText(stageApplicable && Boolean(deployment))}。上线后仍需观察留存、失败率、局内流失点和后续迭代优先级。`
+    },
+    gateSummaryLine(kernel, gate, stageApplicable, risks)
+  ];
+}
+
+function gateSummaryLine(kernel: StudioKernel, gate: GateAction, stageApplicable: boolean, risks: string[]): GateReviewLine {
+  const stageMessage = stageApplicable
+    ? `如制作人已阅读以上风险并仍要求推进，请发送二次确认口令：${gate.confirmToken}`
+    : `当前阶段是「${stageText(kernel.project.currentStage)}」，该门禁只适用于「${gate.expectedStages.map(stageText).join("、")}」，因此不会提供执行口令。`;
+  return {
+    agentId: "studio_orchestrator",
+    roomKind: "studio-main",
+    messageType: "decision_request",
+    content: `门禁评审汇总：${gate.label}。系统未执行阶段推进。主要风险：${formatList(risks)} ${stageMessage}`
+  };
+}
+
+function detectGateAction(content: string): GateAction | undefined {
+  const normalized = content.toLowerCase();
+  if (isReleaseMessage(normalized) || normalized.includes(gateActions.release.confirmToken.toLowerCase())) {
+    return gateActions.release;
+  }
+  if (isPlayableApprovalMessage(normalized) || normalized.includes(gateActions.playable.confirmToken.toLowerCase())) {
+    return gateActions.playable;
+  }
+  if (isApprovalMessage(normalized) || normalized.includes(gateActions.stage1.confirmToken.toLowerCase())) {
+    return gateActions.stage1;
+  }
+  return undefined;
+}
+
+function isGateExecutionConfirmation(content: string, gate: GateAction): boolean {
+  const normalized = content.toLowerCase();
+  return normalized.includes(gate.confirmToken.toLowerCase()) || (normalized.includes("执行确认") && normalized.includes(gate.label.toLowerCase()));
+}
+
+function isGateStageApplicable(kernel: StudioKernel, gate: GateAction): boolean {
+  return gate.expectedStages.includes(kernel.project.currentStage);
+}
+
+function hasRecentGateReview(kernel: StudioKernel, gate: GateAction, currentMessageId?: string): boolean {
+  const messages = kernel.listMessages();
+  const reviewNeedle = `二次确认口令：${gate.confirmToken}`;
+  let latestReview = -1;
+  let latestExecution = -1;
+  for (let index = 0; index < messages.length; index += 1) {
+    const message = messages[index];
+    if (!message) {
+      continue;
+    }
+
+    if (message.senderType === "agent" && message.content.includes(reviewNeedle)) {
+      latestReview = index;
+    }
+    if (message.messageId !== currentMessageId && message.senderType === "producer" && isGateExecutionConfirmation(message.content, gate)) {
+      latestExecution = index;
+    }
+  }
+
+  return latestReview !== -1 && latestReview > latestExecution;
 }
 
 function approveStageOne(kernel: StudioKernel, message: StudioMessage, now: string): void {
@@ -169,6 +490,54 @@ function isReleaseMessage(content: string): boolean {
     (content.includes("发布") || content.includes("上线") || content.includes("release")) &&
     (content.includes("确认") || content.includes("同意") || content.includes("批准") || content.includes("通过"))
   );
+}
+
+function readinessText(isReady: boolean): string {
+  return isReady ? "基本就绪" : "未准备好";
+}
+
+function taskStatusText(task: Task | undefined): string {
+  if (!task) {
+    return "任务状态：未创建。";
+  }
+
+  return `任务状态：${task.status}，进度 ${task.progressPercent ?? 0}%。`;
+}
+
+function artifactStatusText(artifact: Artifact): string {
+  return `${artifact.type} / ${artifact.status}`;
+}
+
+function stageText(stageId: StageId): string {
+  switch (stageId) {
+    case "concept_discussion":
+      return "立项讨论";
+    case "concept_review":
+      return "立项评审";
+    case "production":
+      return "开发落地";
+    case "first_playable_review":
+      return "首个可玩评审";
+    case "release_preparation":
+      return "发布准备";
+    case "release_gate":
+      return "发布门禁";
+    case "production_deploy":
+      return "生产部署";
+    case "liveops":
+      return "持续运营";
+    default:
+      return stageId;
+  }
+}
+
+function formatList(items: string[]): string {
+  const filtered = [...new Set(items.map((item) => item.trim()).filter(Boolean))];
+  if (filtered.length === 0) {
+    return "暂无明确阻塞。";
+  }
+
+  return filtered.join("；");
 }
 
 function approveFirstPlayable(kernel: StudioKernel, message: StudioMessage, now: string): void {

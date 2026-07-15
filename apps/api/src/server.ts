@@ -142,6 +142,13 @@ export async function handleRequest(request: IncomingMessage, response: ServerRe
       }
     }
 
+    if (settingsRoute?.resource === "model-provider-tests") {
+      if (request.method === "POST" && settingsRoute.childId) {
+        sendJson(response, 200, { result: await modelSettingsStore.testProvider(settingsRoute.childId) });
+        return;
+      }
+    }
+
     if (request.method === "GET" && url.pathname === "/projects") {
       sendJson(response, 200, { projects: studioStore.listProjects() });
       return;
@@ -177,7 +184,15 @@ export async function handleRequest(request: IncomingMessage, response: ServerRe
 
     if (request.method === "POST" && resource === "start") {
       sendJson(response, 202, {
-        ...studioStore.startProject(projectRoute.projectId),
+        ...(await studioStore.startProject(projectRoute.projectId)),
+        taskBoard: studioStore.getKernel(projectRoute.projectId).buildTaskBoard()
+      });
+      return;
+    }
+
+    if (request.method === "POST" && resource === "pause") {
+      sendJson(response, 200, {
+        ...studioStore.pauseProject(projectRoute.projectId),
         taskBoard: studioStore.getKernel(projectRoute.projectId).buildTaskBoard()
       });
       return;
@@ -199,7 +214,7 @@ export async function handleRequest(request: IncomingMessage, response: ServerRe
         throw new HttpError(400, "content is required");
       }
 
-      const result = studioStore.postProducerMessage(projectRoute.projectId, input);
+      const result = await studioStore.postProducerMessage(projectRoute.projectId, input);
       sendJson(response, 202, {
         ...result,
         taskBoard: kernel.buildTaskBoard()

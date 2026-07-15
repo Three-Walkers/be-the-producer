@@ -7,38 +7,61 @@ const created = studioStore.createProject({
 });
 
 const projectId = created.project.projectId;
-const kernel = studioStore.getKernel(projectId);
+const started = await studioStore.startProject(projectId);
 
-const stageOneApproval = studioStore.postProducerMessage(projectId, {
+const stageOneReview = await studioStore.postProducerMessage(projectId, {
   roomKind: "studio-main",
-  messageType: "decision_record",
-  content: "确认立项：玩法、美术方向和第一可玩范围都同意，进入开发落地。"
+  messageType: "review",
+  content: "请求门禁评审：确认立项。"
 });
 
-const firstPlayableApproval = studioStore.postProducerMessage(projectId, {
+const stageOneApproval = await studioStore.postProducerMessage(projectId, {
   roomKind: "studio-main",
   messageType: "decision_record",
-  content: "首个可玩版本通过，接受当前核心循环，进入发布准备。"
+  content: "执行确认：确认立项。制作人已阅读 Agent 门禁评审和风险提示，仍确认进入开发落地。"
 });
 
-const releaseApproval = studioStore.postProducerMessage(projectId, {
+const firstPlayableReview = await studioStore.postProducerMessage(projectId, {
+  roomKind: "studio-main",
+  messageType: "review",
+  content: "请求门禁评审：首个可玩通过。"
+});
+
+const firstPlayableApproval = await studioStore.postProducerMessage(projectId, {
+  roomKind: "studio-main",
+  messageType: "decision_record",
+  content: "执行确认：首个可玩通过。制作人已阅读 Agent 门禁评审和风险提示，仍确认进入发布准备。"
+});
+
+const releaseReview = await studioStore.postProducerMessage(projectId, {
+  roomKind: "release-room",
+  messageType: "review",
+  content: "请求门禁评审：批准发布。"
+});
+
+const releaseApproval = await studioStore.postProducerMessage(projectId, {
   roomKind: "release-room",
   messageType: "decision_record",
-  content: "确认发布上线，批准 release。"
+  content: "执行确认：批准发布。制作人已阅读 Agent 门禁评审和风险提示，仍确认进入发布和持续运营。"
 });
+
+const kernel = studioStore.getKernel(projectId);
 
 console.log("PROJECT");
 console.log(JSON.stringify(created.project, null, 2));
 
 console.log("BOOTSTRAP ROUTE TARGETS");
-console.log(JSON.stringify(created.bootstrap?.routePlan.targets, null, 2));
+console.log(JSON.stringify(started.routePlan.targets, null, 2));
 
 console.log("STAGE TRANSITIONS");
 console.log(
   JSON.stringify(
     {
+      stageOneReview: stageOneReview.agentMessages.map((message) => message.content),
       stageOneApproval: stageOneApproval.agentMessages.map((message) => message.content),
+      firstPlayableReview: firstPlayableReview.agentMessages.map((message) => message.content),
       firstPlayableApproval: firstPlayableApproval.agentMessages.map((message) => message.content),
+      releaseReview: releaseReview.agentMessages.map((message) => message.content),
       releaseApproval: releaseApproval.agentMessages.map((message) => message.content),
       currentStage: kernel.project.currentStage
     },
