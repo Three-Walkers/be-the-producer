@@ -1,0 +1,15 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "rootDir": "src",
+    "outDir": "dist",
+    "paths": {
+      "@game-pipeline/shared-schemas": ["../shared-schemas/src/index.ts"]
+    }
+  },
+  "references": [
+    { "path": "../shared-schemas" }
+  ],
+  "include": ["src/**/*.ts"]
+}

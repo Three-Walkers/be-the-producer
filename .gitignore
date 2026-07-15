@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.turbo/
+.DS_Store
+.env
+.env.*
+*.log
+*.tsbuildinfo
+.local/
+studio/projects/*
+!studio/projects/.gitkeep
+studio/projects/*/secrets/
+studio/projects/*/**/server-logs/

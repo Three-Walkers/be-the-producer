@@ -1,0 +1,17 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "rootDir": "src",
+    "outDir": "dist",
+    "paths": {
+      "@game-pipeline/agent-runtime": ["../../packages/agent-runtime/src/index.ts"],
+      "@game-pipeline/shared-schemas": ["../../packages/shared-schemas/src/index.ts"]
+    }
+  },
+  "references": [
+    { "path": "../../packages/shared-schemas" },
+    { "path": "../../packages/agent-runtime" }
+  ],
+  "include": ["src/**/*.ts"]
+}

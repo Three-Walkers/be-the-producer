@@ -1,0 +1,27 @@
+{
+  "name": "game-pipeline-agents",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AI-powered virtual game studio for Cocos WeChat mini-game delivery.",
+  "type": "module",
+  "bin": {
+    "game-pipeline-agents": "./bin/game-pipeline-agents.js"
+  },
+  "scripts": {
+    "build": "tsc -b packages/shared-schemas packages/agent-runtime apps/api",
+    "typecheck": "tsc -b packages/shared-schemas packages/agent-runtime apps/api --pretty false",
+    "clean": "rm -rf packages/*/dist packages/*/*.tsbuildinfo apps/*/dist apps/*/*.tsbuildinfo",
+    "start": "node ./bin/game-pipeline-agents.js",
+    "start:local": "node ./bin/game-pipeline-agents.js",
+    "dev:api": "npm --workspace @game-pipeline/api run dev",
+    "demo": "npm --workspace @game-pipeline/api run demo"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.1",
+    "typescript": "^5.5.4"
+  },
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ]
+}
