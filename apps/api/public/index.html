@@ -3,36 +3,40 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Game Pipeline Agents</title>
+    <title>Be The Producer</title>
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
     <div class="app-shell">
       <aside class="sidebar">
-        <div class="brand">
-          <div class="brand-main">
-            <div class="brand-mark">GP</div>
-            <div>
-              <h1>Game Pipeline Agents</h1>
-              <p>全流程微信小游戏 Agent Studio</p>
+        <section class="sidebar-card sidebar-project-card">
+          <div class="brand">
+            <div class="brand-main">
+              <div class="brand-mark">BTP</div>
+              <div>
+                <h1>Be The Producer</h1>
+                <p>微信小游戏生产流水线</p>
+              </div>
             </div>
+            <button id="open-settings" class="icon-button" type="button" aria-label="打开设置" title="设置">⚙</button>
           </div>
-          <button id="open-settings" class="icon-button" type="button" aria-label="打开设置" title="设置">⚙</button>
-        </div>
 
-        <form id="project-form" class="project-form">
-          <label>
-            项目名称
-            <input id="project-name" value="毛线球防守" autocomplete="off" />
-          </label>
-          <label>
-            初始 idea
-            <textarea id="project-idea" rows="7">做一个微信小游戏，玩家用点击防守毛线球，不让它们滚出篮子，单局一分钟，画风轻松可爱。</textarea>
-          </label>
-          <button type="submit">创建项目</button>
-        </form>
+          <form id="project-form" class="project-form">
+            <div class="project-form-fields">
+              <label>
+                项目名称
+                <input id="project-name" value="毛线球防守" autocomplete="off" />
+              </label>
+              <label>
+                初始 idea
+                <textarea id="project-idea" rows="5">做一个微信小游戏，玩家用点击防守毛线球，不让它们滚出篮子，单局一分钟，画风轻松可爱。</textarea>
+              </label>
+            </div>
+            <button type="submit">创建项目</button>
+          </form>
+        </section>
 
-        <section class="panel">
+        <section class="panel sidebar-card sidebar-project-list-card">
           <div class="panel-heading">
             <h2>已有项目</h2>
             <span id="project-list-summary">0</span>
@@ -40,7 +44,7 @@
           <div id="project-list" class="project-list"></div>
         </section>
 
-        <section class="panel">
+        <section class="panel sidebar-card sidebar-room-card">
           <h2>房间</h2>
           <div id="room-list" class="room-list"></div>
         </section>

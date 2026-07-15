@@ -110,18 +110,36 @@ textarea {
 }
 
 .sidebar,
+.chat-column,
 .workspace-column {
   min-width: 0;
   min-height: 0;
   padding: 18px;
   border-right: 1px solid var(--line);
   background: #fbfbf8;
-  overflow-y: auto;
+  overflow: hidden;
+}
+
+.sidebar {
+  display: grid;
+  grid-template-rows: minmax(390px, 0.82fr) minmax(210px, 0.66fr) minmax(170px, 0.52fr);
+  gap: 16px;
+  overflow: hidden;
 }
 
 .workspace-column {
+  display: grid;
+  grid-template-rows: minmax(180px, 0.36fr) minmax(180px, 0.36fr) minmax(0, 1fr);
+  gap: 16px;
   border-right: 0;
   border-left: 1px solid var(--line);
+}
+
+.sidebar-card {
+  display: grid;
+  min-height: 0;
+  margin: 0;
+  overflow: hidden;
 }
 
 .brand {
@@ -129,7 +147,7 @@ textarea {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  margin-bottom: 18px;
+  margin-bottom: 0;
 }
 
 .brand-main {
@@ -147,6 +165,7 @@ textarea {
   border-radius: 8px;
   background: var(--text);
   color: #fff;
+  font-size: 14px;
   font-weight: 700;
 }
 
@@ -235,7 +254,78 @@ textarea {
   box-shadow: var(--shadow);
 }
 
+.panel.sidebar-card {
+  margin-bottom: 0;
+}
+
+.chat-column .topbar,
+.chat-column .chat-panel,
+.chat-column .composer,
+.workspace-column .panel {
+  min-height: 0;
+  margin: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+.workspace-column .panel {
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.sidebar-project-card {
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: 14px;
+  box-shadow: var(--shadow);
+}
+
+.sidebar-project-card .project-form {
+  display: grid;
+  grid-template-rows: auto auto;
+  gap: 12px;
+  min-height: 0;
+  margin: 0;
+  overflow: hidden;
+}
+
+.project-form-fields {
+  display: grid;
+  align-content: start;
+  gap: 12px;
+  min-height: 0;
+  overflow: visible;
+  padding-right: 0;
+}
+
+#project-idea {
+  height: 150px;
+  min-height: 150px;
+  max-height: 150px;
+  overflow-y: auto;
+  resize: none;
+}
+
+.sidebar-project-list-card,
+.sidebar-room-card {
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.sidebar-project-list-card .project-list,
+.sidebar-room-card .room-list {
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
 .project-form button[type="submit"] {
+  align-self: end;
+  width: 100%;
   min-height: 42px;
 }
 
@@ -377,6 +467,7 @@ textarea {
 .project-list {
   display: grid;
   gap: 8px;
+  align-content: start;
 }
 
 .project-row {
@@ -385,12 +476,14 @@ textarea {
   gap: 8px;
   align-items: stretch;
   width: 100%;
-  min-height: 44px;
+  height: 72px;
+  min-height: 72px;
   border: 1px solid var(--line);
   border-radius: 7px;
   background: #fff;
   color: var(--text);
-  padding: 6px;
+  overflow: hidden;
+  padding: 8px;
 }
 
 .project-row.active {
@@ -401,11 +494,13 @@ textarea {
 .project-open {
   justify-content: start;
   min-width: 0;
-  min-height: 38px;
+  height: 100%;
+  min-height: 0;
   border: 0;
   background: transparent;
   color: var(--text);
   padding: 0 8px;
+  overflow: hidden;
   text-align: left;
 }
 
@@ -415,13 +510,24 @@ textarea {
 
 .project-open span {
   display: grid;
-  gap: 3px;
+  align-content: center;
+  gap: 2px;
   min-width: 0;
+  overflow: hidden;
+}
+
+.project-open strong,
+.project-open small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .project-open small {
   color: var(--muted);
   font-size: 11px;
+  line-height: 1.25;
 }
 
 .project-actions {
@@ -432,8 +538,9 @@ textarea {
 
 .project-action-button {
   display: grid;
-  width: 34px;
-  min-height: 34px;
+  width: 40px;
+  min-height: 40px;
+  height: 40px;
   place-items: center;
   border-color: var(--line);
   background: #fff;
@@ -622,7 +729,7 @@ textarea {
 
 .assignment-row {
   display: grid;
-  grid-template-columns: minmax(230px, 1fr) 138px minmax(150px, 0.7fr) minmax(170px, 0.8fr) 60px;
+  grid-template-columns: minmax(230px, 1fr) 138px minmax(150px, 0.7fr) minmax(190px, 0.8fr) 60px;
   gap: 10px;
   align-items: center;
   min-height: 56px;
@@ -683,6 +790,42 @@ textarea {
   white-space: nowrap;
 }
 
+.avatar-upload-control {
+  display: grid;
+  grid-template-columns: 34px minmax(80px, 1fr) 34px;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+}
+
+.avatar-upload-button {
+  width: auto;
+  border-color: var(--line-strong);
+  background: #fff;
+  color: var(--accent-strong);
+  padding: 0 10px;
+}
+
+.avatar-upload-button:hover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+
+.avatar-clear-button {
+  width: 34px;
+  border-color: var(--line);
+  background: #fff;
+  color: var(--muted);
+  font-size: 18px;
+}
+
+.avatar-clear-button:hover {
+  border-color: var(--danger);
+  background: #fff1f1;
+  color: var(--danger);
+}
+
 .role-avatar {
   display: inline-grid;
   width: 34px;
@@ -723,12 +866,10 @@ textarea {
 
 .chat-column {
   display: grid;
-  grid-template-rows: auto 1fr auto;
+  grid-template-rows: minmax(118px, auto) minmax(0, 1fr) minmax(142px, auto);
+  gap: 16px;
   height: 100vh;
   height: 100dvh;
-  min-width: 0;
-  min-height: 0;
-  overflow: hidden;
 }
 
 .topbar {
@@ -736,9 +877,7 @@ textarea {
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  padding: 18px 22px;
-  border-bottom: 1px solid var(--line);
-  background: var(--surface-strong);
+  padding: 18px 20px;
 }
 
 .stage-pill {
@@ -752,9 +891,8 @@ textarea {
 }
 
 .chat-panel {
-  min-height: 0;
   overflow-y: auto;
-  padding: 18px 22px;
+  padding: 18px 20px;
 }
 
 .message-list {
@@ -844,6 +982,48 @@ textarea {
   line-height: 1.55;
 }
 
+.claim-verification-list {
+  display: grid;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.claim-verification {
+  display: grid;
+  gap: 2px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 7px 9px;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.claim-verification span {
+  font-weight: 750;
+}
+
+.claim-verification small {
+  color: var(--muted);
+}
+
+.claim-verified {
+  border-color: #aacdc0;
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+
+.claim-insufficient {
+  border-color: #ead5a9;
+  background: #fff8e8;
+  color: var(--warn);
+}
+
+.claim-mismatch {
+  border-color: #e2b7b7;
+  background: #fff1f1;
+  color: var(--danger);
+}
+
 .workspace-path-link {
   display: inline;
   min-height: 0;
@@ -912,15 +1092,10 @@ textarea {
 }
 
 .composer {
-  position: sticky;
-  bottom: 0;
   z-index: 10;
   display: grid;
   gap: 12px;
-  border-top: 1px solid var(--line);
-  background: var(--surface-strong);
-  box-shadow: 0 -8px 22px rgba(35, 47, 42, 0.06);
-  padding: 12px 22px 16px;
+  padding: 14px 20px;
 }
 
 .quick-actions {
@@ -1053,8 +1228,10 @@ textarea {
 .artifact-list,
 .workspace-tree {
   display: grid;
+  align-content: start;
   gap: 10px;
-  max-height: 320px;
+  min-height: 0;
+  max-height: none;
   overflow-y: auto;
 }
 
@@ -1253,6 +1430,9 @@ textarea {
   position: fixed;
   left: 50%;
   bottom: 20px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
   max-width: 560px;
   transform: translateX(-50%);
   border: 1px solid var(--line);
@@ -1261,6 +1441,20 @@ textarea {
   color: #fff;
   padding: 10px 14px;
   box-shadow: var(--shadow);
+}
+
+.toast button {
+  flex: 0 0 auto;
+  min-height: 28px;
+  border-color: rgba(255, 255, 255, 0.35);
+  background: rgba(255, 255, 255, 0.12);
+  color: #fff;
+  padding: 0 10px;
+}
+
+.toast button:hover {
+  border-color: #fff;
+  background: rgba(255, 255, 255, 0.2);
 }
 
 .artifact-preview-dialog {
@@ -1349,6 +1543,10 @@ textarea {
     overflow-y: visible;
   }
 
+  .sidebar {
+    overflow: hidden;
+  }
+
   .workspace-column {
     grid-column: 1 / -1;
     border-top: 1px solid var(--line);
@@ -1359,7 +1557,7 @@ textarea {
     grid-template-columns: minmax(230px, 1fr) minmax(130px, 0.6fr) minmax(150px, 0.7fr) 60px;
   }
 
-  .assignment-row [data-assignment-avatar] {
+  .avatar-upload-control {
     grid-column: 1 / -2;
   }
 }
@@ -1378,6 +1576,19 @@ textarea {
     border: 0;
   }
 
+  .sidebar {
+    grid-template-rows: minmax(392px, 42vh) minmax(220px, 25vh) minmax(170px, 33vh);
+    height: 100vh;
+    height: 100dvh;
+    overflow: hidden;
+  }
+
+  #project-idea {
+    height: 142px;
+    min-height: 142px;
+    max-height: 142px;
+  }
+
   .chat-column {
     height: 100vh;
     height: 100dvh;
@@ -1391,7 +1602,7 @@ textarea {
     grid-template-columns: 1fr;
   }
 
-  .assignment-row [data-assignment-avatar] {
+  .avatar-upload-control {
     grid-column: auto;
   }
 }

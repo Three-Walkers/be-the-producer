@@ -1024,7 +1024,7 @@ function renderAgentAssignments() {
         .join("");
       return `<div class="assignment-row" data-agent-id="${escapeHtml(assignment.agentId)}">
         <div class="assignment-agent">
-          ${avatarMarkup(assignment.agentId, displayName)}
+          ${avatarMarkupWithUrl(assignment.agentId, displayName, assignment.avatarUrl)}
           <div class="assignment-meta">
             <strong>${escapeHtml(displayName)}</strong>
             <span>${escapeHtml(assignment.agentId)} · ${escapeHtml(capability)}</span>
@@ -1032,11 +1032,51 @@ function renderAgentAssignments() {
         </div>
         <select data-assignment-provider>${options}</select>
         <input data-assignment-model value="${escapeHtml(assignment.model)}" placeholder="使用连接默认模型" />
-        <input data-assignment-avatar value="${escapeHtml(assignment.avatarUrl ?? "")}" placeholder="头像 URL（可选）" />
+        <div class="avatar-upload-control">
+          <span data-avatar-preview>${avatarMarkupWithUrl(assignment.agentId, displayName, assignment.avatarUrl)}</span>
+          <input data-assignment-avatar type="hidden" value="${escapeHtml(assignment.avatarUrl ?? "")}" />
+          <input data-avatar-file type="file" accept="image/*" hidden />
+          <button data-pick-avatar class="avatar-upload-button" type="button">上传头像</button>
+          <button data-clear-avatar class="avatar-clear-button" type="button" aria-label="清除头像" title="清除头像">×</button>
+        </div>
         <button data-save-assignment type="button">保存</button>
       </div>`;
     })
     .join("");
+
+  container.querySelectorAll("[data-pick-avatar]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const row = button.closest("[data-agent-id]");
+      row.querySelector("[data-avatar-file]").click();
+    });
+  });
+
+  container.querySelectorAll("[data-avatar-file]").forEach((input) => {
+    input.addEventListener("change", async () => {
+      const row = input.closest("[data-agent-id]");
+      const file = input.files?.[0];
+      input.value = "";
+      if (!file) {
+        return;
+      }
+
+      try {
+        const avatarDataUrl = await readAvatarFileAsDataUrl(file);
+        row.querySelector("[data-assignment-avatar]").value = avatarDataUrl;
+        updateAssignmentAvatarPreview(row, avatarDataUrl);
+      } catch (error) {
+        showToast(error.message);
+      }
+    });
+  });
+
+  container.querySelectorAll("[data-clear-avatar]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const row = button.closest("[data-agent-id]");
+      row.querySelector("[data-assignment-avatar]").value = "";
+      updateAssignmentAvatarPreview(row, "");
+    });
+  });
 
   container.querySelectorAll("[data-save-assignment]").forEach((button) => {
     button.addEventListener("click", async () => {
@@ -1074,6 +1114,62 @@ function renderAgentAssignments() {
         }, 1200);
       }
     });
+  });
+}
+
+function updateAssignmentAvatarPreview(row, avatarUrl) {
+  const agentId = row.dataset.agentId;
+  const displayName = agentName(agentId);
+  row.querySelectorAll("[data-avatar-preview]").forEach((container) => {
+    container.innerHTML = avatarMarkupWithUrl(agentId, displayName, avatarUrl);
+  });
+  const agentAvatar = row.querySelector(".assignment-agent .role-avatar");
+  if (agentAvatar) {
+    agentAvatar.outerHTML = avatarMarkupWithUrl(agentId, displayName, avatarUrl);
+  }
+}
+
+async function readAvatarFileAsDataUrl(file) {
+  if (!file.type.startsWith("image/")) {
+    throw new Error("请选择图片文件作为头像。");
+  }
+
+  const source = await readFileAsDataUrl(file);
+  return resizeAvatarImage(source, file.type);
+}
+
+function readFileAsDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.addEventListener("load", () => resolve(String(reader.result ?? "")));
+    reader.addEventListener("error", () => reject(new Error("头像文件读取失败。")));
+    reader.readAsDataURL(file);
+  });
+}
+
+function resizeAvatarImage(source, mimeType) {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.addEventListener("load", () => {
+      const size = 160;
+      const canvas = document.createElement("canvas");
+      canvas.width = size;
+      canvas.height = size;
+      const context = canvas.getContext("2d");
+      if (!context) {
+        reject(new Error("当前浏览器无法处理头像图片。"));
+        return;
+      }
+
+      const sourceSize = Math.min(image.naturalWidth, image.naturalHeight);
+      const sourceX = Math.max(0, (image.naturalWidth - sourceSize) / 2);
+      const sourceY = Math.max(0, (image.naturalHeight - sourceSize) / 2);
+      context.drawImage(image, sourceX, sourceY, sourceSize, sourceSize, 0, 0, size, size);
+      const outputType = mimeType === "image/png" ? "image/png" : "image/jpeg";
+      resolve(canvas.toDataURL(outputType, 0.86));
+    });
+    image.addEventListener("error", () => reject(new Error("头像图片无法解析，请换一张图片。")));
+    image.src = source;
   });
 }
 
@@ -1300,6 +1396,7 @@ function renderMessages() {
             <span>${new Date(message.createdAt).toLocaleTimeString()}</span>
           </div>
           <div class="message-content">${renderMessageContent(message.content)}</div>
+          ${renderClaimVerifications(message)}
         </div>
       </article>`;
     })
@@ -1358,7 +1455,7 @@ function normalizeWorkspacePathCandidate(value) {
   }
 
   candidate = candidate.replace(/^\.\/+/, "");
-  const trimmed = candidate.replace(/[，。；、,;:!?！？)\]}]+$/g, "");
+  const trimmed = candidate.replace(/[，。；、,;:!?！？)\]}>）】》”’]+$/g, "");
   if (!trimmed || !trimmed.includes("/") || trimmed.includes("..")) {
     return undefined;
   }
@@ -1376,7 +1473,38 @@ function normalizeWorkspacePathCandidate(value) {
 }
 
 function workspacePathLink(path, label) {
-  return `<button class="workspace-path-link" type="button" data-open-workspace-path="${escapeHtml(path)}" title="在 Finder 中打开 ${escapeHtml(path)}">${escapeHtml(label)}</button>`;
+  return `<button class="workspace-path-link" type="button" data-open-workspace-path="${escapeHtml(path)}" title="打开精确路径 ${escapeHtml(path)}">${escapeHtml(label)}</button>`;
+}
+
+function renderClaimVerifications(message) {
+  const claims = Array.isArray(message.metadata?.claimVerifications) ? message.metadata.claimVerifications : [];
+  if (!claims.length) {
+    return "";
+  }
+
+  return `<div class="claim-verification-list">
+    ${claims
+      .map((claim) => {
+        const verdict = claim.verdict ?? "insufficient";
+        return `<div class="claim-verification claim-${escapeHtml(verdict)}">
+          <span>${escapeHtml(claimVerdictLabel(verdict))}</span>
+          <small>${escapeHtml(claim.reason ?? "未记录验证说明。")}</small>
+        </div>`;
+      })
+      .join("")}
+  </div>`;
+}
+
+function claimVerdictLabel(verdict) {
+  switch (verdict) {
+    case "verified":
+      return "已验证";
+    case "mismatch":
+      return "声明不成立";
+    case "insufficient":
+    default:
+      return "缺少证据";
+  }
 }
 
 function renderTypingIndicator(indicator) {
@@ -1517,11 +1645,33 @@ async function openArtifactInFinder(artifactId) {
 
 async function openWorkspacePath(path) {
   ensureProject();
-  await request(`/projects/${state.projectId}/workspace/open`, {
+  try {
+    const result = await request(`/projects/${state.projectId}/workspace/open`, {
+      method: "POST",
+      body: JSON.stringify({ path })
+    });
+    showToast(result.exact === false ? `已打开父目录：${result.target?.relativePath ?? path}` : "已在 Finder 中打开本地资源。");
+  } catch (error) {
+    const nearestTarget = error.payload?.details?.nearestTarget;
+    if (nearestTarget?.exists) {
+      showToast(error.message, {
+        label: "打开父目录",
+        onClick: () => openWorkspaceParent(path)
+      });
+      return;
+    }
+
+    showToast(error.message);
+  }
+}
+
+async function openWorkspaceParent(path) {
+  ensureProject();
+  const result = await request(`/projects/${state.projectId}/workspace/open`, {
     method: "POST",
-    body: JSON.stringify({ path })
+    body: JSON.stringify({ path, allowFallback: true })
   });
-  showToast("已在 Finder 中打开本地资源。");
+  showToast(`已打开父目录：${result.target?.relativePath ?? path}`);
 }
 
 function closeArtifactPreview() {
@@ -1643,9 +1793,12 @@ function mentionedAgentIds(content) {
 }
 
 function avatarMarkup(agentId, label) {
+  return avatarMarkupWithUrl(agentId, label, avatarUrlFor(agentId));
+}
+
+function avatarMarkupWithUrl(agentId, label, avatarUrl) {
   const theme = avatarThemes[agentId] ?? fallbackAvatarTheme(label);
-  const avatarUrl = avatarUrlFor(agentId);
-  const image = avatarUrl ? `<img src="${escapeHtml(avatarUrl)}" alt="" />` : escapeHtml(theme.initial);
+  const image = isAvatarImageUrl(avatarUrl) ? `<img src="${escapeHtml(avatarUrl)}" alt="" />` : escapeHtml(theme.initial);
   return `<span class="role-avatar" style="--avatar-bg: ${escapeHtml(theme.color)}" aria-hidden="true">${image}</span>`;
 }
 
@@ -1739,7 +1892,10 @@ async function request(path, options = {}) {
 
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw new Error(payload.error ?? `Request failed: ${response.status}`);
+    const error = new Error(payload.error ?? `Request failed: ${response.status}`);
+    error.status = response.status;
+    error.payload = payload;
+    throw error;
   }
   return payload;
 }
@@ -1750,14 +1906,24 @@ function ensureProject() {
   }
 }
 
-function showToast(message) {
+function showToast(message, action) {
   const toast = $("#toast");
-  toast.textContent = message;
+  toast.innerHTML = `<span>${escapeHtml(message)}</span>`;
+  if (action) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = action.label;
+    button.addEventListener("click", () => {
+      toast.hidden = true;
+      action.onClick();
+    });
+    toast.appendChild(button);
+  }
   toast.hidden = false;
   clearTimeout(showToast.timer);
   showToast.timer = setTimeout(() => {
     toast.hidden = true;
-  }, 2400);
+  }, action ? 7000 : 2400);
 }
 
 function playIcon() {
