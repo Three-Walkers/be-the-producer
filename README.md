@@ -1,8 +1,12 @@
-# Game Pipeline Agents
+# Be The Producer
 
 **English** | [简体中文](./README_zh.md)
 
-Game Pipeline Agents is an AI-powered virtual game studio product system and implementation workspace. The system takes a producer's initial game idea plus controlled server access, then coordinates specialized agents across planning, art, engineering, QA, release, and live operations to deliver a production-ready WeChat mini-game.
+Be The Producer exists to simplify game creation. Anyone with a game idea can act as the producer, even when that idea is unvalidated, incomplete, or still only a rough direction.
+
+The product turns an early idea into a transparent production process. The producer does not need to start with a complete design document, a full development team, or professional game-production experience. They bring the initial spark, review key milestones, make product decisions, and guide the work as the AI game studio turns the idea into a playable game.
+
+Be The Producer is an AI-powered virtual game studio product system and implementation workspace. The system takes a producer's initial game idea plus controlled server access, then coordinates specialized agents across planning, art, engineering, QA, release, and live operations to deliver a production-ready WeChat mini-game.
 
 The initial product scope is lightweight WeChat mini-games built with Cocos Creator, not large-scale PC or console games.
 
