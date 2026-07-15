@@ -1,7 +1,10 @@
 import type {
   AgentId,
   Artifact,
+  ArtifactLedgerEntry,
+  ArtifactOperation,
   AuditEvent,
+  ClaimVerification,
   MemoryRecord,
   Project,
   ProjectId,
@@ -26,6 +29,9 @@ export interface StudioKernelState {
   messages: StudioMessage[];
   tasks: Task[];
   artifacts: Artifact[];
+  artifactOperations: ArtifactOperation[];
+  artifactLedger: ArtifactLedgerEntry[];
+  claimVerifications: ClaimVerification[];
 }
 
 export interface StudioKernelSnapshot extends StudioKernelState {
@@ -61,7 +67,10 @@ export class StudioKernel {
       rooms: restoredState.rooms ?? createDefaultRooms(project.projectId),
       messages: restoredState.messages ?? [],
       tasks: restoredState.tasks ?? [],
-      artifacts: restoredState.artifacts ?? []
+      artifacts: restoredState.artifacts ?? [],
+      artifactOperations: restoredState.artifactOperations ?? [],
+      artifactLedger: restoredState.artifactLedger ?? [],
+      claimVerifications: restoredState.claimVerifications ?? []
     };
   }
 
@@ -142,6 +151,11 @@ export class StudioKernel {
       throw new Error(`Task not found: ${taskId}`);
     }
 
+    if ((status === "review" || status === "done") && !this.hasVerifiedTaskOutputs(task)) {
+      const missing = this.missingVerifiedTaskOutputs(task);
+      throw new Error(`任务「${task.title}」不能进入 ${status}：输出产物缺少已验证证据 ${missing.join("、")}`);
+    }
+
     task.status = status;
     if (status === "done") {
       task.blockers = [];
@@ -153,6 +167,19 @@ export class StudioKernel {
 
   addArtifact(artifact: Artifact): void {
     this.state.artifacts.push(artifact);
+    const operationId = this.createArtifactOperation(artifact);
+    this.state.artifactLedger.push({
+      artifactId: artifact.artifactId,
+      projectId: artifact.projectId,
+      ownerAgentId: artifact.ownerAgentId,
+      ...(artifact.sourceTaskId ? { taskId: artifact.sourceTaskId } : {}),
+      path: artifact.path,
+      createdAt: artifact.createdAt,
+      updatedAt: artifact.updatedAt,
+      sourceOperationId: operationId,
+      status: "pending",
+      reason: "等待工作区写入并计算文件证据。"
+    });
     this.auditLog.append({
       eventId: `evt_${artifact.artifactId}`,
       projectId: artifact.projectId,
@@ -171,6 +198,97 @@ export class StudioKernel {
       },
       createdAt: artifact.createdAt
     });
+  }
+
+  recordArtifactMaterialization(
+    artifactId: string,
+    input: {
+      path: string;
+      hash: string;
+      sizeBytes: number;
+      materializedAt: string;
+    }
+  ): ArtifactLedgerEntry {
+    const artifact = this.state.artifacts.find((candidate) => candidate.artifactId === artifactId);
+    if (!artifact) {
+      throw new Error(`Artifact not found: ${artifactId}`);
+    }
+
+    let ledger = this.state.artifactLedger.find((candidate) => candidate.artifactId === artifactId);
+    if (!ledger) {
+      const operationId = this.createArtifactOperation(artifact);
+      ledger = {
+        artifactId: artifact.artifactId,
+        projectId: artifact.projectId,
+        ownerAgentId: artifact.ownerAgentId,
+        ...(artifact.sourceTaskId ? { taskId: artifact.sourceTaskId } : {}),
+        path: artifact.path,
+        createdAt: artifact.createdAt,
+        updatedAt: artifact.updatedAt,
+        sourceOperationId: operationId,
+        status: "pending"
+      };
+      this.state.artifactLedger.push(ledger);
+    }
+
+    const unchanged =
+      ledger.status === "verified" &&
+      ledger.hash === input.hash &&
+      ledger.sizeBytes === input.sizeBytes &&
+      ledger.path === input.path;
+
+    ledger.path = input.path;
+    ledger.hash = input.hash;
+    ledger.sizeBytes = input.sizeBytes;
+    ledger.materializedAt = input.materializedAt;
+    ledger.updatedAt = input.materializedAt;
+    ledger.status = "verified";
+    ledger.reason = "文件已由服务端 artifact 写入工具物化并完成 hash/size 校验。";
+    artifact.checksum = input.hash;
+    artifact.updatedAt = input.materializedAt;
+
+    const operation = this.state.artifactOperations.find((candidate) => candidate.operationId === ledger.sourceOperationId);
+    if (operation) {
+      operation.path = input.path;
+      operation.status = "completed";
+      operation.updatedAt = input.materializedAt;
+      operation.completedAt = input.materializedAt;
+    }
+
+    if (!unchanged) {
+      this.auditLog.append({
+        eventId: `evt_artifact_materialized_${artifactId}_${Date.now()}`,
+        projectId: artifact.projectId,
+        stageId: artifact.stageId,
+        agentId: artifact.ownerAgentId,
+        ...(artifact.sourceTaskId ? { taskId: artifact.sourceTaskId } : {}),
+        eventType: "ARTIFACT_MATERIALIZED",
+        inputArtifacts: [],
+        outputArtifacts: [artifact.artifactId],
+        toolCalls: [
+          {
+            toolCallId: ledger.sourceOperationId,
+            toolName: "write_artifact",
+            status: "completed",
+            metadata: {
+              path: input.path,
+              hash: input.hash,
+              sizeBytes: input.sizeBytes
+            }
+          }
+        ],
+        decisionRefs: artifact.sourceDecisionIds,
+        status: "completed",
+        metadata: {
+          path: input.path,
+          hash: input.hash,
+          sizeBytes: input.sizeBytes
+        },
+        createdAt: input.materializedAt
+      });
+    }
+
+    return ledger;
   }
 
   updateArtifactStatus(
@@ -235,6 +353,75 @@ export class StudioKernel {
     return [...this.state.artifacts];
   }
 
+  listArtifactOperations(): ArtifactOperation[] {
+    return [...this.state.artifactOperations];
+  }
+
+  listArtifactLedger(): ArtifactLedgerEntry[] {
+    return [...this.state.artifactLedger];
+  }
+
+  listClaimVerifications(): ClaimVerification[] {
+    return [...this.state.claimVerifications];
+  }
+
+  recordClaimVerification(claim: ClaimVerification): ClaimVerification {
+    const existingIndex = this.state.claimVerifications.findIndex((candidate) => candidate.claimId === claim.claimId);
+    const existing = existingIndex === -1 ? undefined : this.state.claimVerifications[existingIndex];
+    const changed =
+      !existing ||
+      existing.verdict !== claim.verdict ||
+      existing.reason !== claim.reason ||
+      existing.claimedPath !== claim.claimedPath ||
+      existing.evidenceRefs.join("|") !== claim.evidenceRefs.join("|");
+    if (existingIndex === -1) {
+      this.state.claimVerifications.push(claim);
+    } else {
+      this.state.claimVerifications[existingIndex] = claim;
+    }
+
+    if (!changed) {
+      return claim;
+    }
+
+    const eventType =
+      claim.verdict === "verified" ? "CLAIM_VERIFIED" : claim.verdict === "mismatch" ? "CLAIM_MISMATCH" : "CLAIM_INSUFFICIENT";
+    this.auditLog.append({
+      eventId: `evt_${eventType.toLowerCase()}_${claim.claimId}_${Date.now()}`,
+      projectId: claim.projectId,
+      agentId: claim.agentId,
+      eventType,
+      inputArtifacts: claim.relatedArtifactIds,
+      outputArtifacts: [],
+      toolCalls: [],
+      decisionRefs: [],
+      status: claim.verdict === "verified" ? "completed" : "failed",
+      ...(claim.verdict === "verified" ? {} : { failureReason: claim.reason }),
+      metadata: {
+        messageId: claim.messageId,
+        claimType: claim.claimType,
+        claimedPath: claim.claimedPath,
+        evidenceRefs: claim.evidenceRefs
+      },
+      createdAt: claim.checkedAt
+    });
+    return claim;
+  }
+
+  setMessageClaimVerifications(messageId: string, claims: ClaimVerification[]): void {
+    const message = this.state.messages.find((candidate) => candidate.messageId === messageId);
+    if (!message) {
+      return;
+    }
+
+    message.metadata = {
+      ...message.metadata,
+      claimVerificationIds: claims.map((claim) => claim.claimId),
+      claimVerifications: claims,
+      claimVerdict: summarizeClaimVerdict(claims)
+    };
+  }
+
   listMessages(): StudioMessage[] {
     return [...this.state.messages];
   }
@@ -252,9 +439,85 @@ export class StudioKernel {
       messages: this.state.messages,
       tasks: this.state.tasks,
       artifacts: this.state.artifacts,
+      artifactOperations: this.state.artifactOperations,
+      artifactLedger: this.state.artifactLedger,
+      claimVerifications: this.state.claimVerifications,
       memoryRecords: this.memory.list(this.state.project.projectId),
       auditEvents: this.auditLog.list(this.state.project.projectId)
     };
+  }
+
+  private createArtifactOperation(artifact: Artifact): string {
+    const existingLedger = this.state.artifactLedger.find((candidate) => candidate.artifactId === artifact.artifactId);
+    if (existingLedger) {
+      return existingLedger.sourceOperationId;
+    }
+
+    const now = new Date().toISOString();
+    const operationId = `op_write_artifact_${artifact.artifactId}_${Date.now()}`;
+    const operation: ArtifactOperation = {
+      operationId,
+      projectId: artifact.projectId,
+      agentId: artifact.ownerAgentId,
+      ...(artifact.sourceTaskId ? { taskId: artifact.sourceTaskId } : {}),
+      artifactId: artifact.artifactId,
+      operationType: "write_artifact",
+      toolName: "write_artifact",
+      path: artifact.path,
+      status: "started",
+      idempotencyKey: `artifact:${artifact.projectId}:${artifact.artifactId}:${artifact.version}`,
+      metadata: {
+        artifactType: artifact.type,
+        artifactStatus: artifact.status
+      },
+      createdAt: now,
+      updatedAt: now
+    };
+    this.state.artifactOperations.push(operation);
+    this.auditLog.append({
+      eventId: `evt_artifact_write_started_${artifact.artifactId}_${Date.now()}`,
+      projectId: artifact.projectId,
+      stageId: artifact.stageId,
+      agentId: artifact.ownerAgentId,
+      ...(artifact.sourceTaskId ? { taskId: artifact.sourceTaskId } : {}),
+      eventType: "ARTIFACT_WRITE_STARTED",
+      inputArtifacts: [],
+      outputArtifacts: [artifact.artifactId],
+      toolCalls: [
+        {
+          toolCallId: operationId,
+          toolName: "write_artifact",
+          status: "started",
+          metadata: {
+            path: artifact.path,
+            artifactType: artifact.type
+          }
+        }
+      ],
+      decisionRefs: artifact.sourceDecisionIds,
+      status: "started",
+      metadata: {
+        path: artifact.path,
+        artifactType: artifact.type
+      },
+      createdAt: now
+    });
+    return operationId;
+  }
+
+  private hasVerifiedTaskOutputs(task: Task): boolean {
+    return this.missingVerifiedTaskOutputs(task).length === 0;
+  }
+
+  private missingVerifiedTaskOutputs(task: Task): string[] {
+    if (task.outputArtifacts.length === 0) {
+      return [];
+    }
+
+    return task.outputArtifacts.filter((artifactId) => {
+      const ledger = this.state.artifactLedger.find((candidate) => candidate.artifactId === artifactId);
+      return !ledger || ledger.status !== "verified" || !ledger.hash || !ledger.sizeBytes;
+    });
   }
 
   private appendTaskEvent(task: Task, eventType: "TASK_CREATED" | "TASK_STATUS_CHANGED"): void {
@@ -311,7 +574,23 @@ export function createStudioKernelFromSnapshot(snapshot: StudioKernelSnapshot): 
     messages: snapshot.messages,
     tasks: snapshot.tasks,
     artifacts: snapshot.artifacts,
+    artifactOperations: snapshot.artifactOperations,
+    artifactLedger: snapshot.artifactLedger,
+    claimVerifications: snapshot.claimVerifications,
     memoryRecords: snapshot.memoryRecords,
     auditEvents: snapshot.auditEvents
   });
+}
+
+function summarizeClaimVerdict(claims: ClaimVerification[]): ClaimVerification["verdict"] | undefined {
+  if (claims.length === 0) {
+    return undefined;
+  }
+  if (claims.some((claim) => claim.verdict === "mismatch")) {
+    return "mismatch";
+  }
+  if (claims.some((claim) => claim.verdict === "insufficient")) {
+    return "insufficient";
+  }
+  return "verified";
 }

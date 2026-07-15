@@ -156,6 +156,7 @@ function handleOrchestrator({ kernel, producerMessage, now }: HandlerInput): voi
     agentId: "studio_orchestrator",
     roomKind: "studio-main",
     messageType: "progress_update",
+    relatedTaskIds: ["task_group_stage_1", "task_stage_1_design_clarification", "task_stage_1_art_direction", "task_stage_1_scope_review"],
     content:
       "已创建 Stage 1 立项任务树：策划负责玩法澄清和 GDD baseline，美术负责视觉方向和 Art Bible baseline，Producer 负责范围与评审记录。"
   });
@@ -221,13 +222,25 @@ function executeGateAction(kernel: StudioKernel, message: StudioMessage, gate: G
 
   switch (gate.actionId) {
     case "stage1":
-      approveStageOne(kernel, message, now);
+      try {
+        approveStageOne(kernel, message, now);
+      } catch (error) {
+        writeEvidenceBlocker(kernel, gate, error);
+      }
       return;
     case "playable":
-      approveFirstPlayable(kernel, message, now);
+      try {
+        approveFirstPlayable(kernel, message, now);
+      } catch (error) {
+        writeEvidenceBlocker(kernel, gate, error);
+      }
       return;
     case "release":
-      approveRelease(kernel, message, now);
+      try {
+        approveRelease(kernel, message, now);
+      } catch (error) {
+        writeEvidenceBlocker(kernel, gate, error);
+      }
       return;
   }
 }
@@ -463,6 +476,7 @@ function hasRecentGateReview(kernel: StudioKernel, gate: GateAction, currentMess
 
 function approveStageOne(kernel: StudioKernel, message: StudioMessage, now: string): void {
   ensureStageOneTasks(kernel, now);
+  requireVerifiedArtifacts(kernel, ["artifact_gdd_baseline_draft", "artifact_art_bible_baseline_draft"]);
   for (const taskId of ["task_stage_1_design_clarification", "task_stage_1_art_direction", "task_stage_1_scope_review"]) {
     kernel.updateTaskStatus(taskId, "done", now);
   }
@@ -557,6 +571,7 @@ function formatList(items: string[]): string {
 }
 
 function approveFirstPlayable(kernel: StudioKernel, message: StudioMessage, now: string): void {
+  requireVerifiedArtifacts(kernel, ["artifact_asset_manifest_draft", "artifact_scene_blueprint_draft", "artifact_wechat_dev_build", "artifact_qa_playtest_report"]);
   for (const taskId of [
     "task_stage_2_asset_pipeline",
     "task_stage_2_cocos_implementation",
@@ -586,6 +601,13 @@ function approveFirstPlayable(kernel: StudioKernel, message: StudioMessage, now:
 }
 
 function approveRelease(kernel: StudioKernel, message: StudioMessage, now: string): void {
+  requireVerifiedArtifacts(kernel, [
+    "artifact_wechat_release_build",
+    "artifact_release_gate_report",
+    "artifact_deployment_report",
+    "artifact_rollback_plan",
+    "artifact_release_notes"
+  ]);
   for (const taskId of [
     "task_stage_3_wechat_release",
     "task_stage_3_qa_release_gate",
@@ -610,6 +632,7 @@ function approveRelease(kernel: StudioKernel, message: StudioMessage, now: strin
     agentId: "devops",
     roomKind: "release-room",
     messageType: "deployment_record",
+    relatedArtifactIds: ["artifact_deployment_report", "artifact_rollback_plan"],
     content: "发布审批已记录。当前本地 MVP 已生成部署记录和回滚计划占位，真实部署将由 Secret Vault 和 DevOps 工具执行。"
   });
 }
@@ -1032,11 +1055,18 @@ function ensureStageTwoTasksAndArtifacts(kernel: StudioKernel, message: StudioMe
     content: "Stage 2 美术资产流水线已启动，本地 MVP 已创建 asset manifest 占位产物。"
   });
   writeAgentMessage(kernel, {
-    agentId: "gameplay_programmer",
+    agentId: "cocos_tech_lead",
     roomKind: "engineering-room",
     messageType: "progress_update",
-    relatedArtifactIds: ["artifact_scene_blueprint_draft", "artifact_wechat_dev_build"],
-    content: "Stage 2 Cocos 实现任务已启动，本地 MVP 已创建 SceneBlueprint 和微信 dev build 占位产物。"
+    relatedArtifactIds: ["artifact_scene_blueprint_draft"],
+    content: "Stage 2 Cocos 技术任务已启动，本地 MVP 已创建 SceneBlueprint 占位产物。"
+  });
+  writeAgentMessage(kernel, {
+    agentId: "cocos_automation",
+    roomKind: "engineering-room",
+    messageType: "progress_update",
+    relatedArtifactIds: ["artifact_wechat_dev_build"],
+    content: "Cocos 自动化已创建微信 dev build 占位产物，等待真实 Cocos 构建接入。"
   });
   writeAgentMessage(kernel, {
     agentId: "qa_evaluator",
@@ -1315,6 +1345,7 @@ function writeAgentMessage(
     roomKind: RoomKind;
     messageType: MessageType;
     content: string;
+    relatedTaskIds?: string[];
     relatedArtifactIds?: string[];
   }
 ): void {
@@ -1329,11 +1360,30 @@ function writeAgentMessage(
     messageType: input.messageType,
     content: input.content,
     mentions: [],
-    relatedTaskIds: [],
+    relatedTaskIds: input.relatedTaskIds ?? [],
     relatedArtifactIds: input.relatedArtifactIds ?? [],
     metadata: {
       generatedBy: "local_agent_runtime"
     },
     createdAt: now
+  });
+}
+
+function requireVerifiedArtifacts(kernel: StudioKernel, artifactIds: string[]): void {
+  const missing = artifactIds.filter((artifactId) => {
+    const ledger = kernel.listArtifactLedger().find((entry) => entry.artifactId === artifactId);
+    return !ledger || ledger.status !== "verified" || !ledger.hash || !ledger.sizeBytes;
+  });
+  if (missing.length > 0) {
+    throw new Error(`缺少已验证产物证据：${missing.join("、")}`);
+  }
+}
+
+function writeEvidenceBlocker(kernel: StudioKernel, gate: GateAction, error: unknown): void {
+  writeAgentMessage(kernel, {
+    agentId: "studio_orchestrator",
+    roomKind: "studio-main",
+    messageType: "blocker",
+    content: `无法执行「${gate.label}」：${error instanceof Error ? error.message : String(error)}。请等待对应 Agent 通过工具写入产物并完成 claim 验证后再确认。`
   });
 }

@@ -2,6 +2,7 @@ import { createRestartedStudioKernel, createStudioKernel, defaultAgentContracts,
 import type { MessageType, RoomKind, StudioMessage } from "@game-pipeline/shared-schemas";
 import { spawn } from "node:child_process";
 import { dirname } from "node:path";
+import { verifyProjectClaims } from "./claimVerifier.js";
 import { ModelAgentRuntime } from "./modelAgentRuntime.js";
 import { ProjectPersistenceStore, type ProjectSummary } from "./projectPersistence.js";
 import {
@@ -9,9 +10,10 @@ import {
   readArtifactPreview,
   readWorkspaceTree,
   resolveArtifactWorkspaceTarget,
-  resolveWorkspacePathTarget,
+  resolveWorkspacePathOpenTarget,
   syncProjectWorkspace,
   type ArtifactPreviewResult,
+  type WorkspacePathOpenTarget,
   type WorkspacePathTarget,
   type WorkspaceSyncResult,
   type WorkspaceTreeEntry
@@ -41,6 +43,9 @@ export class StudioProjectStore {
     for (const kernel of this.persistence.loadAll()) {
       this.projects.set(kernel.project.projectId, kernel);
       syncProjectWorkspace(kernel);
+      verifyProjectClaims(kernel);
+      syncProjectWorkspace(kernel);
+      this.persistence.save(kernel);
     }
   }
 
@@ -221,17 +226,23 @@ export class StudioProjectStore {
       const modelResult = await this.modelRuntime.respond(kernel, message, result.routePlan);
       result.agentMessages.push(...modelResult.agentMessages);
     }
+    let workspace = syncProjectWorkspace(kernel);
+    verifyProjectClaims(kernel);
+    workspace = syncProjectWorkspace(kernel);
     this.persistence.save(kernel);
     return {
       ...result,
-      workspace: syncProjectWorkspace(kernel)
+      workspace
     };
   }
 
   syncWorkspace(projectId: string): WorkspaceSyncResult {
     const kernel = this.getKernel(projectId);
+    let workspace = syncProjectWorkspace(kernel);
+    verifyProjectClaims(kernel);
+    workspace = syncProjectWorkspace(kernel);
     this.persistence.save(kernel);
-    return syncProjectWorkspace(kernel);
+    return workspace;
   }
 
   readWorkspaceTree(projectId: string): {
@@ -276,21 +287,32 @@ export class StudioProjectStore {
     };
   }
 
-  openWorkspacePath(projectId: string, path: string): {
+  openWorkspacePath(projectId: string, path: string, options: { allowFallback?: boolean } = {}): {
     opened: boolean;
     target: WorkspacePathTarget;
+    requestedPath: WorkspacePathOpenTarget["requestedPath"];
+    exact: WorkspacePathOpenTarget["exact"];
+    nearestTarget?: WorkspacePathOpenTarget["nearestTarget"];
   } {
     const kernel = this.getKernel(projectId);
     syncProjectWorkspace(kernel);
-    const target = resolveWorkspacePathTarget(projectId, path);
-    if (!target.exists) {
-      throw new HttpError(404, `本地工作空间中未找到该路径：${target.relativePath}`);
+    const resolved = resolveWorkspacePathOpenTarget(projectId, path);
+    const target = resolved.target.exists ? resolved.target : options.allowFallback ? resolved.nearestTarget : resolved.target;
+    if (!target || !target.exists) {
+      throw new HttpError(404, `文件不存在，Agent 声明未验证：${resolved.requestedPath}`, {
+        requestedPath: resolved.requestedPath,
+        target: resolved.target,
+        nearestTarget: resolved.nearestTarget
+      });
     }
 
     openLocalPath(target.absolutePath, target.type ?? "file");
     return {
       opened: true,
-      target
+      target,
+      requestedPath: resolved.requestedPath,
+      exact: resolved.exact && target === resolved.target,
+      ...(resolved.nearestTarget ? { nearestTarget: resolved.nearestTarget } : {})
     };
   }
 
@@ -367,7 +389,7 @@ function openLocalPath(absolutePath: string, type: "file" | "directory"): void {
 }
 
 export class HttpError extends Error {
-  constructor(readonly statusCode: number, message: string) {
+  constructor(readonly statusCode: number, message: string, readonly details?: unknown) {
     super(message);
   }
 }

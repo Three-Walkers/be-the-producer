@@ -247,7 +247,12 @@ export async function handleRequest(request: IncomingMessage, response: ServerRe
       if (!input.status) {
         throw new HttpError(400, "status is required");
       }
-      const task = kernel.updateTaskStatus(childId, input.status);
+      let task;
+      try {
+        task = kernel.updateTaskStatus(childId, input.status);
+      } catch (error) {
+        throw new HttpError(409, error instanceof Error ? error.message : "任务状态更新被证据门禁拦截。");
+      }
       const workspace = studioStore.syncWorkspace(projectRoute.projectId);
       sendJson(response, 200, { task, taskBoard: kernel.buildTaskBoard(), workspace });
       return;
@@ -269,11 +274,15 @@ export async function handleRequest(request: IncomingMessage, response: ServerRe
     }
 
     if (request.method === "POST" && resource === "workspace" && childId === "open") {
-      const input = await readJson<{ path?: string }>(request);
+      const input = await readJson<{ path?: string; allowFallback?: boolean }>(request);
       if (!input.path) {
         throw new HttpError(400, "path is required");
       }
-      sendJson(response, 200, studioStore.openWorkspacePath(projectRoute.projectId, input.path));
+      sendJson(
+        response,
+        200,
+        studioStore.openWorkspacePath(projectRoute.projectId, input.path, input.allowFallback === undefined ? {} : { allowFallback: input.allowFallback })
+      );
       return;
     }
 
@@ -310,7 +319,7 @@ export async function handleRequest(request: IncomingMessage, response: ServerRe
     throw new HttpError(404, "Route not found");
   } catch (error) {
     if (error instanceof HttpError) {
-      sendJson(response, error.statusCode, { error: error.message });
+      sendJson(response, error.statusCode, { error: error.message, ...(error.details ? { details: error.details } : {}) });
       return;
     }
 

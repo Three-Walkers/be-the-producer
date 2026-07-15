@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, extname, isAbsolute, join, normalize, relative, sep } from "node:path";
 import type { Artifact, MemoryRecord, StudioMessage, Task } from "@game-pipeline/shared-schemas";
@@ -27,6 +28,13 @@ export interface ArtifactWorkspaceTarget {
 
 export type WorkspacePathTarget = ArtifactWorkspaceTarget;
 
+export interface WorkspacePathOpenTarget {
+  requestedPath: string;
+  target: WorkspacePathTarget;
+  exact: boolean;
+  nearestTarget?: WorkspacePathTarget;
+}
+
 export interface ArtifactPreviewResult {
   artifact: Artifact;
   target: Omit<ArtifactWorkspaceTarget, "absolutePath">;
@@ -55,8 +63,6 @@ export function syncProjectWorkspace(kernel: StudioKernel, workspaceRoot = defau
   writeJson(projectRoot, "shared/milestones/project.json", kernel.project, filesWritten);
   writeJson(projectRoot, "shared/task-board/current-status.json", taskBoard, filesWritten);
   writeJson(projectRoot, "shared/tasks/tasks.json", tasks, filesWritten);
-  writeJson(projectRoot, "shared/artifacts/artifacts.json", artifacts, filesWritten);
-  writeJson(projectRoot, "shared/audit/audit-events.json", kernel.listAuditEvents(), filesWritten);
   writeJson(projectRoot, "shared/chat/messages.json", messages, filesWritten);
   writeJsonLines(projectRoot, "shared/memory/project-memory.jsonl", memory, filesWritten);
   writeText(projectRoot, "README.md", renderProjectReadme(kernel, taskBoard.total, artifacts.length, memory.length), filesWritten);
@@ -66,8 +72,14 @@ export function syncProjectWorkspace(kernel: StudioKernel, workspaceRoot = defau
   }
 
   for (const artifact of artifacts) {
-    writeArtifactFile(projectRoot, artifact, tasks, memory, filesWritten);
+    writeArtifactFile(projectRoot, kernel, artifact, tasks, memory, filesWritten);
   }
+
+  writeJson(projectRoot, "shared/artifacts/artifacts.json", kernel.listArtifacts(), filesWritten);
+  writeJson(projectRoot, "shared/artifacts/artifact-ledger.json", kernel.listArtifactLedger(), filesWritten);
+  writeJson(projectRoot, "shared/artifacts/artifact-operations.json", kernel.listArtifactOperations(), filesWritten);
+  writeJson(projectRoot, "shared/claims/claim-verifications.json", kernel.listClaimVerifications(), filesWritten);
+  writeJson(projectRoot, "shared/audit/audit-events.json", kernel.listAuditEvents(), filesWritten);
 
   return {
     projectRoot,
@@ -163,6 +175,75 @@ export function resolveWorkspacePathTarget(
     type: stats.isDirectory() ? "directory" : "file",
     ...(stats.isFile() ? { sizeBytes: stats.size } : {}),
     updatedAt: stats.mtime.toISOString()
+  };
+}
+
+export function resolveWorkspacePathOpenTarget(
+  projectId: string,
+  path: string,
+  workspaceRoot = defaultWorkspaceRoot()
+): WorkspacePathOpenTarget {
+  const requested = resolveWorkspacePathTarget(projectId, path, workspaceRoot);
+  if (requested.exists) {
+    return {
+      requestedPath: requested.relativePath,
+      target: requested,
+      exact: true
+    };
+  }
+
+  const projectRoot = join(workspaceRoot, projectId);
+  let fallbackRelativePath = dirname(requested.relativePath);
+  while (fallbackRelativePath && fallbackRelativePath !== "." && fallbackRelativePath !== "..") {
+    const candidatePath = safeWorkspacePath(fallbackRelativePath);
+    const absolutePath = join(projectRoot, candidatePath);
+    if (!isInsideRoot(projectRoot, absolutePath)) {
+      break;
+    }
+
+    if (existsSync(absolutePath)) {
+      const stats = statSync(absolutePath);
+      return {
+        requestedPath: requested.relativePath,
+        target: requested,
+        exact: false,
+        nearestTarget: {
+          projectRoot,
+          relativePath: relative(projectRoot, absolutePath).split(sep).join("/"),
+          absolutePath,
+          exists: true,
+          type: stats.isDirectory() ? "directory" : "file",
+          ...(stats.isFile() ? { sizeBytes: stats.size } : {}),
+          updatedAt: stats.mtime.toISOString()
+        }
+      };
+    }
+
+    fallbackRelativePath = dirname(fallbackRelativePath);
+  }
+
+  if (existsSync(projectRoot)) {
+    const stats = statSync(projectRoot);
+    return {
+      requestedPath: requested.relativePath,
+      target: requested,
+      exact: false,
+      nearestTarget: {
+        projectRoot,
+        relativePath: ".",
+        absolutePath: projectRoot,
+        exists: true,
+        type: stats.isDirectory() ? "directory" : "file",
+        ...(stats.isFile() ? { sizeBytes: stats.size } : {}),
+        updatedAt: stats.mtime.toISOString()
+      }
+    };
+  }
+
+  return {
+    requestedPath: requested.relativePath,
+    target: requested,
+    exact: false
   };
 }
 
@@ -264,12 +345,17 @@ function writeText(projectRoot: string, path: string, content: string, filesWrit
   const safePath = safeWorkspacePath(path);
   const absolutePath = join(projectRoot, safePath);
   mkdirSync(dirname(absolutePath), { recursive: true });
+  if (existsSync(absolutePath) && statSync(absolutePath).isFile() && readFileSync(absolutePath, "utf8") === content) {
+    return;
+  }
+
   writeFileSync(absolutePath, content, "utf8");
   filesWritten.push(relative(projectRoot, absolutePath).split(sep).join("/"));
 }
 
 function writeArtifactFile(
   projectRoot: string,
+  kernel: StudioKernel,
   artifact: Artifact,
   tasks: Task[],
   memory: MemoryRecord[],
@@ -278,22 +364,22 @@ function writeArtifactFile(
   const targetPath = artifactFilePath(artifact);
   const sourceTask = artifact.sourceTaskId ? tasks.find((task) => task.taskId === artifact.sourceTaskId) : undefined;
   const sourceMemory = memory.filter((record) => record.sourceArtifactId === artifact.artifactId || record.ownerAgent === artifact.ownerAgentId);
+  const artifactDocument = artifactDocumentView(artifact);
 
   if (targetPath.endsWith(".json")) {
-    writeJson(
-      projectRoot,
-      targetPath,
-      {
-        artifact,
-        sourceTask,
-        relatedMemory: sourceMemory
-      },
-      filesWritten
-    );
+    writeJson(projectRoot, targetPath, { artifact: artifactDocument, sourceTask, relatedMemory: sourceMemory }, filesWritten);
+    recordArtifactFileEvidence(projectRoot, kernel, artifact, targetPath);
     return;
   }
 
   writeText(projectRoot, targetPath, renderArtifactMarkdown(artifact, sourceTask, sourceMemory), filesWritten);
+  recordArtifactFileEvidence(projectRoot, kernel, artifact, targetPath);
+}
+
+function artifactDocumentView(artifact: Artifact): Artifact {
+  const artifactWithoutChecksum = { ...artifact };
+  delete artifactWithoutChecksum.checksum;
+  return artifactWithoutChecksum;
 }
 
 export function artifactFilePath(artifact: Artifact): string {
@@ -321,6 +407,26 @@ function safeWorkspacePath(path: string): string {
 function isInsideRoot(root: string, target: string): boolean {
   const relativePath = relative(root, target);
   return relativePath === "" || (!relativePath.startsWith("..") && !relativePath.includes(`${sep}..${sep}`));
+}
+
+function recordArtifactFileEvidence(projectRoot: string, kernel: StudioKernel, artifact: Artifact, path: string): void {
+  const safePath = safeWorkspacePath(path);
+  const absolutePath = join(projectRoot, safePath);
+  if (!existsSync(absolutePath) || !statSync(absolutePath).isFile()) {
+    return;
+  }
+
+  const stats = statSync(absolutePath);
+  kernel.recordArtifactMaterialization(artifact.artifactId, {
+    path: relative(projectRoot, absolutePath).split(sep).join("/"),
+    hash: hashFile(absolutePath),
+    sizeBytes: stats.size,
+    materializedAt: stats.mtime.toISOString()
+  });
+}
+
+function hashFile(absolutePath: string): string {
+  return createHash("sha256").update(readFileSync(absolutePath)).digest("hex");
 }
 
 function toPublicTarget(target: ArtifactWorkspaceTarget): Omit<ArtifactWorkspaceTarget, "absolutePath"> {

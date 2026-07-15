@@ -7,6 +7,8 @@ export type ArtifactId = string;
 export type DecisionId = string;
 export type MemoryId = string;
 export type AuditEventId = string;
+export type OperationId = string;
+export type ClaimId = string;
 
 export type StageId =
   | "concept_discussion"
@@ -280,6 +282,63 @@ export interface Artifact {
   updatedAt: string;
 }
 
+export type ArtifactOperationStatus = "started" | "completed" | "failed";
+export type ArtifactOperationType = "write_artifact" | "append_document";
+export type ArtifactEvidenceStatus = "pending" | "verified" | "mismatch" | "insufficient";
+
+export interface ArtifactOperation {
+  operationId: OperationId;
+  projectId: ProjectId;
+  agentId: AgentId;
+  taskId?: TaskId;
+  artifactId?: ArtifactId;
+  operationType: ArtifactOperationType;
+  toolName: "write_artifact" | "append_document";
+  path: string;
+  status: ArtifactOperationStatus;
+  idempotencyKey: string;
+  error?: string;
+  metadata: Record<string, unknown>;
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string;
+}
+
+export interface ArtifactLedgerEntry {
+  artifactId: ArtifactId;
+  projectId: ProjectId;
+  ownerAgentId: AgentId;
+  taskId?: TaskId;
+  path: string;
+  hash?: string;
+  sizeBytes?: number;
+  createdAt: string;
+  updatedAt: string;
+  materializedAt?: string;
+  sourceOperationId: OperationId;
+  status: ArtifactEvidenceStatus;
+  reason?: string;
+}
+
+export type ClaimVerdict = "verified" | "mismatch" | "insufficient";
+export type ClaimType = "artifact_written" | "completion" | "path_reference";
+
+export interface ClaimVerification {
+  claimId: ClaimId;
+  projectId: ProjectId;
+  messageId: MessageId;
+  agentId: AgentId;
+  claimType: ClaimType;
+  claimedPath?: string;
+  relatedArtifactIds: ArtifactId[];
+  verdict: ClaimVerdict;
+  reason: string;
+  evidenceRefs: string[];
+  resolver: "artifact_ledger" | "filesystem" | "message_metadata";
+  checkedAt: string;
+  metadata: Record<string, unknown>;
+}
+
 export interface MemoryRecord {
   memoryId: MemoryId;
   projectId: ProjectId;
@@ -336,6 +395,12 @@ export interface AuditEvent {
     | "TASK_STATUS_SNAPSHOT_CREATED"
     | "DECISION_MADE"
     | "ARTIFACT_CREATED"
+    | "ARTIFACT_WRITE_STARTED"
+    | "ARTIFACT_WRITE_COMPLETED"
+    | "ARTIFACT_MATERIALIZED"
+    | "CLAIM_VERIFIED"
+    | "CLAIM_MISMATCH"
+    | "CLAIM_INSUFFICIENT"
     | "MEMORY_WRITTEN"
     | "MODEL_INVOKED"
     | "TOOL_STARTED"
