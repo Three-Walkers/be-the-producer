@@ -1,4 +1,4 @@
-import type { ModelProviderConfig, ModelProviderId } from "./modelSettings.js";
+import type { ModelProviderConfig, ModelProviderProtocol } from "./modelSettings.js";
 
 export interface ModelChatInput {
   systemPrompt: string;
@@ -9,7 +9,7 @@ export interface ModelChatInput {
 
 export interface ModelChatResult {
   content: string;
-  providerId: ModelProviderId;
+  providerId: string;
   model: string;
   latencyMs: number;
 }
@@ -38,7 +38,7 @@ export async function generateModelChat(provider: ModelProviderConfig, input: Mo
   }
 
   return {
-    content: extractContent(provider.providerId, body),
+    content: extractContent(provider.protocol, body),
     providerId: provider.providerId,
     model,
     latencyMs
@@ -49,7 +49,7 @@ async function sendChatRequest(provider: ModelProviderConfig, input: Required<Pi
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 30_000);
   try {
-    switch (provider.providerId) {
+    switch (provider.protocol) {
       case "anthropic":
         return await fetch(joinProviderUrl(provider.baseUrl, provider.baseUrl.endsWith("/v1") ? "messages" : "v1/messages"), {
           method: "POST",
@@ -82,9 +82,7 @@ async function sendChatRequest(provider: ModelProviderConfig, input: Required<Pi
             signal: controller.signal
           }
         );
-      case "openai":
-      case "deepseek":
-      case "custom":
+      case "openai-compatible":
       default:
         return await fetch(joinProviderUrl(provider.baseUrl, "chat/completions"), {
           method: "POST",
@@ -109,20 +107,20 @@ async function sendChatRequest(provider: ModelProviderConfig, input: Required<Pi
   }
 }
 
-function extractContent(providerId: ModelProviderId, body: string): string {
+function extractContent(protocol: ModelProviderProtocol, body: string): string {
   const parsed = JSON.parse(body) as {
     choices?: Array<{ message?: { content?: string } }>;
     content?: Array<{ text?: string }>;
     candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
   };
-  if (providerId === "anthropic") {
+  if (protocol === "anthropic") {
     const content = parsed.content?.map((part) => part.text).filter(Boolean).join("\n").trim();
     if (content) {
       return content;
     }
   }
 
-  if (providerId === "google") {
+  if (protocol === "google") {
     const content = parsed.candidates?.[0]?.content?.parts?.map((part) => part.text).filter(Boolean).join("\n").trim();
     if (content) {
       return content;
@@ -137,9 +135,12 @@ function extractContent(providerId: ModelProviderId, body: string): string {
   throw new Error("模型响应中没有可读取的文本内容。");
 }
 
-function fallbackModel(providerId: ModelProviderId): string {
+function fallbackModel(providerId: string): string {
   if (providerId === "deepseek") {
-    return "deepseek-chat";
+    return "deepseek-v4-flash";
+  }
+  if (providerId === "dashscope") {
+    return "qwen-plus";
   }
   return "";
 }

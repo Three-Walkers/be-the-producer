@@ -3,28 +3,37 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { defaultAgentContracts } from "@game-pipeline/agent-runtime";
 
-export type ModelProviderId = "openai" | "anthropic" | "google" | "deepseek" | "custom";
+export type ModelProviderId = string;
+export type ModelProviderProtocol = "openai-compatible" | "anthropic" | "google";
 
 export interface ModelProviderConfig {
   providerId: ModelProviderId;
   label: string;
+  protocol: ModelProviderProtocol;
   baseUrl: string;
   defaultModel: string;
   apiKey?: string;
+  isCustom?: boolean;
+  createdAt?: string;
   updatedAt?: string;
 }
 
 export interface PublicModelProviderConfig {
   providerId: ModelProviderId;
   label: string;
+  protocol: ModelProviderProtocol;
   baseUrl: string;
   defaultModel: string;
   hasApiKey: boolean;
+  isCustom: boolean;
   keyFingerprint?: string;
+  createdAt?: string;
   updatedAt?: string;
 }
 
 export interface SaveModelProviderInput {
+  label?: string;
+  protocol?: ModelProviderProtocol;
   baseUrl?: string;
   defaultModel?: string;
   apiKey?: string;
@@ -37,12 +46,14 @@ export interface AgentModelAssignment {
   capability: string;
   providerId: ModelProviderId;
   model: string;
+  avatarUrl: string;
   updatedAt?: string;
 }
 
 export interface SaveAgentModelAssignmentInput {
   providerId?: ModelProviderId;
   model?: string;
+  avatarUrl?: string;
 }
 
 export interface ModelProviderTestResult {
@@ -63,33 +74,46 @@ interface ModelSettingsDocument {
 const defaultProviders: ModelProviderConfig[] = [
   {
     providerId: "openai",
-    label: "OpenAI",
+    label: "OpenAI 官方",
+    protocol: "openai-compatible",
     baseUrl: "https://api.openai.com/v1",
     defaultModel: ""
   },
   {
+    providerId: "dashscope",
+    label: "阿里云百炼 DashScope",
+    protocol: "openai-compatible",
+    baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    defaultModel: "qwen-plus"
+  },
+  {
+    providerId: "deepseek",
+    label: "DeepSeek 官方",
+    protocol: "openai-compatible",
+    baseUrl: "https://api.deepseek.com",
+    defaultModel: "deepseek-v4-flash"
+  },
+  {
     providerId: "anthropic",
     label: "Anthropic",
+    protocol: "anthropic",
     baseUrl: "https://api.anthropic.com",
     defaultModel: ""
   },
   {
     providerId: "google",
     label: "Google Gemini",
+    protocol: "google",
     baseUrl: "https://generativelanguage.googleapis.com",
     defaultModel: ""
   },
   {
-    providerId: "deepseek",
-    label: "DeepSeek",
-    baseUrl: "https://api.deepseek.com",
-    defaultModel: ""
-  },
-  {
     providerId: "custom",
-    label: "Custom OpenAI-compatible",
+    label: "自定义 OpenAI-compatible",
+    protocol: "openai-compatible",
     baseUrl: "",
-    defaultModel: ""
+    defaultModel: "",
+    isCustom: true
   }
 ];
 
@@ -131,6 +155,12 @@ export class ModelSettingsStore {
       throw new Error(`Unsupported model provider: ${providerId}`);
     }
 
+    if (input.label !== undefined) {
+      provider.label = normalizeProviderLabel(input.label, provider.label);
+    }
+    if (input.protocol !== undefined) {
+      provider.protocol = normalizeProviderProtocol(input.protocol);
+    }
     if (input.baseUrl !== undefined) {
       provider.baseUrl = input.baseUrl.trim();
     }
@@ -141,6 +171,29 @@ export class ModelSettingsStore {
       provider.apiKey = input.apiKey.trim();
     }
     provider.updatedAt = new Date().toISOString();
+    this.write(document);
+    return toPublicProvider(provider);
+  }
+
+  createProvider(input: SaveModelProviderInput): PublicModelProviderConfig {
+    const document = this.load();
+    const now = new Date().toISOString();
+    const label = normalizeProviderLabel(input.label, "自定义模型连接");
+    const provider: ModelProviderConfig = {
+      providerId: uniqueProviderId(document.providers, label),
+      label,
+      protocol: normalizeProviderProtocol(input.protocol ?? "openai-compatible"),
+      baseUrl: input.baseUrl?.trim() ?? "",
+      defaultModel: input.defaultModel?.trim() ?? "",
+      isCustom: true,
+      createdAt: now,
+      updatedAt: now
+    };
+    if (input.apiKey?.trim()) {
+      provider.apiKey = input.apiKey.trim();
+    }
+
+    document.providers.push(provider);
     this.write(document);
     return toPublicProvider(provider);
   }
@@ -156,6 +209,29 @@ export class ModelSettingsStore {
     provider.updatedAt = new Date().toISOString();
     this.write(document);
     return toPublicProvider(provider);
+  }
+
+  removeProvider(providerId: string): void {
+    const document = this.load();
+    const provider = document.providers.find((candidate) => candidate.providerId === providerId);
+    if (!provider) {
+      throw new Error(`Unsupported model provider: ${providerId}`);
+    }
+    if (!provider.isCustom || provider.providerId === "custom") {
+      throw new Error("只能删除新增的自定义模型连接。");
+    }
+
+    document.providers = document.providers.filter((candidate) => candidate.providerId !== providerId);
+    document.agentAssignments = document.agentAssignments.map((assignment) =>
+      assignment.providerId === providerId
+        ? {
+            ...assignment,
+            providerId: defaultProviderForAgent(assignment.agentId, assignment.capability),
+            updatedAt: new Date().toISOString()
+          }
+        : assignment
+    );
+    this.write(document);
   }
 
   async testProvider(providerId: string): Promise<ModelProviderTestResult> {
@@ -183,6 +259,9 @@ export class ModelSettingsStore {
     if (input.model !== undefined) {
       assignment.model = input.model.trim();
     }
+    if (input.avatarUrl !== undefined) {
+      assignment.avatarUrl = normalizeAvatarUrl(input.avatarUrl);
+    }
     assignment.updatedAt = new Date().toISOString();
     this.write(document);
     return assignment;
@@ -199,9 +278,16 @@ export class ModelSettingsStore {
     const saved = JSON.parse(readFileSync(this.configPath, "utf8")) as ModelProviderConfig[] | Partial<ModelSettingsDocument>;
     const savedProviders = Array.isArray(saved) ? saved : (saved.providers ?? []);
     const savedAssignments = Array.isArray(saved) ? [] : (saved.agentAssignments ?? []);
+    const shouldMigrateOpenAIAssignmentsToDashScope = savedProviders.some(
+      (provider) => provider.providerId === "openai" && provider.baseUrl?.includes("dashscope.aliyuncs.com")
+    );
     return {
       providers: mergeProviders(savedProviders),
-      agentAssignments: mergeAgentAssignments(savedAssignments)
+      agentAssignments: mergeAgentAssignments(savedAssignments).map((assignment) =>
+        shouldMigrateOpenAIAssignmentsToDashScope && assignment.providerId === "openai"
+          ? { ...assignment, providerId: "dashscope" }
+          : assignment
+      )
     };
   }
 
@@ -224,10 +310,13 @@ function toPublicProvider(provider: ModelProviderConfig): PublicModelProviderCon
   return {
     providerId: provider.providerId,
     label: provider.label,
+    protocol: provider.protocol,
     baseUrl: provider.baseUrl,
     defaultModel: provider.defaultModel,
     hasApiKey: Boolean(provider.apiKey),
+    isCustom: Boolean(provider.isCustom),
     ...(provider.apiKey ? { keyFingerprint: fingerprint(provider.apiKey) } : {}),
+    ...(provider.createdAt ? { createdAt: provider.createdAt } : {}),
     ...(provider.updatedAt ? { updatedAt: provider.updatedAt } : {})
   };
 }
@@ -237,13 +326,37 @@ function fingerprint(apiKey: string): string {
 }
 
 function mergeProviders(savedProviders: ModelProviderConfig[]): ModelProviderConfig[] {
-  return defaultProviders.map((defaultProvider) => {
-    const existing = savedProviders.find((provider) => provider.providerId === defaultProvider.providerId);
-    return {
+  const normalizedSavedProviders = savedProviders.map((provider) => normalizeSavedProvider(provider));
+  const savedOpenAI = normalizedSavedProviders.find((provider) => provider.providerId === "openai");
+  const openAIWasDashScope = Boolean(savedOpenAI?.baseUrl && savedOpenAI.baseUrl.includes("dashscope.aliyuncs.com"));
+  const defaultProviderIds = new Set(defaultProviders.map((provider) => provider.providerId));
+  const mergedDefaults = defaultProviders.map((defaultProvider) => {
+    const existing = normalizedSavedProviders.find((provider) => provider.providerId === defaultProvider.providerId);
+    if (defaultProvider.providerId === "openai" && openAIWasDashScope) {
+      return structuredClone(defaultProvider);
+    }
+    if (defaultProvider.providerId === "dashscope" && !existing && savedOpenAI) {
+      return normalizeSavedProvider({
+        ...defaultProvider,
+        ...savedOpenAI,
+        providerId: "dashscope",
+        label: defaultProvider.label,
+        protocol: "openai-compatible"
+      });
+    }
+
+    const isCustom = existing?.isCustom ?? defaultProvider.isCustom;
+    return normalizeSavedProvider({
       ...defaultProvider,
-      ...existing
-    };
+      ...existing,
+      providerId: defaultProvider.providerId,
+      label: defaultProviderLabel(defaultProvider, existing),
+      protocol: existing?.protocol ?? defaultProvider.protocol,
+      ...(isCustom !== undefined ? { isCustom } : {})
+    });
   });
+  const customProviders = normalizedSavedProviders.filter((provider) => !defaultProviderIds.has(provider.providerId));
+  return [...mergedDefaults, ...customProviders];
 }
 
 function mergeAgentAssignments(savedAssignments: AgentModelAssignment[]): AgentModelAssignment[] {
@@ -254,7 +367,8 @@ function mergeAgentAssignments(savedAssignments: AgentModelAssignment[]): AgentM
       ...existing,
       displayName: defaultAssignment.displayName,
       roleScope: defaultAssignment.roleScope,
-      capability: defaultAssignment.capability
+      capability: defaultAssignment.capability,
+      avatarUrl: existing?.avatarUrl ?? defaultAssignment.avatarUrl ?? ""
     };
   });
 }
@@ -265,16 +379,33 @@ function defaultAgentAssignments(): AgentModelAssignment[] {
     displayName: agent.displayName,
     roleScope: agent.roleScope,
     capability: agent.modelProfile.capability,
-    providerId: defaultProviderForCapability(agent.modelProfile.capability),
-    model: ""
+    providerId: defaultProviderForAgent(agent.agentId, agent.modelProfile.capability),
+    model: "",
+    avatarUrl: ""
   }));
 }
 
-function defaultProviderForCapability(capability: string): ModelProviderId {
-  if (capability === "image_generation" || capability === "vision") {
-    return "openai";
+function normalizeAvatarUrl(value: string): string {
+  const avatarUrl = value.trim();
+  if (!avatarUrl) {
+    return "";
   }
-  return "openai";
+
+  if (/^(https?:\/\/|\/|data:image\/)/i.test(avatarUrl)) {
+    return avatarUrl;
+  }
+
+  throw new Error("头像地址只支持 http(s)、站内 / 路径或 data:image。");
+}
+
+function defaultProviderForAgent(agentId: string, capability: string): ModelProviderId {
+  if (capability === "coding" || capability === "evaluation" || agentId === "studio_orchestrator") {
+    return "deepseek";
+  }
+  if (capability === "image_generation" || capability === "vision") {
+    return "dashscope";
+  }
+  return "dashscope";
 }
 
 async function testProviderConnection(provider: ModelProviderConfig): Promise<ModelProviderTestResult> {
@@ -326,7 +457,7 @@ async function sendProviderProbe(provider: ModelProviderConfig, model: string): 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 15_000);
   try {
-    switch (provider.providerId) {
+    switch (provider.protocol) {
       case "anthropic":
         return await fetch(joinProviderUrl(provider.baseUrl, provider.baseUrl.endsWith("/v1") ? "messages" : "v1/messages"), {
           method: "POST",
@@ -357,9 +488,7 @@ async function sendProviderProbe(provider: ModelProviderConfig, model: string): 
             signal: controller.signal
           }
         );
-      case "openai":
-      case "deepseek":
-      case "custom":
+      case "openai-compatible":
       default:
         return await fetch(joinProviderUrl(provider.baseUrl, "chat/completions"), {
           method: "POST",
@@ -384,10 +513,86 @@ async function sendProviderProbe(provider: ModelProviderConfig, model: string): 
 function fallbackTestModel(providerId: ModelProviderId): string {
   switch (providerId) {
     case "deepseek":
-      return "deepseek-chat";
+      return "deepseek-v4-flash";
+    case "dashscope":
+      return "qwen-plus";
     default:
       return "";
   }
+}
+
+function normalizeSavedProvider(provider: ModelProviderConfig): ModelProviderConfig {
+  return {
+    ...provider,
+    label: normalizeProviderLabel(provider.label, provider.providerId),
+    protocol: normalizeProviderProtocol(provider.protocol ?? legacyProtocolForProvider(provider.providerId)),
+    baseUrl: provider.baseUrl ?? "",
+    defaultModel: provider.defaultModel ?? "",
+    isCustom: Boolean(provider.isCustom) || provider.providerId.startsWith("custom_")
+  };
+}
+
+function defaultProviderLabel(defaultProvider: ModelProviderConfig, existing: ModelProviderConfig | undefined): string {
+  const oldDefaultLabels: Record<string, string[]> = {
+    openai: ["OpenAI"],
+    deepseek: ["DeepSeek"],
+    custom: ["Custom OpenAI-compatible"]
+  };
+  const existingLabel = existing?.label?.trim();
+  if (!existingLabel || oldDefaultLabels[defaultProvider.providerId]?.includes(existingLabel)) {
+    return defaultProvider.label;
+  }
+  return existingLabel;
+}
+
+function normalizeProviderLabel(value: string | undefined, fallback: string): string {
+  const label = value?.trim();
+  if (!label) {
+    return fallback;
+  }
+  return label.slice(0, 80);
+}
+
+function normalizeProviderProtocol(value: string): ModelProviderProtocol {
+  if (value === "anthropic" || value === "google" || value === "openai-compatible") {
+    return value;
+  }
+  throw new Error(`Unsupported model provider protocol: ${value}`);
+}
+
+function legacyProtocolForProvider(providerId: string): ModelProviderProtocol {
+  if (providerId === "anthropic") {
+    return "anthropic";
+  }
+  if (providerId === "google") {
+    return "google";
+  }
+  return "openai-compatible";
+}
+
+function uniqueProviderId(providers: ModelProviderConfig[], label: string): string {
+  const base = `custom_${slugProviderLabel(label) || "profile"}`;
+  let providerId = base;
+  let index = 2;
+  while (providers.some((provider) => provider.providerId === providerId)) {
+    providerId = `${base}_${index}`;
+    index += 1;
+  }
+  return providerId;
+}
+
+function slugProviderLabel(label: string): string {
+  const ascii = label
+    .normalize("NFKD")
+    .replace(/[^\w\s-]/g, "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_-]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  if (ascii) {
+    return ascii.slice(0, 32);
+  }
+  return Date.now().toString(36);
 }
 
 function joinProviderUrl(baseUrl: string, path: string): string {

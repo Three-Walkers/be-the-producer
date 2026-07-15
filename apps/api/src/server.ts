@@ -89,7 +89,7 @@ function routeSettingsPath(pathname: string): { resource: string; childId?: stri
 
   return {
     resource: parts[1],
-    ...(parts[2] ? { childId: parts[2] } : {})
+    ...(parts[2] ? { childId: decodeURIComponent(parts[2]) } : {})
   };
 }
 
@@ -122,6 +122,12 @@ export async function handleRequest(request: IncomingMessage, response: ServerRe
         return;
       }
 
+      if (request.method === "POST" && !settingsRoute.childId) {
+        const input = await readJson<SaveModelProviderInput>(request);
+        sendJson(response, 201, { provider: modelSettingsStore.createProvider(input) });
+        return;
+      }
+
       if (request.method === "PUT" && settingsRoute.childId) {
         const input = await readJson<SaveModelProviderInput>(request);
         sendJson(response, 200, { provider: modelSettingsStore.saveProvider(settingsRoute.childId, input) });
@@ -130,6 +136,14 @@ export async function handleRequest(request: IncomingMessage, response: ServerRe
 
       if (request.method === "DELETE" && settingsRoute.childId) {
         sendJson(response, 200, { provider: modelSettingsStore.clearProviderKey(settingsRoute.childId) });
+        return;
+      }
+    }
+
+    if (settingsRoute?.resource === "model-provider-profiles") {
+      if (request.method === "DELETE" && settingsRoute.childId) {
+        modelSettingsStore.removeProvider(settingsRoute.childId);
+        sendJson(response, 200, { ok: true });
         return;
       }
     }
