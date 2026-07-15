@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import { dirname, extname, join, normalize, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { URL } from "node:url";
-import { modelSettingsStore, type SaveModelProviderInput } from "./modelSettings.js";
+import { modelSettingsStore, type SaveAgentModelAssignmentInput, type SaveModelProviderInput } from "./modelSettings.js";
 import { HttpError, studioStore, type CreateProjectInput, type PostMessageInput } from "./store.js";
 
 const defaultPort = 8787;
@@ -115,7 +115,10 @@ export async function handleRequest(request: IncomingMessage, response: ServerRe
     const settingsRoute = routeSettingsPath(url.pathname);
     if (settingsRoute?.resource === "model-providers") {
       if (request.method === "GET" && !settingsRoute.childId) {
-        sendJson(response, 200, { providers: modelSettingsStore.listPublic() });
+        sendJson(response, 200, {
+          providers: modelSettingsStore.listPublic(),
+          assignments: modelSettingsStore.listAgentAssignments()
+        });
         return;
       }
 
@@ -127,6 +130,14 @@ export async function handleRequest(request: IncomingMessage, response: ServerRe
 
       if (request.method === "DELETE" && settingsRoute.childId) {
         sendJson(response, 200, { provider: modelSettingsStore.clearProviderKey(settingsRoute.childId) });
+        return;
+      }
+    }
+
+    if (settingsRoute?.resource === "model-assignments") {
+      if (request.method === "PUT" && settingsRoute.childId) {
+        const input = await readJson<SaveAgentModelAssignmentInput>(request);
+        sendJson(response, 200, { assignment: modelSettingsStore.saveAgentAssignment(settingsRoute.childId, input) });
         return;
       }
     }
