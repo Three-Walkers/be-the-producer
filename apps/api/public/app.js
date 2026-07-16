@@ -1366,6 +1366,8 @@ function renderMessages() {
     ? state.pendingAgentResponses.filter((indicator) => indicator.roomId === activeRoom.roomId)
     : state.pendingAgentResponses;
   const list = $("#message-list");
+  const scrollContainer = list.closest(".chat-panel");
+  const shouldStickToBottom = scrollContainer ? isNearScrollBottom(scrollContainer) : true;
   if (!messages.length && !pendingResponses.length) {
     list.className = "message-list empty-state";
     list.textContent = "当前房间还没有消息。";
@@ -1406,7 +1408,15 @@ function renderMessages() {
       openWorkspacePath(button.dataset.openWorkspacePath).catch((error) => showToast(error.message));
     });
   });
-  list.parentElement.scrollTop = list.parentElement.scrollHeight;
+  if (scrollContainer && shouldStickToBottom) {
+    requestAnimationFrame(() => {
+      scrollContainer.scrollTop = scrollContainer.scrollHeight;
+    });
+  }
+}
+
+function isNearScrollBottom(element) {
+  return element.scrollHeight - element.scrollTop - element.clientHeight < 80;
 }
 
 function renderMessageContent(content) {
