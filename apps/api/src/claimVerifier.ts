@@ -8,7 +8,7 @@ const completionClaimPattern =
   /(已完成|已经完成|完成了|已生成|已经生成|已更新|已经更新|已提交|已经提交|已创建|已经创建|已写入|已经写入|写入了|已固化|已经固化)/;
 
 const workspacePathPattern =
-  /(?:\.\/)?(?:agents|shared|docs|assets|artifacts|outputs|builds|release|releases|workspace)\/[A-Za-z0-9._~@%+\-/]+|(?:\.\/)?[A-Za-z0-9._~@%+-]+\/[A-Za-z0-9._~@%+\-/]*[A-Za-z0-9._~@%+-]\.[A-Za-z0-9]{2,10}/g;
+  /(?:\.\/)?(?:agents|shared|docs|assets|artifacts|outputs|builds|release|releases|intermediate|cocos|settings|workspace)\/[A-Za-z0-9._~@%+\-/]+|(?:\.\/)?[A-Za-z0-9._~@%+-]+\/[A-Za-z0-9._~@%+\-/]*[A-Za-z0-9._~@%+-]\.[A-Za-z0-9]{2,10}/g;
 
 export function verifyProjectClaims(kernel: StudioKernel): ClaimVerification[] {
   const verifiedClaims: ClaimVerification[] = [];

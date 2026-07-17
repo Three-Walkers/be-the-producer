@@ -173,7 +173,7 @@ export const defaultAgentContracts: AgentContract[] = [
       costTier: "standard",
       contextPolicy: "role_pack"
     },
-    workspace: "workspace/game-project/assets/scripts/",
+    workspace: "assets/scripts/",
     memoryScopes: {
       read: ["project", "decision", "artifact", "qa", "knowledge"],
       write: ["role", "artifact", "knowledge"]

@@ -1420,25 +1420,117 @@ function isNearScrollBottom(element) {
 }
 
 function renderMessageContent(content) {
-  const text = String(content ?? "");
+  return renderMarkdown(String(content ?? ""));
+}
+
+function renderMarkdown(text) {
+  const codeBlockPattern = /```([A-Za-z0-9_-]+)?\n?([\s\S]*?)```/g;
+  let cursor = 0;
+  let html = "";
+
+  for (const match of text.matchAll(codeBlockPattern)) {
+    html += renderMarkdownBlocks(text.slice(cursor, match.index));
+    const language = match[1] ? ` data-language="${escapeHtml(match[1])}"` : "";
+    html += `<pre class="message-code-block"${language}><code>${escapeHtml(match[2] ?? "")}</code></pre>`;
+    cursor = (match.index ?? 0) + match[0].length;
+  }
+
+  html += renderMarkdownBlocks(text.slice(cursor));
+  return html || "";
+}
+
+function renderMarkdownBlocks(text) {
+  const lines = String(text ?? "").replace(/\r\n/g, "\n").split("\n");
+  const blocks = [];
+  let index = 0;
+
+  while (index < lines.length) {
+    const line = lines[index];
+    if (!line.trim()) {
+      index += 1;
+      continue;
+    }
+
+    const heading = /^(#{1,6})\s+(.+)$/.exec(line);
+    if (heading) {
+      const level = Math.min(heading[1].length, 6);
+      blocks.push(`<h${level}>${renderInlineMarkdown(heading[2])}</h${level}>`);
+      index += 1;
+      continue;
+    }
+
+    if (/^\s*[-*_]{3,}\s*$/.test(line)) {
+      blocks.push("<hr>");
+      index += 1;
+      continue;
+    }
+
+    if (/^\s*>\s?/.test(line)) {
+      const quoteLines = [];
+      while (index < lines.length && /^\s*>\s?/.test(lines[index])) {
+        quoteLines.push(lines[index].replace(/^\s*>\s?/, ""));
+        index += 1;
+      }
+      blocks.push(`<blockquote>${renderMarkdownBlocks(quoteLines.join("\n"))}</blockquote>`);
+      continue;
+    }
+
+    if (/^\s*[-*+]\s+/.test(line)) {
+      const items = [];
+      while (index < lines.length && /^\s*[-*+]\s+/.test(lines[index])) {
+        items.push(lines[index].replace(/^\s*[-*+]\s+/, ""));
+        index += 1;
+      }
+      blocks.push(`<ul>${items.map((item) => `<li>${renderInlineMarkdown(item)}</li>`).join("")}</ul>`);
+      continue;
+    }
+
+    if (/^\s*\d+\.\s+/.test(line)) {
+      const items = [];
+      while (index < lines.length && /^\s*\d+\.\s+/.test(lines[index])) {
+        items.push(lines[index].replace(/^\s*\d+\.\s+/, ""));
+        index += 1;
+      }
+      blocks.push(`<ol>${items.map((item) => `<li>${renderInlineMarkdown(item)}</li>`).join("")}</ol>`);
+      continue;
+    }
+
+    const paragraphLines = [];
+    while (index < lines.length && lines[index].trim() && !isMarkdownBlockStart(lines[index])) {
+      paragraphLines.push(lines[index]);
+      index += 1;
+    }
+    blocks.push(`<p>${paragraphLines.map((paragraphLine) => renderInlineMarkdown(paragraphLine)).join("<br>")}</p>`);
+  }
+
+  return blocks.join("");
+}
+
+function isMarkdownBlockStart(line) {
+  return /^(#{1,6})\s+/.test(line) || /^\s*[-*_]{3,}\s*$/.test(line) || /^\s*>\s?/.test(line) || /^\s*[-*+]\s+/.test(line) || /^\s*\d+\.\s+/.test(line);
+}
+
+function renderInlineMarkdown(text) {
+  const rawText = String(text ?? "");
   const codePattern = /`([^`\n]+)`/g;
   let cursor = 0;
   let html = "";
-  for (const match of text.matchAll(codePattern)) {
-    html += linkWorkspacePaths(text.slice(cursor, match.index));
+
+  for (const match of rawText.matchAll(codePattern)) {
+    html += renderInlineTextSegment(rawText.slice(cursor, match.index));
     const codeText = match[1] ?? "";
     const candidate = normalizeWorkspacePathCandidate(codeText);
     html += candidate ? workspacePathLink(candidate.path, candidate.label) : `<code class="message-inline-code">${escapeHtml(codeText)}</code>`;
     cursor = (match.index ?? 0) + match[0].length;
   }
 
-  html += linkWorkspacePaths(text.slice(cursor));
+  html += renderInlineTextSegment(rawText.slice(cursor));
   return html;
 }
 
-function linkWorkspacePaths(text) {
+function renderInlineTextSegment(text) {
   const pathPattern =
-    /(?:\.\/)?(?:agents|shared|docs|assets|artifacts|outputs|builds|release|releases)\/[A-Za-z0-9._~@%+\-/]+|(?:\.\/)?[A-Za-z0-9._~@%+-]+\/[A-Za-z0-9._~@%+\-/]*[A-Za-z0-9._~@%+-]\.[A-Za-z0-9]{2,10}/g;
+    /(?:\.\/)?(?:agents|shared|docs|assets|artifacts|outputs|builds|release|releases|intermediate|cocos|settings)\/[A-Za-z0-9._~@%+\-/]+|(?:\.\/)?[A-Za-z0-9._~@%+-]+\/[A-Za-z0-9._~@%+\-/]*[A-Za-z0-9._~@%+-]\.[A-Za-z0-9]{2,10}/g;
   let cursor = 0;
   let html = "";
   for (const match of text.matchAll(pathPattern)) {
@@ -1448,13 +1540,19 @@ function linkWorkspacePaths(text) {
       continue;
     }
 
-    html += escapeHtml(text.slice(cursor, match.index));
+    html += renderInlineEmphasis(text.slice(cursor, match.index));
     html += workspacePathLink(candidate.path, candidate.label);
     cursor = (match.index ?? 0) + raw.length;
   }
 
-  html += escapeHtml(text.slice(cursor));
+  html += renderInlineEmphasis(text.slice(cursor));
   return html;
+}
+
+function renderInlineEmphasis(text) {
+  return escapeHtml(text)
+    .replace(/\*\*([^*\n][\s\S]*?[^*\n])\*\*/g, "<strong>$1</strong>")
+    .replace(/__([^_\n][\s\S]*?[^_\n])__/g, "<strong>$1</strong>");
 }
 
 function normalizeWorkspacePathCandidate(value) {
@@ -1470,7 +1568,7 @@ function normalizeWorkspacePathCandidate(value) {
     return undefined;
   }
 
-  const startsWithWorkspaceRoot = /^(agents|shared|docs|assets|artifacts|outputs|builds|release|releases)\//.test(trimmed);
+  const startsWithWorkspaceRoot = /^(agents|shared|docs|assets|artifacts|outputs|builds|release|releases|intermediate|cocos|settings)\//.test(trimmed);
   const hasFileExtension = /\.[A-Za-z0-9]{2,10}$/.test(trimmed);
   if (!startsWithWorkspaceRoot && !hasFileExtension) {
     return undefined;
@@ -1499,10 +1597,41 @@ function renderClaimVerifications(message) {
         return `<div class="claim-verification claim-${escapeHtml(verdict)}">
           <span>${escapeHtml(claimVerdictLabel(verdict))}</span>
           <small>${escapeHtml(claim.reason ?? "未记录验证说明。")}</small>
+          ${renderClaimRepairMeta(claim)}
         </div>`;
       })
       .join("")}
   </div>`;
+}
+
+function renderClaimRepairMeta(claim) {
+  const metadata = claim.metadata ?? {};
+  if (!metadata.repairId && !metadata.repairTaskId) {
+    return "";
+  }
+
+  const status = metadata.repairStatus === "resolved" ? "已关闭" : "待补证";
+  const action = repairActionLabel(metadata.repairAction);
+  const taskId = typeof metadata.repairTaskId === "string" ? metadata.repairTaskId : "";
+  const nextStep = typeof metadata.repairNextStep === "string" ? metadata.repairNextStep : "";
+  const nearestPath = typeof metadata.nearestArtifactPath === "string" ? metadata.nearestArtifactPath : "";
+  return `<div class="claim-repair-meta">
+    <span>修复状态：${escapeHtml(status)}${taskId ? ` · ${escapeHtml(taskId)}` : ""}</span>
+    ${action ? `<small>处理动作：${escapeHtml(action)}</small>` : ""}
+    ${nearestPath ? `<small>最近实际产物：${workspacePathLink(nearestPath, nearestPath)}</small>` : ""}
+    ${nextStep ? `<small>${escapeHtml(nextStep)}</small>` : ""}
+  </div>`;
+}
+
+function repairActionLabel(action) {
+  switch (action) {
+    case "supply_evidence":
+      return "补齐工具证据";
+    case "correct_claim":
+      return "更正声明或补齐原路径";
+    default:
+      return "";
+  }
 }
 
 function claimVerdictLabel(verdict) {
