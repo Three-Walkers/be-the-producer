@@ -3,6 +3,7 @@ import type { MessageType, RoomKind, StudioMessage } from "@game-pipeline/shared
 import { spawn } from "node:child_process";
 import { dirname } from "node:path";
 import { verifyProjectClaims } from "./claimVerifier.js";
+import { reconcileClaimRepairs } from "./claimRepair.js";
 import { ModelAgentRuntime } from "./modelAgentRuntime.js";
 import { ProjectPersistenceStore, type ProjectSummary } from "./projectPersistence.js";
 import {
@@ -44,6 +45,7 @@ export class StudioProjectStore {
       this.projects.set(kernel.project.projectId, kernel);
       syncProjectWorkspace(kernel);
       verifyProjectClaims(kernel);
+      reconcileClaimRepairs(kernel);
       syncProjectWorkspace(kernel);
       this.persistence.save(kernel);
     }
@@ -132,8 +134,10 @@ export class StudioProjectStore {
         messageType: "plan_submission"
       },
       {
-        scriptedReplies: true,
-        modelReplies: false
+        scriptedReplies: false,
+        modelReplies: true,
+        bootstrapProjectState: true,
+        protocolFlows: true
       }
     );
     const kernel = this.getKernel(projectId);
@@ -187,7 +191,7 @@ export class StudioProjectStore {
   private async handleProducerInput(
     projectId: string,
     input: PostMessageInput,
-    options: { scriptedReplies: boolean; modelReplies: boolean }
+    options: { scriptedReplies: boolean; modelReplies: boolean; bootstrapProjectState?: boolean; protocolFlows?: boolean }
   ): Promise<ReturnType<LocalAgentRuntime["handleProducerMessage"]> & {
     workspace: WorkspaceSyncResult;
   }> {
@@ -219,15 +223,19 @@ export class StudioProjectStore {
       createdAt: new Date().toISOString()
     };
 
-    const result = this.runtime.handleProducerMessage(kernel, message, {
-      scriptedReplies: options.scriptedReplies
-    });
+    const runtimeOptions = {
+      scriptedReplies: options.scriptedReplies,
+      ...(options.protocolFlows === undefined ? {} : { protocolFlows: options.protocolFlows }),
+      ...(options.bootstrapProjectState === undefined ? {} : { bootstrapProjectState: options.bootstrapProjectState })
+    };
+    const result = this.runtime.handleProducerMessage(kernel, message, runtimeOptions);
     if (options.modelReplies && result.agentMessages.length === 0) {
       const modelResult = await this.modelRuntime.respond(kernel, message, result.routePlan);
       result.agentMessages.push(...modelResult.agentMessages);
     }
     let workspace = syncProjectWorkspace(kernel);
     verifyProjectClaims(kernel);
+    reconcileClaimRepairs(kernel);
     workspace = syncProjectWorkspace(kernel);
     this.persistence.save(kernel);
     return {
@@ -240,6 +248,7 @@ export class StudioProjectStore {
     const kernel = this.getKernel(projectId);
     let workspace = syncProjectWorkspace(kernel);
     verifyProjectClaims(kernel);
+    reconcileClaimRepairs(kernel);
     workspace = syncProjectWorkspace(kernel);
     this.persistence.save(kernel);
     return workspace;

@@ -4,6 +4,7 @@ import type {
   ArtifactLedgerEntry,
   ArtifactOperation,
   AuditEvent,
+  ClaimRepair,
   ClaimVerification,
   MemoryRecord,
   Project,
@@ -32,6 +33,7 @@ export interface StudioKernelState {
   artifactOperations: ArtifactOperation[];
   artifactLedger: ArtifactLedgerEntry[];
   claimVerifications: ClaimVerification[];
+  claimRepairs: ClaimRepair[];
 }
 
 export interface StudioKernelSnapshot extends StudioKernelState {
@@ -70,7 +72,8 @@ export class StudioKernel {
       artifacts: restoredState.artifacts ?? [],
       artifactOperations: restoredState.artifactOperations ?? [],
       artifactLedger: restoredState.artifactLedger ?? [],
-      claimVerifications: restoredState.claimVerifications ?? []
+      claimVerifications: restoredState.claimVerifications ?? [],
+      claimRepairs: restoredState.claimRepairs ?? []
     };
   }
 
@@ -143,6 +146,27 @@ export class StudioKernel {
   addTask(task: Task): void {
     this.state.tasks.push(task);
     this.appendTaskEvent(task, "TASK_CREATED");
+  }
+
+  updateTask(taskId: string, fields: Partial<Omit<Task, "taskId" | "projectId" | "createdAt">>): Task {
+    const task = this.state.tasks.find((candidate) => candidate.taskId === taskId);
+    if (!task) {
+      throw new Error(`Task not found: ${taskId}`);
+    }
+
+    if ((fields.status === "review" || fields.status === "done") && !this.hasVerifiedTaskOutputs(task)) {
+      const missing = this.missingVerifiedTaskOutputs(task);
+      throw new Error(`任务「${task.title}」不能进入 ${fields.status}：输出产物缺少已验证证据 ${missing.join("、")}`);
+    }
+
+    Object.assign(task, fields);
+    task.updatedAt = fields.updatedAt ?? new Date().toISOString();
+    if (task.status === "done") {
+      task.blockers = [];
+      task.progressPercent = 100;
+    }
+    this.appendTaskEvent(task, "TASK_UPDATED");
+    return task;
   }
 
   updateTaskStatus(taskId: string, status: Task["status"], updatedAt = new Date().toISOString()): Task {
@@ -365,6 +389,10 @@ export class StudioKernel {
     return [...this.state.claimVerifications];
   }
 
+  listClaimRepairs(): ClaimRepair[] {
+    return [...this.state.claimRepairs];
+  }
+
   recordClaimVerification(claim: ClaimVerification): ClaimVerification {
     const existingIndex = this.state.claimVerifications.findIndex((candidate) => candidate.claimId === claim.claimId);
     const existing = existingIndex === -1 ? undefined : this.state.claimVerifications[existingIndex];
@@ -408,6 +436,67 @@ export class StudioKernel {
     return claim;
   }
 
+  upsertClaimRepair(repair: ClaimRepair): { repair: ClaimRepair; created: boolean; changed: boolean } {
+    const existingIndex = this.state.claimRepairs.findIndex((candidate) => candidate.repairId === repair.repairId);
+    const existing = existingIndex === -1 ? undefined : this.state.claimRepairs[existingIndex];
+    const created = existingIndex === -1;
+    const changed =
+      !existing ||
+      existing.status !== repair.status ||
+      existing.reason !== repair.reason ||
+      existing.action !== repair.action ||
+      existing.nearestArtifactPath !== repair.nearestArtifactPath ||
+      existing.resolution !== repair.resolution ||
+      existing.resolutionClaimId !== repair.resolutionClaimId;
+
+    let current: ClaimRepair;
+    if (created) {
+      this.state.claimRepairs.push(repair);
+      current = repair;
+    } else {
+      if (!existing) {
+        throw new Error(`Claim repair not found: ${repair.repairId}`);
+      }
+      current = {
+        ...existing,
+        ...repair,
+        createdAt: existing.createdAt
+      };
+      this.state.claimRepairs[existingIndex] = current;
+    }
+
+    if (changed) {
+      this.auditLog.append({
+        eventId: `evt_claim_repair_${current.status}_${current.repairId}_${Date.now()}`,
+        projectId: current.projectId,
+        agentId: current.agentId,
+        taskId: current.taskId,
+        eventType: current.status === "resolved" ? "CLAIM_REPAIR_RESOLVED" : "CLAIM_REPAIR_OPENED",
+        inputArtifacts: [],
+        outputArtifacts: [],
+        toolCalls: [],
+        decisionRefs: [],
+        status: current.status === "resolved" ? "completed" : "started",
+        metadata: {
+          claimId: current.claimId,
+          messageId: current.messageId,
+          action: current.action,
+          claimedPath: current.claimedPath,
+          nearestArtifactPath: current.nearestArtifactPath,
+          resolution: current.resolution,
+          resolutionClaimId: current.resolutionClaimId
+        },
+        createdAt: current.updatedAt
+      });
+    }
+
+    return {
+      repair: current,
+      created,
+      changed
+    };
+  }
+
   setMessageClaimVerifications(messageId: string, claims: ClaimVerification[]): void {
     const message = this.state.messages.find((candidate) => candidate.messageId === messageId);
     if (!message) {
@@ -442,6 +531,7 @@ export class StudioKernel {
       artifactOperations: this.state.artifactOperations,
       artifactLedger: this.state.artifactLedger,
       claimVerifications: this.state.claimVerifications,
+      claimRepairs: this.state.claimRepairs,
       memoryRecords: this.memory.list(this.state.project.projectId),
       auditEvents: this.auditLog.list(this.state.project.projectId)
     };
@@ -520,7 +610,7 @@ export class StudioKernel {
     });
   }
 
-  private appendTaskEvent(task: Task, eventType: "TASK_CREATED" | "TASK_STATUS_CHANGED"): void {
+  private appendTaskEvent(task: Task, eventType: "TASK_CREATED" | "TASK_UPDATED" | "TASK_STATUS_CHANGED"): void {
     this.auditLog.append({
       eventId: `evt_${eventType.toLowerCase()}_${task.taskId}_${Date.now()}`,
       projectId: task.projectId,
@@ -577,6 +667,7 @@ export function createStudioKernelFromSnapshot(snapshot: StudioKernelSnapshot): 
     artifactOperations: snapshot.artifactOperations,
     artifactLedger: snapshot.artifactLedger,
     claimVerifications: snapshot.claimVerifications,
+    claimRepairs: snapshot.claimRepairs,
     memoryRecords: snapshot.memoryRecords,
     auditEvents: snapshot.auditEvents
   });

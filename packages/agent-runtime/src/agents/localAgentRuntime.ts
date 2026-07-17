@@ -19,6 +19,8 @@ export interface LocalAgentRunResult {
 
 export interface LocalAgentRuntimeOptions {
   scriptedReplies?: boolean;
+  protocolFlows?: boolean;
+  bootstrapProjectState?: boolean;
 }
 
 type Handler = (input: HandlerInput) => void;
@@ -93,12 +95,17 @@ export class LocalAgentRuntime {
 
   handleProducerMessage(kernel: StudioKernel, message: StudioMessage, options: LocalAgentRuntimeOptions = {}): LocalAgentRunResult {
     const scriptedReplies = options.scriptedReplies ?? true;
+    const protocolFlows = options.protocolFlows ?? true;
     const routePlan = kernel.postMessage(message);
     const before = kernel.listMessages().length;
     const now = new Date().toISOString();
 
+    if (options.bootstrapProjectState) {
+      bootstrapConceptDiscussion(kernel, message, now);
+    }
+
     const gate = detectGateAction(message.content);
-    const shouldRunLocalDecisionFlow = gate ? scriptedReplies || isGateExecutionConfirmation(message.content, gate) : false;
+    const shouldRunLocalDecisionFlow = gate ? protocolFlows : false;
     const transitionApplied = shouldRunLocalDecisionFlow ? applyProducerDecisionFlow(kernel, message, now) : false;
     if (transitionApplied) {
       return {
@@ -141,6 +148,17 @@ export class LocalAgentRuntime {
   }
 }
 
+function bootstrapConceptDiscussion(kernel: StudioKernel, producerMessage: StudioMessage, now: string): void {
+  ensureStageOneTasks(kernel, now);
+  writeProjectMemory(kernel, {
+    memoryId: `mem_project_idea_${producerMessage.messageId}`,
+    ownerAgent: "studio_orchestrator",
+    type: "initial_idea",
+    content: `制作人初始 idea：${producerMessage.content}`,
+    now
+  });
+}
+
 function handleOrchestrator({ kernel, producerMessage, now }: HandlerInput): void {
   if (isApprovalMessage(producerMessage.content) || isReleaseMessage(producerMessage.content)) {
     return;
@@ -151,7 +169,7 @@ function handleOrchestrator({ kernel, producerMessage, now }: HandlerInput): voi
     return;
   }
 
-  ensureStageOneTasks(kernel, now);
+  bootstrapConceptDiscussion(kernel, producerMessage, now);
   writeAgentMessage(kernel, {
     agentId: "studio_orchestrator",
     roomKind: "studio-main",
@@ -159,13 +177,6 @@ function handleOrchestrator({ kernel, producerMessage, now }: HandlerInput): voi
     relatedTaskIds: ["task_group_stage_1", "task_stage_1_design_clarification", "task_stage_1_art_direction", "task_stage_1_scope_review"],
     content:
       "已创建 Stage 1 立项任务树：策划负责玩法澄清和 GDD baseline，美术负责视觉方向和 Art Bible baseline，Producer 负责范围与评审记录。"
-  });
-  writeProjectMemory(kernel, {
-    memoryId: `mem_project_idea_${producerMessage.messageId}`,
-    ownerAgent: "studio_orchestrator",
-    type: "initial_idea",
-    content: `制作人初始 idea：${producerMessage.content}`,
-    now
   });
 }
 
@@ -669,7 +680,7 @@ function handleGameDesigner({ kernel, producerMessage, now }: HandlerInput): voi
     memoryId: `mem_design_draft_${producerMessage.messageId}`,
     ownerAgent: "game_designer",
     type: "gdd_draft",
-    content: "策划已进入开局澄清，当前需要确认核心操作、单局时长、胜负条件和玩家目标情绪。",
+    content: "策划已进入开局澄清，当前阶段保持开放，只有制作人发起门禁评审并二次确认后才会结束。",
     now
   });
   writeAgentMessage(kernel, {
@@ -677,8 +688,7 @@ function handleGameDesigner({ kernel, producerMessage, now }: HandlerInput): voi
     roomKind: "design-room",
     messageType: "decision_request",
     relatedArtifactIds: [artifactId],
-    content:
-      "策划初步接收 idea。请制作人确认四点：1. 单局目标时长；2. 玩家核心操作；3. 胜利/失败条件；4. 想要的玩家情绪。确认后我会固化 GDD baseline。"
+    content: buildDesignOpeningQuestion(producerMessage.content)
   });
 }
 
@@ -705,7 +715,7 @@ function handleArtDirector({ kernel, producerMessage, now }: HandlerInput): void
     memoryId: `mem_art_draft_${producerMessage.messageId}`,
     ownerAgent: "art_director",
     type: "art_bible_draft",
-    content: "美术已进入视觉澄清，当前需要确认目标风格、色彩语气、UI 可读性和禁用风格。",
+    content: "美术已进入视觉澄清，当前阶段保持开放，只有制作人发起门禁评审并二次确认后才会结束。",
     now
   });
   writeAgentMessage(kernel, {
@@ -713,9 +723,61 @@ function handleArtDirector({ kernel, producerMessage, now }: HandlerInput): void
     roomKind: "art-room",
     messageType: "decision_request",
     relatedArtifactIds: [artifactId],
-    content:
-      "美术方向已开始。请制作人提供或确认：1. 参考游戏/图片；2. 风格关键词；3. 主色倾向；4. 明确不要出现的视觉元素。确认后我会固化 Art Bible baseline。"
+    content: buildArtOpeningQuestion(producerMessage.content)
   });
+}
+
+function buildDesignOpeningQuestion(idea: string): string {
+  const text = idea.toLowerCase();
+  const questions: string[] = [];
+  if (text.includes("毛线") || text.includes("线团") || text.includes("球")) {
+    questions.push("毛线球的核心物理行为是什么：弹开、滚动、缠住、还是被点击后短暂停滞？");
+  }
+  if (text.includes("防守") || text.includes("守") || text.includes("篮")) {
+    questions.push("防守失败的判定要精确到什么程度：碰到篮筐边缘、越过某条线，还是落入篮内才失败？");
+  }
+  if (text.includes("微信") || text.includes("小游戏")) {
+    questions.push("微信小游戏首个可玩要优先验证哪件事：上手速度、单局留存、分享复玩，还是手感反馈？");
+  }
+  if (text.includes("可爱") || text.includes("轻松") || text.includes("治愈")) {
+    questions.push("你希望玩家的主要情绪更偏轻松治愈、手忙脚乱的快乐，还是紧张但不挫败？");
+  }
+  if (questions.length < 3) {
+    questions.push("玩家每局最核心的一句话目标是什么？");
+    questions.push("玩家失败后应该立刻想再来一局，还是先看到成长/奖励反馈？");
+  }
+
+  return [
+    "策划已接收 idea，我不会把立项讨论自动结束。",
+    "我先围绕这个 idea 提出当前最需要制作人判断的设计问题：",
+    ...questions.slice(0, 4).map((question, index) => `${index + 1}. ${question}`),
+    "你可以继续补充任何细节；只有你明确发起门禁评审并二次确认后，本阶段才会进入开发落地。"
+  ].join("\n");
+}
+
+function buildArtOpeningQuestion(idea: string): string {
+  const text = idea.toLowerCase();
+  const prompts: string[] = [];
+  if (text.includes("毛线") || text.includes("猫") || text.includes("可爱")) {
+    prompts.push("毛线球和场景要偏手作毛绒、扁平贴纸，还是更像柔软 3D 玩具？");
+  }
+  if (text.includes("轻松") || text.includes("治愈") || text.includes("可爱")) {
+    prompts.push("整体色彩要偏奶油暖色、清爽浅色，还是高对比的街机糖果色？");
+  }
+  if (text.includes("篮球") || text.includes("篮")) {
+    prompts.push("篮子/边界要明显游戏化，还是融入生活化场景让防守目标更自然？");
+  }
+  if (prompts.length < 3) {
+    prompts.push("有没有明确参考图、参考游戏或不想出现的视觉风格？");
+    prompts.push("首个可玩阶段优先保证角色识别、操作反馈，还是场景氛围？");
+  }
+
+  return [
+    "美术已接收 idea，我不会把视觉讨论自动结束。",
+    "我先按当前 idea 提出视觉方向澄清：",
+    ...prompts.slice(0, 4).map((prompt, index) => `${index + 1}. ${prompt}`),
+    "你可以继续补充参考和禁用项；只有你明确发起门禁评审并二次确认后，本阶段才会进入开发落地。"
+  ].join("\n");
 }
 
 function handleAssetProduction({ kernel }: HandlerInput): void {

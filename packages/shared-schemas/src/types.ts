@@ -322,6 +322,9 @@ export interface ArtifactLedgerEntry {
 
 export type ClaimVerdict = "verified" | "mismatch" | "insufficient";
 export type ClaimType = "artifact_written" | "completion" | "path_reference";
+export type ClaimRepairStatus = "open" | "resolved";
+export type ClaimRepairAction = "supply_evidence" | "correct_claim";
+export type ClaimRepairResolution = "evidence_verified" | "claim_corrected";
 
 export interface ClaimVerification {
   claimId: ClaimId;
@@ -337,6 +340,25 @@ export interface ClaimVerification {
   resolver: "artifact_ledger" | "filesystem" | "message_metadata";
   checkedAt: string;
   metadata: Record<string, unknown>;
+}
+
+export interface ClaimRepair {
+  repairId: string;
+  projectId: ProjectId;
+  claimId: ClaimId;
+  messageId: MessageId;
+  agentId: AgentId;
+  taskId: TaskId;
+  status: ClaimRepairStatus;
+  action: ClaimRepairAction;
+  claimedPath?: string;
+  nearestArtifactPath?: string;
+  reason: string;
+  createdAt: string;
+  updatedAt: string;
+  resolvedAt?: string;
+  resolution?: ClaimRepairResolution;
+  resolutionClaimId?: ClaimId;
 }
 
 export interface MemoryRecord {
@@ -401,6 +423,8 @@ export interface AuditEvent {
     | "CLAIM_VERIFIED"
     | "CLAIM_MISMATCH"
     | "CLAIM_INSUFFICIENT"
+    | "CLAIM_REPAIR_OPENED"
+    | "CLAIM_REPAIR_RESOLVED"
     | "MEMORY_WRITTEN"
     | "MODEL_INVOKED"
     | "TOOL_STARTED"
