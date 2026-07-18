@@ -104,9 +104,9 @@ export class LocalAgentRuntime {
       bootstrapConceptDiscussion(kernel, message, now);
     }
 
-    const gate = detectGateAction(message.content);
+    const gate = resolveGateAction(kernel, message.content);
     const shouldRunLocalDecisionFlow = gate ? protocolFlows : false;
-    const transitionApplied = shouldRunLocalDecisionFlow ? applyProducerDecisionFlow(kernel, message, now) : false;
+    const transitionApplied = gate && shouldRunLocalDecisionFlow ? applyProducerDecisionFlow(kernel, message, gate, now) : false;
     if (transitionApplied) {
       return {
         routePlan,
@@ -195,13 +195,9 @@ function writePresenceResponse(kernel: StudioKernel): void {
   });
 }
 
-function applyProducerDecisionFlow(kernel: StudioKernel, message: StudioMessage, now: string): boolean {
-  const gate = detectGateAction(message.content);
-  if (!gate) {
-    return false;
-  }
-
-  if (isGateExecutionConfirmation(message.content, gate)) {
+function applyProducerDecisionFlow(kernel: StudioKernel, message: StudioMessage, gate: GateAction, now: string): boolean {
+  const hasReview = hasRecentGateReview(kernel, gate, message.messageId);
+  if (isGateExecutionConfirmation(message.content, gate) || (hasReview && isNaturalLanguageGateConfirmation(message.content))) {
     executeGateAction(kernel, message, gate, now);
     return true;
   }
@@ -440,9 +436,48 @@ function detectGateAction(content: string): GateAction | undefined {
   return undefined;
 }
 
+function resolveGateAction(kernel: StudioKernel, content: string): GateAction | undefined {
+  const explicit = detectGateAction(content);
+  if (explicit) {
+    return explicit;
+  }
+
+  const pending = Object.values(gateActions).filter(
+    (gate) => isGateStageApplicable(kernel, gate) && hasRecentGateReview(kernel, gate)
+  );
+  if (pending.length === 1 && isNaturalLanguageGateConfirmation(content)) {
+    return pending[0];
+  }
+
+  if (!isGenericGateIntent(content)) {
+    return undefined;
+  }
+  return Object.values(gateActions).find((gate) => isGateStageApplicable(kernel, gate));
+}
+
 function isGateExecutionConfirmation(content: string, gate: GateAction): boolean {
   const normalized = content.toLowerCase();
   return normalized.includes(gate.confirmToken.toLowerCase()) || (normalized.includes("执行确认") && normalized.includes(gate.label.toLowerCase()));
+}
+
+function isNaturalLanguageGateConfirmation(content: string): boolean {
+  const normalized = content.toLowerCase().replace(/[，。！？!?\s]/g, "");
+  if (["确认", "同意", "继续", "通过", "审批通过", "确认通过"].includes(normalized)) {
+    return true;
+  }
+  return (
+    (normalized.includes("确认") || normalized.includes("同意") || normalized.includes("继续") || normalized.includes("通过")) &&
+    (normalized.includes("结束") || normalized.includes("下一阶段") || normalized.includes("推进") || normalized.includes("进入开发") || normalized.includes("进入发布"))
+  );
+}
+
+function isGenericGateIntent(content: string): boolean {
+  const normalized = content.toLowerCase();
+  return (
+    isNaturalLanguageGateConfirmation(content) ||
+    ((normalized.includes("门禁") || normalized.includes("评审")) &&
+      (normalized.includes("发起") || normalized.includes("开始") || normalized.includes("请求") || normalized.includes("进入")))
+  );
 }
 
 function isGateStageApplicable(kernel: StudioKernel, gate: GateAction): boolean {
@@ -514,8 +549,12 @@ function approveStageOne(kernel: StudioKernel, message: StudioMessage, now: stri
 
 function isApprovalMessage(content: string): boolean {
   return (
-    (content.includes("确认") || content.includes("同意") || content.includes("审批") || content.includes("通过")) &&
-    (content.includes("玩法") || content.includes("美术") || content.includes("范围") || content.includes("stage 1") || content.includes("立项"))
+    ((content.includes("确认") || content.includes("同意") || content.includes("审批") || content.includes("通过")) &&
+      (content.includes("玩法") || content.includes("美术") || content.includes("范围") || content.includes("stage 1") || content.includes("立项"))) ||
+    ((content.includes("门禁") || content.includes("评审")) &&
+      (content.includes("立项") || content.includes("本阶段") || content.includes("当前阶段") || content.includes("讨论"))) ||
+    ((content.includes("结束") || content.includes("下一阶段") || content.includes("开发落地")) &&
+      (content.includes("确认") || content.includes("同意") || content.includes("开始") || content.includes("进入") || content.includes("推进")))
   );
 }
 
