@@ -1,0 +1,167 @@
+import assert from "node:assert/strict";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+const tempRoot = mkdtempSync(join(tmpdir(), "btp-claude-harness-"));
+const projectRoot = join(tempRoot, "project");
+const fakeClaude = join(tempRoot, "fake-claude.mjs");
+mkdirSync(projectRoot, { recursive: true });
+writeFileSync(
+  fakeClaude,
+  `#!/usr/bin/env node
+import { mkdirSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+const args = process.argv.slice(2);
+if (args.includes("--version")) {
+  process.stdout.write("9.9.9-test\\n");
+  process.exit(0);
+}
+let prompt = "";
+for await (const chunk of process.stdin) prompt += chunk;
+if (prompt.includes("ABORT_TEST")) {
+  await new Promise((resolve) => setTimeout(resolve, 5000));
+}
+const target = join(process.cwd(), "docs/design/harness-proof.md");
+mkdirSync(dirname(target), { recursive: true });
+writeFileSync(target, "# Harness Proof\\n\\nClaude CLI wrote this file from its native Write/Edit loop.\\n");
+const harnessState = join(process.cwd(), ".be-the-producer", "test");
+mkdirSync(harnessState, { recursive: true });
+writeFileSync(join(harnessState, "harness-args.json"), JSON.stringify(args));
+const sessionId = "11111111-1111-4111-8111-111111111111";
+process.stdout.write(JSON.stringify({type:"system", subtype:"init", session_id:sessionId}) + "\\n");
+process.stdout.write(JSON.stringify({type:"assistant", message:{content:[{type:"text", text:"已实际写入任务文件。"}]}}) + "\\n");
+process.stdout.write(JSON.stringify({type:"result", result:"已实际写入任务文件。", session_id:sessionId}) + "\\n");
+`,
+  "utf8"
+);
+chmodSync(fakeClaude, 0o755);
+process.env.CLAUDE_CLI_PATH = fakeClaude;
+
+const { ClaudeCliHarness } = await import("../apps/api/dist/claudeCliHarness.js");
+const { captureWorkspaceSnapshot, recordHarnessWorkspaceChanges } = await import("../apps/api/dist/harnessWorkspaceEvidence.js");
+const { createStudioKernel, defaultAgentContracts } = await import("@game-pipeline/agent-runtime");
+
+const harness = new ClaudeCliHarness();
+const status = await harness.status();
+assert.equal(status.available, true);
+assert.match(status.version, /9\.9\.9-test/);
+
+const kernel = createStudioKernel("harness_test", "Harness Test", "producer", "验证 Claude CLI 持续工作");
+const agent = defaultAgentContracts.find((candidate) => candidate.agentId === "game_designer");
+assert.ok(agent);
+const now = new Date().toISOString();
+kernel.addTask({
+  taskId: "task_harness",
+  projectId: kernel.project.projectId,
+  stageId: "concept_discussion",
+  roomId: kernel.getRoom("design-room").roomId,
+  parentTaskId: undefined,
+  taskLevel: "task",
+  title: "写入 Harness 证明",
+  description: "使用 CLI 原生工具写入文件",
+  ownerAgentId: agent.agentId,
+  participantAgentIds: [],
+  status: "doing",
+  priority: 100,
+  sortOrder: 1,
+  progressPercent: 0,
+  blockers: [],
+  inputArtifacts: [],
+  outputArtifacts: ["artifact_harness_proof"],
+  acceptanceCriteria: ["文件存在且有 hash"],
+  createdAt: now,
+  updatedAt: now
+});
+kernel.upsertArtifact({
+  artifactId: "artifact_harness_proof",
+  projectId: kernel.project.projectId,
+  type: "gdd",
+  path: "docs/design/harness-proof.md",
+  ownerAgentId: agent.agentId,
+  stageId: "concept_discussion",
+  status: "draft",
+  version: 1,
+  sourceTaskId: "task_harness",
+  sourceDecisionIds: [],
+  metadata: {},
+  createdAt: now,
+  updatedAt: now
+});
+const task = kernel.findTask("task_harness");
+assert.ok(task);
+const provider = {
+  providerId: "test-anthropic",
+  label: "Test Anthropic",
+  protocol: "anthropic",
+  baseUrl: "https://example.invalid/apps/anthropic",
+  defaultModel: "qwen-test",
+  apiKey: "test-only"
+};
+const before = captureWorkspaceSnapshot(projectRoot);
+const result = await harness.run({
+  projectId: kernel.project.projectId,
+  projectRoot,
+  agent,
+  provider,
+  model: "qwen-test",
+  systemPrompt: "test",
+  userPrompt: "write the proof"
+});
+assert.equal(result.sessionId, "11111111-1111-4111-8111-111111111111");
+const after = captureWorkspaceSnapshot(projectRoot);
+const evidence = recordHarnessWorkspaceChanges(kernel, task, agent, before, after, result.invocationId);
+assert.deepEqual(evidence.violations, []);
+assert.ok(evidence.changedPaths.includes("docs/design/harness-proof.md"));
+assert.ok(evidence.toolExecutions.some((tool) => tool.status === "completed"));
+assert.equal(kernel.listArtifactLedger().find((entry) => entry.artifactId === "artifact_harness_proof")?.status, "verified");
+assert.ok(kernel.listArtifacts().find((artifact) => artifact.artifactId === "artifact_harness_proof")?.metadata.toolExecutedAt);
+
+const concurrentBefore = captureWorkspaceSnapshot(projectRoot);
+writeFileSync(join(projectRoot, "docs/design/harness-proof.md"), "# Harness Proof\n\nOnly the design Agent changed this file.\n", "utf8");
+mkdirSync(join(projectRoot, "agents/art"), { recursive: true });
+writeFileSync(join(projectRoot, "agents/art/concurrent-art.md"), "# Concurrent Art\n", "utf8");
+const concurrentAfter = captureWorkspaceSnapshot(projectRoot);
+const isolatedEvidence = recordHarnessWorkspaceChanges(
+  kernel,
+  task,
+  agent,
+  concurrentBefore,
+  concurrentAfter,
+  "inv_concurrent_isolation",
+  ["docs/design/harness-proof.md"]
+);
+assert.deepEqual(isolatedEvidence.changedPaths, ["docs/design/harness-proof.md"]);
+assert.deepEqual(isolatedEvidence.violations, []);
+
+await harness.run({
+  projectId: kernel.project.projectId,
+  projectRoot,
+  agent,
+  provider,
+  model: "qwen-test",
+  systemPrompt: "test",
+  userPrompt: "resume the proof",
+  sessionId: result.sessionId
+});
+const args = JSON.parse(readFileSync(join(projectRoot, ".be-the-producer/test/harness-args.json"), "utf8"));
+assert.ok(args.includes("--resume"));
+assert.ok(args.includes(result.sessionId));
+
+const abortController = new AbortController();
+const aborted = harness.run({
+  projectId: kernel.project.projectId,
+  projectRoot,
+  agent,
+  provider,
+  model: "qwen-test",
+  systemPrompt: "test",
+  userPrompt: "ABORT_TEST",
+  abortSignal: abortController.signal
+});
+setTimeout(() => abortController.abort(), 50);
+await assert.rejects(aborted, /暂停或取消/);
+assert.equal(existsSync(join(projectRoot, "docs/design/harness-proof.md")), true);
+
+rmSync(tempRoot, { recursive: true, force: true });
+process.stdout.write("Claude CLI Harness smoke passed: session resume, isolated evidence ledger, cancellation\n");

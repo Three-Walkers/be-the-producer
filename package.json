@@ -10,6 +10,8 @@
   "scripts": {
     "build": "tsc -b packages/shared-schemas packages/agent-runtime apps/api",
     "typecheck": "tsc -b packages/shared-schemas packages/agent-runtime apps/api --pretty false",
+    "verify:agent-loop": "npm run build && node scripts/verify-agent-loop.mjs",
+    "verify:claude-harness": "npm run build && node scripts/verify-claude-harness.mjs",
     "clean": "rm -rf packages/*/dist packages/*/*.tsbuildinfo apps/*/dist apps/*/*.tsbuildinfo",
     "start": "node ./bin/game-pipeline-agents.js",
     "start:local": "node ./bin/game-pipeline-agents.js",
