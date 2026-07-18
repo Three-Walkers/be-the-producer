@@ -238,6 +238,15 @@ export async function handleRequest(request: IncomingMessage, response: ServerRe
       return;
     }
 
+    if (request.method === "PATCH" && resource === "rooms" && childId && nested === "participants") {
+      const input = await readJson<{ agentId?: string; action?: "invite" | "remove" }>(request);
+      if (!input.agentId || (input.action !== "invite" && input.action !== "remove")) {
+        throw new HttpError(400, "agentId and action=invite|remove are required");
+      }
+      sendJson(response, 200, studioStore.updateRoomParticipant(projectRoute.projectId, childId, input.agentId, input.action));
+      return;
+    }
+
     if (request.method === "GET" && resource === "messages") {
       sendJson(response, 200, { messages: kernel.listMessages() });
       return;

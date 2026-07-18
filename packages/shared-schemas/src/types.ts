@@ -446,6 +446,8 @@ export interface AuditEvent {
   eventType:
     | "PROJECT_CREATED"
     | "ROOM_CREATED"
+    | "ROOM_MEMBER_INVITED"
+    | "ROOM_MEMBER_REMOVED"
     | "MESSAGE_POSTED"
     | "AGENT_INVOKED"
     | "AGENT_RESPONDED"

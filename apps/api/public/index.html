@@ -236,6 +236,19 @@
       </div>
     </dialog>
 
+    <dialog id="room-settings-dialog" class="room-settings-dialog">
+      <div class="room-settings-surface">
+        <header class="room-settings-header">
+          <div>
+            <h2 id="room-settings-title">房间成员</h2>
+            <p id="room-settings-summary">管理当前房间可以参与聊天和自动路由的 Agent。</p>
+          </div>
+          <button id="close-room-settings" class="icon-button" type="button" aria-label="关闭房间设置" title="关闭">×</button>
+        </header>
+        <div id="room-member-list" class="room-member-list"></div>
+      </div>
+    </dialog>
+
     <div id="toast" class="toast" hidden></div>
     <script src="/app.js" type="module"></script>
   </body>

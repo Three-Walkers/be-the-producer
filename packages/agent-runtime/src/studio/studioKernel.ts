@@ -222,7 +222,7 @@ export class StudioKernel {
   }
 
   listRooms(): Room[] {
-    return [...this.state.rooms];
+    return this.state.rooms.map(cloneRoom);
   }
 
   getRoom(kind: RoomKind): Room {
@@ -230,7 +230,52 @@ export class StudioKernel {
     if (!room) {
       throw new Error(`Room not found: ${kind}`);
     }
-    return room;
+    return cloneRoom(room);
+  }
+
+  updateRoomParticipant(
+    kind: RoomKind,
+    agentId: AgentId,
+    action: "invite" | "remove",
+    updatedAt = new Date().toISOString()
+  ): { room: Room; changed: boolean } {
+    if (!this.agents.has(agentId)) {
+      throw new Error(`Unknown agent: ${agentId}`);
+    }
+    const room = this.state.rooms.find((candidate) => candidate.kind === kind);
+    if (!room) {
+      throw new Error(`Room not found: ${kind}`);
+    }
+
+    const wasPresent = room.participants.includes(agentId);
+    const shouldBePresent = action === "invite";
+    const changed = wasPresent !== shouldBePresent;
+    if (changed) {
+      room.participants = shouldBePresent
+        ? [...room.participants, agentId]
+        : room.participants.filter((candidate) => candidate !== agentId);
+      this.state.project.updatedAt = updatedAt;
+      this.auditLog.append({
+        eventId: `evt_room_member_${action}_${room.kind}_${agentId}_${Date.now()}`,
+        projectId: this.state.project.projectId,
+        stageId: this.state.project.currentStage,
+        agentId: "producer",
+        eventType: action === "invite" ? "ROOM_MEMBER_INVITED" : "ROOM_MEMBER_REMOVED",
+        inputArtifacts: [],
+        outputArtifacts: [],
+        toolCalls: [],
+        decisionRefs: [],
+        status: "completed",
+        metadata: {
+          roomId: room.roomId,
+          roomKind: room.kind,
+          memberAgentId: agentId
+        },
+        createdAt: updatedAt
+      });
+    }
+
+    return { room: cloneRoom(room), changed };
   }
 
   postMessage(message: StudioMessage): RoutePlan {
@@ -888,4 +933,12 @@ function summarizeClaimVerdict(claims: ClaimVerification[]): ClaimVerification["
     return "insufficient";
   }
   return "verified";
+}
+
+function cloneRoom(room: Room): Room {
+  return {
+    ...room,
+    participants: [...room.participants],
+    routingPolicy: { ...room.routingPolicy }
+  };
 }

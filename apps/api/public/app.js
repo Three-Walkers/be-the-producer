@@ -14,6 +14,7 @@ const state = {
   modelTestResults: {},
   harnessStatuses: [],
   pendingAgentResponses: [],
+  roomSettingsKind: null,
   selectedModelProviderId: "dashscope"
 };
 
@@ -205,6 +206,7 @@ const settingsDialog = $("#settings-dialog");
 const startConfirmDialog = $("#start-confirm-dialog");
 const deleteConfirmDialog = $("#delete-confirm-dialog");
 const artifactPreviewDialog = $("#artifact-preview-dialog");
+const roomSettingsDialog = $("#room-settings-dialog");
 const messageContentInput = $("#message-content");
 const mentionSuggestions = $("#mention-suggestions");
 let pendingStartProjectId = null;
@@ -328,6 +330,16 @@ $("#open-artifact-finder").addEventListener("click", () => {
 artifactPreviewDialog.addEventListener("click", (event) => {
   if (event.target === artifactPreviewDialog) {
     closeArtifactPreview();
+  }
+});
+
+$("#close-room-settings").addEventListener("click", () => {
+  closeRoomSettings();
+});
+
+roomSettingsDialog.addEventListener("click", (event) => {
+  if (event.target === roomSettingsDialog) {
+    closeRoomSettings();
   }
 });
 
@@ -1408,6 +1420,10 @@ function clearCurrentProject() {
   state.taskBoard = null;
   state.artifacts = [];
   state.workspace = null;
+  state.roomSettingsKind = null;
+  if (roomSettingsDialog.open) {
+    roomSettingsDialog.close();
+  }
   render();
 }
 
@@ -1422,7 +1438,13 @@ function renderRooms() {
     .map((room) => {
       const count = state.messages.filter((message) => message.roomId === room.roomId).length;
       const active = room.kind === state.activeRoomKind ? " active" : "";
-      return `<button class="room-button${active}" data-room-kind="${escapeHtml(room.kind)}" type="button"><span>${escapeHtml(roomLabels[room.kind] ?? room.name)}</span><span>${count}</span></button>`;
+      return `<div class="room-row${active}">
+        <button class="room-button room-select-button" data-room-kind="${escapeHtml(room.kind)}" type="button">
+          <span>${escapeHtml(roomLabels[room.kind] ?? room.name)}</span>
+          <span>${count}</span>
+        </button>
+        <button class="room-settings-button" data-room-settings="${escapeHtml(room.kind)}" type="button" aria-label="设置${escapeHtml(roomLabels[room.kind] ?? room.name)}成员" title="管理房间成员">⚙</button>
+      </div>`;
     })
     .join("");
 
@@ -1434,6 +1456,89 @@ function renderRooms() {
       renderMessages();
     });
   });
+  roomList.querySelectorAll("[data-room-settings]").forEach((button) => {
+    button.addEventListener("click", () => {
+      openRoomSettings(button.dataset.roomSettings);
+    });
+  });
+}
+
+function openRoomSettings(roomKind) {
+  const room = state.rooms.find((candidate) => candidate.kind === roomKind);
+  if (!room) {
+    showToast("房间不存在或尚未加载。");
+    return;
+  }
+  state.roomSettingsKind = roomKind;
+  renderRoomSettings();
+  roomSettingsDialog.showModal();
+}
+
+function closeRoomSettings() {
+  state.roomSettingsKind = null;
+  roomSettingsDialog.close();
+}
+
+function renderRoomSettings() {
+  const room = state.rooms.find((candidate) => candidate.kind === state.roomSettingsKind);
+  const list = $("#room-member-list");
+  if (!room) {
+    $("#room-settings-title").textContent = "房间成员";
+    $("#room-settings-summary").textContent = "房间不存在或尚未加载。";
+    list.innerHTML = '<div class="empty-state compact">暂无可管理成员</div>';
+    return;
+  }
+
+  const participants = new Set(room.participants ?? []);
+  $("#room-settings-title").textContent = roomLabels[room.kind] ?? room.name;
+  $("#room-settings-summary").textContent = `${participants.size} 个 Agent 在房间内；移出后该角色不会再收到本房间的自动路由。`;
+  const candidates = [...mentionCandidates].sort((left, right) => Number(participants.has(right.agentId)) - Number(participants.has(left.agentId)));
+  list.innerHTML = candidates
+    .map((candidate) => {
+      const present = participants.has(candidate.agentId);
+      const action = present ? "remove" : "invite";
+      const actionLabel = present ? "移出房间" : "邀请加入";
+      return `<div class="room-member-row">
+        ${avatarMarkup(candidate.agentId, candidate.label)}
+        <div class="room-member-identity">
+          <strong>${escapeHtml(candidate.label)}</strong>
+          <small>${escapeHtml(candidate.agentId)}</small>
+        </div>
+        <span class="room-member-status ${present ? "present" : "absent"}">${present ? "房间内" : "未加入"}</span>
+        <button class="room-member-action ${action}" data-room-agent="${escapeHtml(candidate.agentId)}" data-room-action="${action}" type="button" aria-label="${actionLabel}${escapeHtml(candidate.label)}" title="${actionLabel}">${present ? "−" : "+"}</button>
+      </div>`;
+    })
+    .join("");
+
+  list.querySelectorAll("[data-room-agent]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const originalText = button.textContent;
+      button.disabled = true;
+      button.textContent = "…";
+      try {
+        await updateRoomMembership(room.kind, button.dataset.roomAgent, button.dataset.roomAction);
+      } catch (error) {
+        showToast(error.message);
+        button.disabled = false;
+        button.textContent = originalText;
+      }
+    });
+  });
+}
+
+async function updateRoomMembership(roomKind, agentId, action) {
+  const result = await request(`/projects/${state.projectId}/rooms/${encodeURIComponent(roomKind)}/participants`, {
+    method: "PATCH",
+    body: JSON.stringify({ agentId, action })
+  });
+  state.rooms = result.rooms;
+  const messages = await request(`/projects/${state.projectId}/messages`);
+  state.messages = messages.messages;
+  renderProjectHeader();
+  renderRooms();
+  renderMessages();
+  renderRoomSettings();
+  showToast(action === "invite" ? "Agent 已加入房间。" : "Agent 已移出房间。");
 }
 
 function renderMessages() {

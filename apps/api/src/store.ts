@@ -1,5 +1,5 @@
 import { createRestartedStudioKernel, createStudioKernel, defaultAgentContracts, LocalAgentRuntime, type StudioKernel } from "@game-pipeline/agent-runtime";
-import type { AgentLoopState, MessageType, RoomKind, StudioMessage } from "@game-pipeline/shared-schemas";
+import type { AgentId, AgentLoopState, MessageType, Room, RoomKind, StudioMessage } from "@game-pipeline/shared-schemas";
 import { spawn } from "node:child_process";
 import { dirname } from "node:path";
 import { verifyProjectClaims } from "./claimVerifier.js";
@@ -203,6 +203,53 @@ export class StudioProjectStore {
 
   getAgentLoopState(projectId: string): AgentLoopState {
     return this.getKernel(projectId).getAgentLoopState();
+  }
+
+  updateRoomParticipant(
+    projectId: string,
+    roomKind: string,
+    agentIdInput: string,
+    action: "invite" | "remove"
+  ): { room: Room; rooms: Room[]; changed: boolean } {
+    const kernel = this.getKernel(projectId);
+    const room = kernel.listRooms().find((candidate) => candidate.kind === roomKind);
+    if (!room) {
+      throw new HttpError(404, `Room not found: ${roomKind}`);
+    }
+    const agentId = agentIdInput as AgentId;
+    if (!kernel.agents.has(agentId)) {
+      throw new HttpError(400, `Unknown agent: ${agentIdInput}`);
+    }
+
+    const result = kernel.updateRoomParticipant(room.kind, agentId, action);
+    if (result.changed) {
+      const contract = kernel.agents.get(agentId);
+      kernel.recordMessage({
+        messageId: `msg_room_membership_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        projectId,
+        roomId: result.room.roomId,
+        senderType: "producer",
+        senderId: kernel.project.producerId,
+        messageType: "decision_record",
+        content: action === "invite" ? `已邀请 ${contract.displayName} 加入当前房间。` : `已将 ${contract.displayName} 移出当前房间。`,
+        mentions: [],
+        relatedTaskIds: [],
+        relatedArtifactIds: [],
+        metadata: {
+          roomMembershipChange: action,
+          memberAgentId: agentId,
+          roomKind: room.kind
+        },
+        createdAt: new Date().toISOString()
+      });
+      this.checkpointKernel(kernel);
+    }
+
+    return {
+      room: result.room,
+      rooms: kernel.listRooms(),
+      changed: result.changed
+    };
   }
 
   wakeAgentLoop(projectId: string): AgentLoopState {

@@ -49,6 +49,7 @@ export class RoleAwareRouter {
   route(message: StudioMessage, context: RouterContext): RoutePlan {
     const scores = this.registry
       .list()
+      .filter((agent) => context.room.participants.includes(agent.agentId))
       .map((agent) => this.scoreAgent(agent, message, context))
       .filter((score) => score.required || score.score >= context.room.routingPolicy.orchestratorReviewThreshold)
       .sort((a, b) => b.score - a.score);
@@ -72,7 +73,7 @@ export class RoleAwareRouter {
       reasons.push("explicit_mention");
     }
 
-    if (agent.roomMemberships.includes(context.room.kind)) {
+    if (context.room.participants.includes(agent.agentId)) {
       score += policy.primaryRoomScore;
       reasons.push("room_member");
     }
