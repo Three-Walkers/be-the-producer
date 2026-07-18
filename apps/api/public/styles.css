@@ -208,7 +208,7 @@ textarea {
   align-items: center;
   max-width: min(460px, 60vw);
   min-height: 24px;
-  margin-top: 8px;
+  margin-top: 0;
   border: 1px solid #c6ddd3;
   border-radius: 999px;
   background: var(--accent-soft);
@@ -218,6 +218,71 @@ textarea {
   font-weight: 650;
   line-height: 1;
   white-space: nowrap;
+}
+
+.project-context-badges {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.agent-loop-status {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  min-height: 24px;
+  gap: 6px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #f7f8f6;
+  color: var(--muted);
+  padding: 3px 10px;
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1;
+}
+
+.agent-loop-light {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: #a4aaa6;
+}
+
+.agent-loop-status.running {
+  border-color: #b8d8ca;
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+
+.agent-loop-status.running .agent-loop-light {
+  background: var(--accent);
+  animation: typing-bounce 900ms ease-in-out infinite;
+}
+
+.agent-loop-status.waiting_for_producer {
+  border-color: #dbc58e;
+  background: #fff8e7;
+  color: #805f18;
+}
+
+.agent-loop-status.waiting_for_producer .agent-loop-light {
+  background: #c18a22;
+}
+
+.agent-loop-status.blocked,
+.agent-loop-status.error {
+  border-color: #e1b2b2;
+  background: #fff0f0;
+  color: #a63b3b;
+}
+
+.agent-loop-status.blocked .agent-loop-light,
+.agent-loop-status.error .agent-loop-light {
+  background: #c94747;
 }
 
 .project-form,
@@ -271,9 +336,13 @@ textarea {
 }
 
 .chat-column .topbar,
-.chat-column .composer,
 .workspace-column .panel {
   overflow: hidden;
+}
+
+.chat-column .composer {
+  position: relative;
+  overflow: visible;
 }
 
 .workspace-column .panel {
@@ -723,9 +792,27 @@ textarea {
   padding-top: 16px;
 }
 
+.harness-section {
+  display: grid;
+  gap: 10px;
+  border-top: 1px solid var(--line);
+  padding-top: 16px;
+}
+
+.harness-section button {
+  min-height: 32px;
+  border-color: var(--line-strong);
+  background: #fff;
+  color: var(--accent-strong);
+  padding: 0 12px;
+  font-size: 12px;
+}
+
 .assignment-list {
   display: grid;
   max-height: 390px;
+  min-width: 0;
+  overflow-x: hidden;
   overflow-y: auto;
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -734,9 +821,10 @@ textarea {
 
 .assignment-row {
   display: grid;
-  grid-template-columns: minmax(230px, 1fr) 138px minmax(150px, 0.7fr) minmax(190px, 0.8fr) 60px;
+  grid-template-columns: minmax(170px, 1fr) 104px minmax(145px, 0.9fr) minmax(125px, 0.72fr) minmax(136px, 0.75fr) 60px;
   gap: 10px;
   align-items: center;
+  min-width: 0;
   min-height: 56px;
   border: 0;
   border-bottom: 1px solid var(--line);
@@ -1203,7 +1291,7 @@ textarea {
 }
 
 .composer {
-  z-index: 10;
+  z-index: 40;
   display: grid;
   gap: 12px;
   padding: 14px 20px;
@@ -1273,7 +1361,7 @@ textarea {
   right: 0;
   bottom: calc(100% + 8px);
   left: 0;
-  z-index: 30;
+  z-index: 50;
   display: grid;
   gap: 4px;
   max-height: 260px;
@@ -1665,7 +1753,7 @@ textarea {
   }
 
   .assignment-row {
-    grid-template-columns: minmax(230px, 1fr) minmax(130px, 0.6fr) minmax(150px, 0.7fr) 60px;
+    grid-template-columns: minmax(210px, 1fr) 112px minmax(130px, 0.6fr) minmax(150px, 0.7fr) 60px;
   }
 
   .avatar-upload-control {
@@ -1711,6 +1799,18 @@ textarea {
   .assignment-row {
     display: grid;
     grid-template-columns: 1fr;
+  }
+
+  .assignment-list {
+    display: block;
+  }
+
+  .assignment-row {
+    min-height: 0;
+  }
+
+  .assignment-row > [data-save-assignment] {
+    width: 100%;
   }
 
   .avatar-upload-control {

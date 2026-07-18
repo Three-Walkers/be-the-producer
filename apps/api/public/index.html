@@ -55,7 +55,13 @@
           <div>
             <div class="eyebrow">当前项目</div>
             <h2 id="project-title">未创建</h2>
-            <div id="active-room-title" class="active-room-title">当前房间 · 主群聊</div>
+            <div class="project-context-badges">
+              <div id="active-room-title" class="active-room-title">当前房间 · 主群聊</div>
+              <div id="agent-loop-status" class="agent-loop-status idle" title="Agent Loop 状态">
+                <span class="agent-loop-light"></span>
+                <span id="agent-loop-status-text">Agent Loop 未启动</span>
+              </div>
+            </div>
           </div>
           <div class="stage-pill" id="project-stage">等待 idea</div>
         </header>
@@ -171,6 +177,16 @@
             <span>保存 API key 后可测试模型连通性。</span>
           </div>
           <div id="model-provider-status" class="provider-status"></div>
+          <section class="harness-section">
+            <div class="panel-heading">
+              <h2>Agent 执行内核</h2>
+              <button id="test-claude-harness" type="button">检测 Claude CLI</button>
+            </div>
+            <div id="claude-harness-status" class="model-test-status idle">
+              <span class="test-light"></span>
+              <span>正在检测本机 Claude Code CLI。</span>
+            </div>
+          </section>
           <section class="assignment-section">
             <div class="panel-heading">
               <h2>角色模型分配</h2>

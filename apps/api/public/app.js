@@ -8,9 +8,11 @@ const state = {
   taskBoard: null,
   artifacts: [],
   workspace: null,
+  agentLoop: null,
   modelProviders: [],
   modelAssignments: [],
   modelTestResults: {},
+  harnessStatuses: [],
   pendingAgentResponses: [],
   selectedModelProviderId: "dashscope"
 };
@@ -491,6 +493,24 @@ $("#test-model-provider").addEventListener("click", async () => {
   }
 });
 
+$("#test-claude-harness").addEventListener("click", async () => {
+  const button = $("#test-claude-harness");
+  const originalText = button.textContent;
+  button.disabled = true;
+  button.textContent = "检测中";
+  try {
+    const response = await request("/settings/agent-harness-tests/claude-cli", { method: "POST" });
+    state.harnessStatuses = [response.result];
+    renderHarnessStatus();
+    showToast(response.result.message);
+  } catch (error) {
+    showToast(error.message);
+  } finally {
+    button.disabled = false;
+    button.textContent = originalText;
+  }
+});
+
 $("#project-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   try {
@@ -730,13 +750,14 @@ function buildPresetMessage(presetId, preset) {
 
 async function refreshProject() {
   ensureProject();
-  const [project, rooms, messages, taskBoard, artifacts, workspace] = await Promise.all([
+  const [project, rooms, messages, taskBoard, artifacts, workspace, agentLoop] = await Promise.all([
     request(`/projects/${state.projectId}`),
     request(`/projects/${state.projectId}/rooms`),
     request(`/projects/${state.projectId}/messages`),
     request(`/projects/${state.projectId}/task-board`),
     request(`/projects/${state.projectId}/artifacts`),
-    request(`/projects/${state.projectId}/workspace-tree`)
+    request(`/projects/${state.projectId}/workspace-tree`),
+    request(`/projects/${state.projectId}/agent-loop`)
   ]);
 
   state.project = project.project;
@@ -745,6 +766,7 @@ async function refreshProject() {
   state.taskBoard = taskBoard.taskBoard;
   state.artifacts = artifacts.artifacts;
   state.workspace = workspace;
+  state.agentLoop = agentLoop.agentLoop;
   render();
 }
 
@@ -927,9 +949,13 @@ function hideMentionSuggestions() {
 }
 
 async function loadModelProviders() {
-  const settings = await request("/settings/model-providers");
+  const [settings, harnessSettings] = await Promise.all([
+    request("/settings/model-providers"),
+    request("/settings/agent-harnesses")
+  ]);
   state.modelProviders = settings.providers;
   state.modelAssignments = settings.assignments ?? [];
+  state.harnessStatuses = harnessSettings.harnesses ?? [];
   if (!state.modelProviders.some((provider) => provider.providerId === state.selectedModelProviderId)) {
     state.selectedModelProviderId = state.modelProviders[0]?.providerId ?? "openai";
   }
@@ -986,6 +1012,19 @@ function renderModelSettings() {
     });
   });
   renderAgentAssignments();
+  renderHarnessStatus();
+}
+
+function renderHarnessStatus() {
+  const container = $("#claude-harness-status");
+  const status = state.harnessStatuses.find((candidate) => candidate.harnessId === "claude-cli");
+  if (!status) {
+    container.className = "model-test-status idle";
+    container.innerHTML = '<span class="test-light"></span><span>尚未检测 Claude Code CLI。</span>';
+    return;
+  }
+  container.className = `model-test-status ${status.available ? "success" : "failure"}`;
+  container.innerHTML = `<span class="test-light"></span><span>${escapeHtml(status.message)}</span>`;
 }
 
 function renderModelTestStatus() {
@@ -1030,6 +1069,10 @@ function renderAgentAssignments() {
             <span>${escapeHtml(assignment.agentId)} · ${escapeHtml(capability)}</span>
           </div>
         </div>
+        <select data-assignment-harness aria-label="执行内核">
+          <option value="claude-cli" ${assignment.harnessId === "claude-cli" ? "selected" : ""}>Claude CLI</option>
+          <option value="direct-api" ${assignment.harnessId === "direct-api" ? "selected" : ""}>直接 API</option>
+        </select>
         <select data-assignment-provider>${options}</select>
         <input data-assignment-model value="${escapeHtml(assignment.model)}" placeholder="使用连接默认模型" />
         <div class="avatar-upload-control">
@@ -1086,11 +1129,13 @@ function renderAgentAssignments() {
       button.textContent = "保存中";
       try {
         const providerId = row.querySelector("[data-assignment-provider]").value;
+        const harnessId = row.querySelector("[data-assignment-harness]").value;
         const model = row.querySelector("[data-assignment-model]").value;
         const avatarUrl = row.querySelector("[data-assignment-avatar]").value;
         await request(`/settings/model-assignments/${encodeURIComponent(row.dataset.agentId)}`, {
           method: "PUT",
           body: JSON.stringify({
+            harnessId,
             providerId,
             model,
             avatarUrl
@@ -1098,11 +1143,13 @@ function renderAgentAssignments() {
         });
         const assignment = state.modelAssignments.find((candidate) => candidate.agentId === row.dataset.agentId);
         if (assignment) {
+          assignment.harnessId = harnessId;
           assignment.providerId = providerId;
           assignment.model = model.trim();
           assignment.avatarUrl = avatarUrl.trim();
         }
         button.textContent = "已保存";
+        showToast(`${agentName(row.dataset.agentId)}的模型与执行内核配置已保存。`);
         renderMessages();
       } catch (error) {
         button.textContent = "失败";
@@ -1178,12 +1225,42 @@ function renderProjectHeader() {
   $("#active-room-title").textContent = `当前房间 · ${activeRoomName()}`;
   if (!state.project) {
     $("#project-stage").textContent = "等待 idea";
+    renderAgentLoopStatus();
     return;
   }
 
   $("#project-stage").textContent = isProjectStarted()
     ? `${stageLabels[state.project.currentStage] ?? state.project.currentStage} · ${executionLabel(currentExecutionStatus())}`
     : "未启动";
+  renderAgentLoopStatus();
+}
+
+function renderAgentLoopStatus() {
+  const container = $("#agent-loop-status");
+  const text = $("#agent-loop-status-text");
+  const loop = state.agentLoop;
+  const status = loop?.status ?? (state.project?.executionStatus === "paused" ? "paused" : "idle");
+  container.className = `agent-loop-status ${status}`;
+  if (!loop) {
+    text.textContent = "Agent Loop 未启动";
+    container.title = "Agent Loop 尚未建立运行状态。";
+    return;
+  }
+  if (status === "running") {
+    const names = (loop.activeAgentIds ?? []).map(agentName);
+    text.textContent = names.length ? `${names.join("、")} 工作中 · 第 ${loop.iteration} 轮` : `Agent Loop 调度中 · 第 ${loop.iteration} 轮`;
+  } else if (status === "waiting_for_producer") {
+    text.textContent = "等待制作人";
+  } else if (status === "blocked") {
+    text.textContent = "Loop 阻塞";
+  } else if (status === "error") {
+    text.textContent = "Loop 异常";
+  } else if (status === "paused") {
+    text.textContent = "Agent Loop 已暂停";
+  } else {
+    text.textContent = "Agent Loop 空闲";
+  }
+  container.title = loop.waitingReason ?? loop.lastError ?? `Agent Loop：${status}`;
 }
 
 function renderProjectList() {
@@ -2093,3 +2170,20 @@ function escapeHtml(value) {
 render();
 loadModelProviders().catch((error) => showToast(error.message));
 loadProjects().catch((error) => showToast(error.message));
+
+let backgroundRefreshInFlight = false;
+setInterval(() => {
+  if (!state.projectId || currentExecutionStatus() !== "running" || backgroundRefreshInFlight) {
+    return;
+  }
+  backgroundRefreshInFlight = true;
+  refreshProject()
+    .catch((error) => {
+      if (error.status !== 404) {
+        console.warn("后台刷新项目失败", error);
+      }
+    })
+    .finally(() => {
+      backgroundRefreshInFlight = false;
+    });
+}, 1500);
