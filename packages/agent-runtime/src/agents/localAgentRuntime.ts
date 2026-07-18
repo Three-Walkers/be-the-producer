@@ -966,7 +966,13 @@ function ensureStageTwoTasksAndArtifacts(kernel: StudioKernel, message: StudioMe
     progressPercent: 0,
     childrenSummary: emptyChildrenSummary(),
     inputArtifacts: ["artifact_gdd_baseline_draft", "artifact_art_bible_baseline_draft"],
-    outputArtifacts: ["artifact_asset_manifest_draft", "artifact_scene_blueprint_draft", "artifact_wechat_dev_build", "artifact_qa_playtest_report"],
+    outputArtifacts: [
+      "artifact_asset_manifest_draft",
+      "artifact_scene_blueprint_draft",
+      "artifact_gameplay_source",
+      "artifact_wechat_dev_build",
+      "artifact_qa_playtest_report"
+    ],
     acceptanceCriteria: ["核心循环可玩", "资产已导入", "QA 试玩报告已生成"],
     blockers: [],
     createdAt: now,
@@ -995,6 +1001,28 @@ function ensureStageTwoTasksAndArtifacts(kernel: StudioKernel, message: StudioMe
     updatedAt: now
   });
   ensureTask(kernel, {
+    taskId: "task_stage_2_cocos_architecture",
+    projectId,
+    stageId,
+    parentTaskId: groupId,
+    roomId: kernel.getRoom("engineering-room").roomId,
+    taskLevel: "task",
+    ownerAgentId: "cocos_tech_lead",
+    title: "设计 Cocos 场景与模块蓝图",
+    description: "根据 GDD 定义场景层级、Prefab 边界、资源加载契约和性能预算。",
+    status: "doing",
+    priority: 95,
+    sortOrder: 115,
+    progressPercent: 10,
+    childrenSummary: emptyChildrenSummary(),
+    inputArtifacts: ["artifact_gdd_baseline_draft"],
+    outputArtifacts: ["artifact_scene_blueprint_draft"],
+    acceptanceCriteria: ["SceneBlueprint 已通过证据验证", "模块边界和性能预算明确"],
+    blockers: [],
+    createdAt: now,
+    updatedAt: now
+  });
+  ensureTask(kernel, {
     taskId: "task_stage_2_cocos_implementation",
     projectId,
     stageId,
@@ -1003,15 +1031,37 @@ function ensureStageTwoTasksAndArtifacts(kernel: StudioKernel, message: StudioMe
     taskLevel: "task",
     ownerAgentId: "gameplay_programmer",
     title: "实现 Cocos 首个可玩核心循环",
-    description: "实现点击防守玩法、场景蓝图、构建和基础 UI。",
-    status: "doing",
-    priority: 95,
+    description: "根据 GDD 和 SceneBlueprint 实现点击防守玩法、状态机和基础 UI TypeScript 代码。",
+    status: "todo",
+    priority: 90,
     sortOrder: 120,
     progressPercent: 50,
     childrenSummary: emptyChildrenSummary(),
-    inputArtifacts: ["artifact_gdd_baseline_draft", "artifact_asset_manifest_draft"],
-    outputArtifacts: ["artifact_scene_blueprint_draft", "artifact_wechat_dev_build"],
-    acceptanceCriteria: ["Cocos 构建成功", "核心循环可运行"],
+    inputArtifacts: ["artifact_gdd_baseline_draft", "artifact_scene_blueprint_draft"],
+    outputArtifacts: ["artifact_gameplay_source"],
+    acceptanceCriteria: ["玩法 TypeScript 源码已写入 Cocos assets/scripts", "核心循环状态机和 UI 逻辑明确"],
+    blockers: [],
+    createdAt: now,
+    updatedAt: now
+  });
+  ensureTask(kernel, {
+    taskId: "task_stage_2_cocos_build",
+    projectId,
+    stageId,
+    parentTaskId: groupId,
+    roomId: kernel.getRoom("engineering-room").roomId,
+    taskLevel: "task",
+    ownerAgentId: "cocos_automation",
+    title: "导入资产并构建微信首个可玩版本",
+    description: "通过 Cocos 引擎桥导入资产、应用场景蓝图、生成 Prefab 并执行微信小游戏开发构建。",
+    status: "todo",
+    priority: 85,
+    sortOrder: 125,
+    progressPercent: 0,
+    childrenSummary: emptyChildrenSummary(),
+    inputArtifacts: ["artifact_asset_manifest_draft", "artifact_scene_blueprint_draft", "artifact_gameplay_source"],
+    outputArtifacts: ["artifact_wechat_dev_build"],
+    acceptanceCriteria: ["Cocos MCP 构建命令成功", "微信小游戏开发构建可启动"],
     blockers: [],
     createdAt: now,
     updatedAt: now
@@ -1064,10 +1114,28 @@ function ensureStageTwoTasksAndArtifacts(kernel: StudioKernel, message: StudioMe
     stageId,
     status: "draft",
     version: 1,
-    sourceTaskId: "task_stage_2_cocos_implementation",
+    sourceTaskId: "task_stage_2_cocos_architecture",
     sourceDecisionIds: [],
     metadata: {
       generatedBy: "local_agent_runtime"
+    },
+    createdAt: now,
+    updatedAt: now
+  });
+  ensureArtifact(kernel, {
+    artifactId: "artifact_gameplay_source",
+    projectId,
+    type: "source_code",
+    path: "assets/scripts/gameplay/GameController.ts",
+    ownerAgentId: "gameplay_programmer",
+    stageId,
+    status: "draft",
+    version: 1,
+    sourceTaskId: "task_stage_2_cocos_implementation",
+    sourceDecisionIds: [],
+    metadata: {
+      generatedBy: "local_agent_runtime",
+      placeholder: true
     },
     createdAt: now,
     updatedAt: now
@@ -1081,7 +1149,7 @@ function ensureStageTwoTasksAndArtifacts(kernel: StudioKernel, message: StudioMe
     stageId,
     status: "submitted",
     version: 1,
-    sourceTaskId: "task_stage_2_cocos_implementation",
+    sourceTaskId: "task_stage_2_cocos_build",
     sourceDecisionIds: [],
     metadata: {
       buildMode: "local_mvp_placeholder",
@@ -1114,28 +1182,28 @@ function ensureStageTwoTasksAndArtifacts(kernel: StudioKernel, message: StudioMe
     roomKind: "art-room",
     messageType: "progress_update",
     relatedArtifactIds: ["artifact_asset_manifest_draft"],
-    content: "Stage 2 美术资产流水线已启动，本地 MVP 已创建 asset manifest 占位产物。"
+    content: "Stage 2 美术资产任务已排队；资产生产 Agent 必须通过工具生成资产清单和可验证输出。"
   });
   writeAgentMessage(kernel, {
     agentId: "cocos_tech_lead",
     roomKind: "engineering-room",
     messageType: "progress_update",
     relatedArtifactIds: ["artifact_scene_blueprint_draft"],
-    content: "Stage 2 Cocos 技术任务已启动，本地 MVP 已创建 SceneBlueprint 占位产物。"
+    content: "Stage 2 Cocos 架构任务已排队；场景蓝图完成后会交接给玩法程序和 Cocos 自动化。"
   });
   writeAgentMessage(kernel, {
     agentId: "cocos_automation",
     roomKind: "engineering-room",
     messageType: "progress_update",
     relatedArtifactIds: ["artifact_wechat_dev_build"],
-    content: "Cocos 自动化已创建微信 dev build 占位产物，等待真实 Cocos 构建接入。"
+    content: "Cocos 自动化构建任务等待资产清单、场景蓝图和玩法源码；没有真实引擎工具结果时不会声明构建完成。"
   });
   writeAgentMessage(kernel, {
     agentId: "qa_evaluator",
     roomKind: "qa-room",
     messageType: "playtest_summary",
     relatedArtifactIds: ["artifact_qa_playtest_report"],
-    content: "QA 已创建首个可玩试玩报告占位。制作人确认首个可玩后进入发布准备。"
+    content: "QA 试玩任务等待真实微信开发构建；没有运行、截图和报告证据时不会提交首个可玩结论。"
   });
 }
 

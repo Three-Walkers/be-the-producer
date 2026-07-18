@@ -1,11 +1,13 @@
 import { createRestartedStudioKernel, createStudioKernel, defaultAgentContracts, LocalAgentRuntime, type StudioKernel } from "@game-pipeline/agent-runtime";
-import type { MessageType, RoomKind, StudioMessage } from "@game-pipeline/shared-schemas";
+import type { AgentLoopState, MessageType, RoomKind, StudioMessage } from "@game-pipeline/shared-schemas";
 import { spawn } from "node:child_process";
 import { dirname } from "node:path";
 import { verifyProjectClaims } from "./claimVerifier.js";
 import { reconcileClaimRepairs } from "./claimRepair.js";
+import { AgentLoopService } from "./agentLoop.js";
 import { ModelAgentRuntime } from "./modelAgentRuntime.js";
 import { ProjectPersistenceStore, type ProjectSummary } from "./projectPersistence.js";
+import { executeAgentToolRequests } from "./toolExecutor.js";
 import {
   deleteProjectWorkspace,
   readArtifactPreview,
@@ -39,15 +41,32 @@ export class StudioProjectStore {
   private readonly runtime = new LocalAgentRuntime();
   private readonly modelRuntime = new ModelAgentRuntime();
   private readonly persistence = new ProjectPersistenceStore();
+  private readonly agentLoop: AgentLoopService;
 
   constructor() {
+    this.agentLoop = new AgentLoopService({
+      getKernel: (projectId) => this.getKernel(projectId),
+      checkpoint: (kernel) => {
+        this.checkpointKernel(kernel);
+      },
+      modelRuntime: this.modelRuntime
+    });
+    const resumableProjectIds: string[] = [];
     for (const kernel of this.persistence.loadAll()) {
       this.projects.set(kernel.project.projectId, kernel);
-      syncProjectWorkspace(kernel);
-      verifyProjectClaims(kernel);
-      reconcileClaimRepairs(kernel);
-      syncProjectWorkspace(kernel);
-      this.persistence.save(kernel);
+      this.checkpointKernel(kernel);
+      if (
+        kernel.project.executionStatus === "running" &&
+        ["idle", "running", "blocked", "error"].includes(kernel.getAgentLoopState().status)
+      ) {
+        resumableProjectIds.push(kernel.project.projectId);
+      }
+    }
+    for (const projectId of resumableProjectIds) {
+      this.agentLoop.start(projectId, {
+        reason: "服务重启后恢复未完成的 Agent Loop。",
+        unlockRetryableFailures: true
+      });
     }
   }
 
@@ -101,7 +120,7 @@ export class StudioProjectStore {
           executionStatus: "paused",
           updatedAt: now
         });
-        this.persistence.save(kernel);
+        this.agentLoop.pause(kernel.project.projectId, `切换到项目 ${projectId}，当前项目已自动暂停。`);
       }
     }
 
@@ -110,7 +129,10 @@ export class StudioProjectStore {
         executionStatus: "running",
         updatedAt: now
       });
-      this.persistence.save(existing);
+      this.agentLoop.start(projectId, {
+        reason: "制作人继续项目，恢复未完成任务。",
+        unlockRetryableFailures: true
+      });
       return {
         routePlan: {
           targets: [],
@@ -163,7 +185,7 @@ export class StudioProjectStore {
       executionStatus: "paused",
       updatedAt: new Date().toISOString()
     });
-    this.persistence.save(kernel);
+    this.agentLoop.pause(projectId);
     return {
       project: kernel.project,
       rooms: kernel.listRooms(),
@@ -177,6 +199,22 @@ export class StudioProjectStore {
       throw new HttpError(404, `Project not found: ${projectId}`);
     }
     return kernel;
+  }
+
+  getAgentLoopState(projectId: string): AgentLoopState {
+    return this.getKernel(projectId).getAgentLoopState();
+  }
+
+  wakeAgentLoop(projectId: string): AgentLoopState {
+    const kernel = this.getKernel(projectId);
+    if (kernel.project.executionStatus !== "running") {
+      throw new HttpError(409, "项目尚未启动或已暂停，不能继续 Agent Loop。");
+    }
+    return this.agentLoop.start(projectId, {
+      reason: "制作人手动要求 Agents 继续未完成工作。",
+      unlockProducerWaits: true,
+      unlockRetryableFailures: true
+    });
   }
 
   postProducerMessage(projectId: string, input: PostMessageInput): Promise<ReturnType<LocalAgentRuntime["handleProducerMessage"]> & {
@@ -233,11 +271,17 @@ export class StudioProjectStore {
       const modelResult = await this.modelRuntime.respond(kernel, message, result.routePlan);
       result.agentMessages.push(...modelResult.agentMessages);
     }
-    let workspace = syncProjectWorkspace(kernel);
-    verifyProjectClaims(kernel);
-    reconcileClaimRepairs(kernel);
-    workspace = syncProjectWorkspace(kernel);
-    this.persistence.save(kernel);
+    executeAgentToolRequests(kernel, result.agentMessages);
+    const workspace = this.checkpointKernel(kernel);
+    this.agentLoop.start(projectId, {
+      reason: `制作人消息唤醒 Agent Loop：${message.messageId}`,
+      triggerMessageId: message.messageId,
+      preferredAgentIds: result.routePlan.targets.map((target) => target.agentId),
+      unlockProducerWaits:
+        !options.bootstrapProjectState && input.messageType !== "progress_update" && !isPresencePing(input.content),
+      unlockRetryableFailures:
+        !options.bootstrapProjectState && input.messageType !== "progress_update" && !isPresencePing(input.content)
+    });
     return {
       ...result,
       workspace
@@ -246,12 +290,7 @@ export class StudioProjectStore {
 
   syncWorkspace(projectId: string): WorkspaceSyncResult {
     const kernel = this.getKernel(projectId);
-    let workspace = syncProjectWorkspace(kernel);
-    verifyProjectClaims(kernel);
-    reconcileClaimRepairs(kernel);
-    workspace = syncProjectWorkspace(kernel);
-    this.persistence.save(kernel);
-    return workspace;
+    return this.checkpointKernel(kernel);
   }
 
   readWorkspaceTree(projectId: string): {
@@ -327,6 +366,7 @@ export class StudioProjectStore {
 
   deleteProject(projectId: string): { projectId: string } {
     this.getKernel(projectId);
+    this.agentLoop.cancel(projectId);
     this.projects.delete(projectId);
     this.persistence.delete(projectId);
     deleteProjectWorkspace(projectId);
@@ -340,6 +380,15 @@ export class StudioProjectStore {
       syncProjectWorkspace(kernel);
     }
     return kernel;
+  }
+
+  private checkpointKernel(kernel: StudioKernel): WorkspaceSyncResult {
+    let workspace = syncProjectWorkspace(kernel);
+    verifyProjectClaims(kernel);
+    reconcileClaimRepairs(kernel);
+    workspace = syncProjectWorkspace(kernel);
+    this.persistence.save(kernel);
+    return workspace;
   }
 }
 
@@ -371,6 +420,10 @@ function extractMentionedAgents(content: string): string[] {
 
 function uniqueStrings(values: string[]): string[] {
   return [...new Set(values.filter(Boolean))];
+}
+
+function isPresencePing(content: string): boolean {
+  return /^(有人吗|有人在吗|在吗|在不在|hello|hi|hey|ping|有人么)[？?!.。！\s]*$/i.test(content.trim());
 }
 
 function openLocalPath(absolutePath: string, type: "file" | "directory"): void {

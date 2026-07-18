@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { defaultAgentContracts } from "@game-pipeline/agent-runtime";
+import type { AgentHarnessId } from "@game-pipeline/shared-schemas";
 
 export type ModelProviderId = string;
 export type ModelProviderProtocol = "openai-compatible" | "anthropic" | "google";
@@ -44,6 +45,7 @@ export interface AgentModelAssignment {
   displayName: string;
   roleScope: string;
   capability: string;
+  harnessId: AgentHarnessId;
   providerId: ModelProviderId;
   model: string;
   avatarUrl: string;
@@ -51,6 +53,7 @@ export interface AgentModelAssignment {
 }
 
 export interface SaveAgentModelAssignmentInput {
+  harnessId?: AgentHarnessId;
   providerId?: ModelProviderId;
   model?: string;
   avatarUrl?: string;
@@ -85,6 +88,20 @@ const defaultProviders: ModelProviderConfig[] = [
     protocol: "openai-compatible",
     baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
     defaultModel: "qwen-plus"
+  },
+  {
+    providerId: "dashscope-anthropic-qwen",
+    label: "百炼 Qwen · Claude CLI",
+    protocol: "anthropic",
+    baseUrl: "https://dashscope.aliyuncs.com/apps/anthropic",
+    defaultModel: "qwen3.7-plus"
+  },
+  {
+    providerId: "dashscope-anthropic-deepseek",
+    label: "百炼 DeepSeek · Claude CLI",
+    protocol: "anthropic",
+    baseUrl: "https://dashscope.aliyuncs.com/apps/anthropic",
+    defaultModel: "deepseek-v4-pro"
   },
   {
     providerId: "deepseek",
@@ -250,11 +267,24 @@ export class ModelSettingsStore {
       throw new Error(`Unsupported agent: ${agentId}`);
     }
 
+    const nextProviderId = input.providerId ?? assignment.providerId;
+    const nextHarnessId = normalizeHarnessId(input.harnessId ?? assignment.harnessId);
+    const nextProvider = document.providers.find((provider) => provider.providerId === nextProviderId);
+    if (!nextProvider) {
+      throw new Error(`Unsupported model provider: ${nextProviderId}`);
+    }
+    if (nextHarnessId === "claude-cli" && nextProvider.protocol !== "anthropic") {
+      throw new Error("Claude CLI 只能使用 Anthropic Messages 连接。百炼请选用“百炼 Qwen/DeepSeek · Claude CLI”。");
+    }
+
     if (input.providerId !== undefined) {
       if (!document.providers.some((provider) => provider.providerId === input.providerId)) {
         throw new Error(`Unsupported model provider: ${input.providerId}`);
       }
       assignment.providerId = input.providerId;
+    }
+    if (input.harnessId !== undefined) {
+      assignment.harnessId = nextHarnessId;
     }
     if (input.model !== undefined) {
       assignment.model = input.model.trim();
@@ -328,10 +358,19 @@ function fingerprint(apiKey: string): string {
 function mergeProviders(savedProviders: ModelProviderConfig[]): ModelProviderConfig[] {
   const normalizedSavedProviders = savedProviders.map((provider) => normalizeSavedProvider(provider));
   const savedOpenAI = normalizedSavedProviders.find((provider) => provider.providerId === "openai");
+  const savedDashScope = normalizedSavedProviders.find((provider) => provider.providerId === "dashscope");
   const openAIWasDashScope = Boolean(savedOpenAI?.baseUrl && savedOpenAI.baseUrl.includes("dashscope.aliyuncs.com"));
   const defaultProviderIds = new Set(defaultProviders.map((provider) => provider.providerId));
   const mergedDefaults = defaultProviders.map((defaultProvider) => {
     const existing = normalizedSavedProviders.find((provider) => provider.providerId === defaultProvider.providerId);
+    if (defaultProvider.providerId.startsWith("dashscope-anthropic-") && !existing && savedDashScope?.apiKey) {
+      return normalizeSavedProvider({
+        ...defaultProvider,
+        apiKey: savedDashScope.apiKey,
+        ...(savedDashScope.createdAt ? { createdAt: savedDashScope.createdAt } : {}),
+        ...(savedDashScope.updatedAt ? { updatedAt: savedDashScope.updatedAt } : {})
+      });
+    }
     if (defaultProvider.providerId === "openai" && openAIWasDashScope) {
       return structuredClone(defaultProvider);
     }
@@ -362,12 +401,18 @@ function mergeProviders(savedProviders: ModelProviderConfig[]): ModelProviderCon
 function mergeAgentAssignments(savedAssignments: AgentModelAssignment[]): AgentModelAssignment[] {
   return defaultAgentAssignments().map((defaultAssignment) => {
     const existing = savedAssignments.find((assignment) => assignment.agentId === defaultAssignment.agentId);
+    const harnessId = normalizeHarnessId(existing?.harnessId ?? "claude-cli");
     return {
       ...defaultAssignment,
       ...existing,
       displayName: defaultAssignment.displayName,
       roleScope: defaultAssignment.roleScope,
       capability: defaultAssignment.capability,
+      harnessId,
+      providerId:
+        harnessId === "claude-cli" && (!existing?.harnessId || existing.providerId === "dashscope" || existing.providerId === "deepseek")
+          ? claudeProviderForAgent(defaultAssignment.agentId, defaultAssignment.capability)
+          : existing?.providerId ?? defaultAssignment.providerId,
       avatarUrl: existing?.avatarUrl ?? defaultAssignment.avatarUrl ?? ""
     };
   });
@@ -379,7 +424,8 @@ function defaultAgentAssignments(): AgentModelAssignment[] {
     displayName: agent.displayName,
     roleScope: agent.roleScope,
     capability: agent.modelProfile.capability,
-    providerId: defaultProviderForAgent(agent.agentId, agent.modelProfile.capability),
+    harnessId: "claude-cli",
+    providerId: claudeProviderForAgent(agent.agentId, agent.modelProfile.capability),
     model: "",
     avatarUrl: ""
   }));
@@ -406,6 +452,20 @@ function defaultProviderForAgent(agentId: string, capability: string): ModelProv
     return "dashscope";
   }
   return "dashscope";
+}
+
+function claudeProviderForAgent(agentId: string, capability: string): ModelProviderId {
+  if (capability === "coding" || capability === "evaluation" || ["studio_orchestrator", "producer", "devops"].includes(agentId)) {
+    return "dashscope-anthropic-deepseek";
+  }
+  return "dashscope-anthropic-qwen";
+}
+
+function normalizeHarnessId(value: string): AgentHarnessId {
+  if (value === "direct-api" || value === "claude-cli") {
+    return value;
+  }
+  throw new Error(`Unsupported Agent harness: ${value}`);
 }
 
 async function testProviderConnection(provider: ModelProviderConfig): Promise<ModelProviderTestResult> {

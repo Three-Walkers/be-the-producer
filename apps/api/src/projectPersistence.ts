@@ -8,6 +8,8 @@ export interface ProjectSummary {
   currentStage: string;
   status: string;
   executionStatus?: string;
+  agentLoopStatus?: string;
+  agentLoopWaitingReason?: string;
   initialIdea?: string;
   createdAt: string;
   updatedAt: string;
@@ -44,6 +46,8 @@ export class ProjectPersistenceStore {
           currentStage: snapshot.project.currentStage,
           status: snapshot.project.status,
           ...(snapshot.project.executionStatus ? { executionStatus: snapshot.project.executionStatus } : {}),
+          ...(snapshot.agentLoop?.status ? { agentLoopStatus: snapshot.agentLoop.status } : {}),
+          ...(snapshot.agentLoop?.waitingReason ? { agentLoopWaitingReason: snapshot.agentLoop.waitingReason } : {}),
           ...(snapshot.project.initialIdea ? { initialIdea: snapshot.project.initialIdea } : {}),
           createdAt: snapshot.project.createdAt,
           updatedAt: snapshot.project.updatedAt,

@@ -9,6 +9,45 @@ export type MemoryId = string;
 export type AuditEventId = string;
 export type OperationId = string;
 export type ClaimId = string;
+export type AgentHarnessId = "direct-api" | "claude-cli";
+
+export type AgentLoopStatus = "idle" | "running" | "waiting_for_producer" | "paused" | "blocked" | "error";
+export type AgentLoopAgentStatus = "idle" | "queued" | "working" | "waiting" | "blocked" | "error";
+export type AgentLoopControlStatus = "continue" | "waiting_for_producer" | "handoff" | "ready_for_review" | "blocked";
+
+export interface AgentLoopAgentState {
+  agentId: AgentId;
+  status: AgentLoopAgentStatus;
+  taskId?: TaskId;
+  iteration: number;
+  harnessId?: AgentHarnessId;
+  sessionId?: string;
+  lastInvocationId?: string;
+  lastChangedPaths?: string[];
+  lastMessageId?: MessageId;
+  lastError?: string;
+  updatedAt: string;
+}
+
+export interface AgentLoopState {
+  projectId: ProjectId;
+  status: AgentLoopStatus;
+  runId?: string;
+  iteration: number;
+  activeAgentIds: AgentId[];
+  pendingTaskIds: TaskId[];
+  agents: Record<AgentId, AgentLoopAgentState>;
+  waitingReason?: string;
+  lastError?: string;
+  startedAt?: string;
+  updatedAt: string;
+}
+
+export interface AgentLoopControl {
+  status: AgentLoopControlStatus;
+  reason: string;
+  handoffAgentIds: AgentId[];
+}
 
 export type StageId =
   | "concept_discussion"

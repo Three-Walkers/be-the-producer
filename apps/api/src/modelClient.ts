@@ -5,6 +5,7 @@ export interface ModelChatInput {
   userPrompt: string;
   model: string;
   maxTokens?: number;
+  abortSignal?: AbortSignal;
 }
 
 export interface ModelChatResult {
@@ -47,6 +48,8 @@ export async function generateModelChat(provider: ModelProviderConfig, input: Mo
 
 async function sendChatRequest(provider: ModelProviderConfig, input: Required<Pick<ModelChatInput, "systemPrompt" | "userPrompt" | "model">> & ModelChatInput): Promise<Response> {
   const controller = new AbortController();
+  const abort = (): void => controller.abort();
+  input.abortSignal?.addEventListener("abort", abort, { once: true });
   const timeout = setTimeout(() => controller.abort(), 30_000);
   try {
     switch (provider.protocol) {
@@ -104,6 +107,7 @@ async function sendChatRequest(provider: ModelProviderConfig, input: Required<Pi
     }
   } finally {
     clearTimeout(timeout);
+    input.abortSignal?.removeEventListener("abort", abort);
   }
 }
 

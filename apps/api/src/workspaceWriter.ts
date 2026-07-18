@@ -46,8 +46,22 @@ export interface ArtifactPreviewResult {
   reason?: string;
 }
 
+export interface ToolArtifactWriteResult {
+  projectRoot: string;
+  relativePath: string;
+  absolutePath: string;
+  content: string;
+  hash: string;
+  sizeBytes: number;
+  materializedAt: string;
+}
+
 const defaultWorkspaceRoot = (): string =>
   process.env.STUDIO_WORKSPACE_ROOT ?? join(process.env.INIT_CWD ?? process.cwd(), "studio", "projects");
+
+export function resolveProjectWorkspaceRoot(projectId: string, workspaceRoot = defaultWorkspaceRoot()): string {
+  return join(workspaceRoot, projectId);
+}
 
 export function syncProjectWorkspace(kernel: StudioKernel, workspaceRoot = defaultWorkspaceRoot()): WorkspaceSyncResult {
   const projectRoot = join(workspaceRoot, kernel.project.projectId);
@@ -122,6 +136,49 @@ export function deleteProjectWorkspace(projectId: string, workspaceRoot = defaul
     recursive: true,
     force: true
   });
+}
+
+export function writeToolArtifactContent(
+  kernel: StudioKernel,
+  artifact: Artifact,
+  input: { content: string; mode: "replace" | "append" },
+  workspaceRoot = defaultWorkspaceRoot()
+): ToolArtifactWriteResult {
+  const projectRoot = join(workspaceRoot, kernel.project.projectId);
+  const filesWritten: string[] = [];
+  mkdirSync(projectRoot, { recursive: true });
+  writeCocosProjectScaffold(projectRoot, kernel, filesWritten);
+
+  const relativePath = safeWorkspacePath(artifactFilePath(artifact));
+  const absolutePath = join(projectRoot, relativePath);
+  if (!isInsideRoot(projectRoot, absolutePath)) {
+    throw new Error(`Unsafe artifact path: ${artifact.path}`);
+  }
+
+  const previousContent = input.mode === "append" && existsSync(absolutePath) && statSync(absolutePath).isFile() ? readFileSync(absolutePath, "utf8") : "";
+  const separator = previousContent && !previousContent.endsWith("\n") ? "\n" : "";
+  const content = input.mode === "append" && previousContent ? `${previousContent}${separator}${input.content}` : input.content;
+  writeText(projectRoot, relativePath, content.endsWith("\n") ? content : `${content}\n`, filesWritten);
+
+  const stats = statSync(absolutePath);
+  const hash = hashWorkspaceFile(absolutePath);
+  const materializedAt = stats.mtime.toISOString();
+  kernel.recordArtifactMaterialization(artifact.artifactId, {
+    path: relative(projectRoot, absolutePath).split(sep).join("/"),
+    hash,
+    sizeBytes: stats.size,
+    materializedAt
+  });
+
+  return {
+    projectRoot,
+    relativePath: relative(projectRoot, absolutePath).split(sep).join("/"),
+    absolutePath,
+    content: readFileSync(absolutePath, "utf8"),
+    hash,
+    sizeBytes: stats.size,
+    materializedAt
+  };
 }
 
 export function resolveArtifactWorkspaceTarget(
@@ -311,8 +368,42 @@ export function readArtifactPreview(projectId: string, artifact: Artifact): Arti
   };
 }
 
+export function readArtifactContentForModel(projectId: string, artifact: Artifact, maxCharacters = 12_000): string | undefined {
+  const target = resolveArtifactWorkspaceTarget(projectId, artifact);
+  if (!target.exists || target.type !== "file" || !isModelReadableText(target.relativePath)) {
+    return undefined;
+  }
+  const content = readFileSync(target.absolutePath, "utf8");
+  if (content.length <= maxCharacters) {
+    return content;
+  }
+  return `${content.slice(0, maxCharacters)}\n\n[内容已截断，共 ${content.length} 字符]`;
+}
+
 export function isPreviewableDocument(path: string): boolean {
   return [".md", ".markdown", ".txt", ".json", ".jsonl", ".log"].includes(extname(path).toLowerCase());
+}
+
+function isModelReadableText(path: string): boolean {
+  return [
+    ".md",
+    ".markdown",
+    ".txt",
+    ".json",
+    ".jsonl",
+    ".log",
+    ".ts",
+    ".tsx",
+    ".js",
+    ".mjs",
+    ".cjs",
+    ".css",
+    ".html",
+    ".xml",
+    ".yaml",
+    ".yml",
+    ".toml"
+  ].includes(extname(path).toLowerCase());
 }
 
 function listWorkspaceEntries(root: string, current: string): WorkspaceTreeEntry[] {
@@ -516,6 +607,21 @@ function writeArtifactFile(
   const sourceTask = artifact.sourceTaskId ? tasks.find((task) => task.taskId === artifact.sourceTaskId) : undefined;
   const sourceMemory = memory.filter((record) => record.sourceArtifactId === artifact.artifactId || record.ownerAgent === artifact.ownerAgentId);
   const artifactDocument = artifactDocumentView(artifact);
+  const toolContent = typeof artifact.metadata.toolContent === "string" ? artifact.metadata.toolContent : undefined;
+
+  if (artifact.metadata.nativeHarnessManaged === true) {
+    const absolutePath = join(projectRoot, safeWorkspacePath(targetPath));
+    if (existsSync(absolutePath) && statSync(absolutePath).isFile()) {
+      recordArtifactFileEvidence(projectRoot, kernel, artifact, targetPath);
+      return;
+    }
+  }
+
+  if (toolContent !== undefined) {
+    writeText(projectRoot, targetPath, toolContent.endsWith("\n") ? toolContent : `${toolContent}\n`, filesWritten);
+    recordArtifactFileEvidence(projectRoot, kernel, artifact, targetPath);
+    return;
+  }
 
   if (targetPath.endsWith(".json")) {
     writeJson(projectRoot, targetPath, { artifact: artifactDocument, sourceTask, relatedMemory: sourceMemory }, filesWritten);
@@ -570,13 +676,13 @@ function recordArtifactFileEvidence(projectRoot: string, kernel: StudioKernel, a
   const stats = statSync(absolutePath);
   kernel.recordArtifactMaterialization(artifact.artifactId, {
     path: relative(projectRoot, absolutePath).split(sep).join("/"),
-    hash: hashFile(absolutePath),
+    hash: hashWorkspaceFile(absolutePath),
     sizeBytes: stats.size,
     materializedAt: stats.mtime.toISOString()
   });
 }
 
-function hashFile(absolutePath: string): string {
+export function hashWorkspaceFile(absolutePath: string): string {
   return createHash("sha256").update(readFileSync(absolutePath)).digest("hex");
 }
 

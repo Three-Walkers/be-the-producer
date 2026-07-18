@@ -4,6 +4,7 @@ import { dirname, extname, join, normalize, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { URL } from "node:url";
 import { modelSettingsStore, type SaveAgentModelAssignmentInput, type SaveModelProviderInput } from "./modelSettings.js";
+import { claudeCliHarness } from "./claudeCliHarness.js";
 import { HttpError, studioStore, type CreateProjectInput, type PostMessageInput } from "./store.js";
 
 const defaultPort = 8787;
@@ -163,6 +164,16 @@ export async function handleRequest(request: IncomingMessage, response: ServerRe
       }
     }
 
+    if (settingsRoute?.resource === "agent-harnesses" && request.method === "GET") {
+      sendJson(response, 200, { harnesses: [await claudeCliHarness.status()] });
+      return;
+    }
+
+    if (settingsRoute?.resource === "agent-harness-tests" && request.method === "POST" && settingsRoute.childId === "claude-cli") {
+      sendJson(response, 200, { result: await claudeCliHarness.status() });
+      return;
+    }
+
     if (request.method === "GET" && url.pathname === "/projects") {
       sendJson(response, 200, { projects: studioStore.listProjects() });
       return;
@@ -209,6 +220,16 @@ export async function handleRequest(request: IncomingMessage, response: ServerRe
         ...studioStore.pauseProject(projectRoute.projectId),
         taskBoard: studioStore.getKernel(projectRoute.projectId).buildTaskBoard()
       });
+      return;
+    }
+
+    if (request.method === "GET" && resource === "agent-loop") {
+      sendJson(response, 200, { agentLoop: studioStore.getAgentLoopState(projectRoute.projectId) });
+      return;
+    }
+
+    if (request.method === "POST" && resource === "agent-loop" && childId === "wake") {
+      sendJson(response, 202, { agentLoop: studioStore.wakeAgentLoop(projectRoute.projectId) });
       return;
     }
 

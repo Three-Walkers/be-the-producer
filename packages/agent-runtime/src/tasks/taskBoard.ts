@@ -74,8 +74,12 @@ export function aggregateChildrenSummary(children: Task[]): TaskChildrenSummary 
 
 export function calculateProgressPercent(task: Task, children: Task[]): number | undefined {
   if (children.length === 0) {
+    if (task.progressPercent !== undefined) {
+      return clampProgress(task.progressPercent);
+    }
     if (task.status === "todo") return 0;
-    if (task.status === "doing" || task.status === "review" || task.status === "blocked") return 50;
+    if (task.status === "doing" || task.status === "blocked") return 50;
+    if (task.status === "review") return 90;
     if (task.status === "done") return 100;
     return undefined;
   }
@@ -85,7 +89,18 @@ export function calculateProgressPercent(task: Task, children: Task[]): number |
     return undefined;
   }
 
-  return Math.round((effectiveChildren.filter((child) => child.status === "done").length / effectiveChildren.length) * 100);
+  const progress = effectiveChildren.map((child) => {
+    if (child.progressPercent !== undefined) return clampProgress(child.progressPercent);
+    if (child.status === "done") return 100;
+    if (child.status === "review") return 90;
+    if (child.status === "doing" || child.status === "blocked") return 50;
+    return 0;
+  });
+  return Math.round(progress.reduce((sum, value) => sum + value, 0) / progress.length);
+}
+
+function clampProgress(value: number): number {
+  return Math.max(0, Math.min(100, Math.round(value)));
 }
 
 export interface TaskBoardFilter {

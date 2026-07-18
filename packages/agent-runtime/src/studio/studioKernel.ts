@@ -1,4 +1,6 @@
 import type {
+  AgentLoopAgentState,
+  AgentLoopState,
   AgentId,
   Artifact,
   ArtifactLedgerEntry,
@@ -26,6 +28,7 @@ import { TaskBoardBuilder } from "../tasks/taskBoard.js";
 
 export interface StudioKernelState {
   project: Project;
+  agentLoop: AgentLoopState;
   rooms: Room[];
   messages: StudioMessage[];
   tasks: Task[];
@@ -42,6 +45,14 @@ export interface StudioKernelSnapshot extends StudioKernelState {
   memoryRecords: MemoryRecord[];
   auditEvents: AuditEvent[];
 }
+
+type AgentLoopUpdateFields = {
+  [Key in keyof Omit<AgentLoopState, "projectId" | "agents">]?: AgentLoopState[Key] | undefined;
+} & { agents?: Record<AgentId, AgentLoopAgentState> | undefined };
+
+type AgentLoopAgentUpdateFields = {
+  [Key in keyof Omit<AgentLoopAgentState, "agentId">]?: AgentLoopAgentState[Key] | undefined;
+};
 
 export class StudioKernel {
   readonly agents: AgentRegistry;
@@ -66,6 +77,7 @@ export class StudioKernel {
     this.taskBoard = new TaskBoardBuilder();
     this.state = {
       project,
+      agentLoop: restoredState.agentLoop ?? createInitialAgentLoopState(project),
       rooms: restoredState.rooms ?? createDefaultRooms(project.projectId),
       messages: restoredState.messages ?? [],
       tasks: restoredState.tasks ?? [],
@@ -86,6 +98,122 @@ export class StudioKernel {
       ...this.state.project,
       ...fields
     };
+  }
+
+  getAgentLoopState(): AgentLoopState {
+    return {
+      ...this.state.agentLoop,
+      activeAgentIds: [...this.state.agentLoop.activeAgentIds],
+      pendingTaskIds: [...this.state.agentLoop.pendingTaskIds],
+      agents: Object.fromEntries(
+        Object.entries(this.state.agentLoop.agents).map(([agentId, state]) => [
+          agentId,
+          {
+            ...state,
+            ...(state.lastChangedPaths ? { lastChangedPaths: [...state.lastChangedPaths] } : {})
+          }
+        ])
+      )
+    };
+  }
+
+  updateAgentLoop(fields: AgentLoopUpdateFields): AgentLoopState {
+    const next: AgentLoopState = {
+      ...this.state.agentLoop,
+      agents: fields.agents ?? this.state.agentLoop.agents,
+      status: fields.status ?? this.state.agentLoop.status,
+      iteration: fields.iteration ?? this.state.agentLoop.iteration,
+      activeAgentIds: fields.activeAgentIds ? [...fields.activeAgentIds] : this.state.agentLoop.activeAgentIds,
+      pendingTaskIds: fields.pendingTaskIds ? [...fields.pendingTaskIds] : this.state.agentLoop.pendingTaskIds,
+      updatedAt: fields.updatedAt ?? new Date().toISOString()
+    };
+    if (fields.runId !== undefined) {
+      next.runId = fields.runId;
+    }
+    if (fields.waitingReason !== undefined) {
+      next.waitingReason = fields.waitingReason;
+    }
+    if (fields.lastError !== undefined) {
+      next.lastError = fields.lastError;
+    }
+    if (fields.startedAt !== undefined) {
+      next.startedAt = fields.startedAt;
+    }
+    if ("waitingReason" in fields && fields.waitingReason === undefined) {
+      delete next.waitingReason;
+    }
+    if ("lastError" in fields && fields.lastError === undefined) {
+      delete next.lastError;
+    }
+    if ("runId" in fields && fields.runId === undefined) {
+      delete next.runId;
+    }
+    if ("startedAt" in fields && fields.startedAt === undefined) {
+      delete next.startedAt;
+    }
+    this.state.agentLoop = next;
+    return this.getAgentLoopState();
+  }
+
+  updateAgentLoopAgent(agentId: AgentId, fields: AgentLoopAgentUpdateFields): AgentLoopAgentState {
+    const previous = this.state.agentLoop.agents[agentId];
+    const next: AgentLoopAgentState = {
+      agentId,
+      status: fields.status ?? previous?.status ?? "idle",
+      iteration: fields.iteration ?? previous?.iteration ?? this.state.agentLoop.iteration,
+      ...(fields.taskId !== undefined ? { taskId: fields.taskId } : previous?.taskId ? { taskId: previous.taskId } : {}),
+      ...(fields.harnessId !== undefined
+        ? { harnessId: fields.harnessId }
+        : previous?.harnessId
+          ? { harnessId: previous.harnessId }
+          : {}),
+      ...(fields.sessionId !== undefined
+        ? { sessionId: fields.sessionId }
+        : previous?.sessionId
+          ? { sessionId: previous.sessionId }
+          : {}),
+      ...(fields.lastInvocationId !== undefined
+        ? { lastInvocationId: fields.lastInvocationId }
+        : previous?.lastInvocationId
+          ? { lastInvocationId: previous.lastInvocationId }
+          : {}),
+      ...(fields.lastChangedPaths !== undefined
+        ? { lastChangedPaths: [...fields.lastChangedPaths] }
+        : previous?.lastChangedPaths
+          ? { lastChangedPaths: [...previous.lastChangedPaths] }
+          : {}),
+      ...(fields.lastMessageId !== undefined
+        ? { lastMessageId: fields.lastMessageId }
+        : previous?.lastMessageId
+          ? { lastMessageId: previous.lastMessageId }
+          : {}),
+      ...(fields.lastError !== undefined ? { lastError: fields.lastError } : previous?.lastError ? { lastError: previous.lastError } : {}),
+      updatedAt: fields.updatedAt ?? new Date().toISOString()
+    };
+    if ("taskId" in fields && fields.taskId === undefined) {
+      delete next.taskId;
+    }
+    if ("harnessId" in fields && fields.harnessId === undefined) {
+      delete next.harnessId;
+    }
+    if ("sessionId" in fields && fields.sessionId === undefined) {
+      delete next.sessionId;
+    }
+    if ("lastInvocationId" in fields && fields.lastInvocationId === undefined) {
+      delete next.lastInvocationId;
+    }
+    if ("lastChangedPaths" in fields && fields.lastChangedPaths === undefined) {
+      delete next.lastChangedPaths;
+    }
+    if ("lastMessageId" in fields && fields.lastMessageId === undefined) {
+      delete next.lastMessageId;
+    }
+    if ("lastError" in fields && fields.lastError === undefined) {
+      delete next.lastError;
+    }
+    this.state.agentLoop.agents[agentId] = next;
+    this.state.agentLoop.updatedAt = next.updatedAt;
+    return { ...next };
   }
 
   setStage(stageId: StageId, updatedAt = new Date().toISOString()): void {
@@ -222,6 +350,53 @@ export class StudioKernel {
       },
       createdAt: artifact.createdAt
     });
+  }
+
+  upsertArtifact(artifact: Artifact): Artifact {
+    const existing = this.state.artifacts.find(
+      (candidate) => candidate.artifactId === artifact.artifactId || (candidate.ownerAgentId === artifact.ownerAgentId && candidate.path === artifact.path)
+    );
+    if (!existing) {
+      this.addArtifact(artifact);
+      this.attachArtifactToSourceTask(artifact);
+      return artifact;
+    }
+
+    const updatedAt = artifact.updatedAt ?? new Date().toISOString();
+    existing.type = artifact.type;
+    existing.path = artifact.path;
+    existing.status = artifact.status;
+    existing.version = Math.max(existing.version, artifact.version);
+    if (artifact.sourceTaskId !== undefined) {
+      existing.sourceTaskId = artifact.sourceTaskId;
+    }
+    existing.sourceDecisionIds = [...new Set([...existing.sourceDecisionIds, ...artifact.sourceDecisionIds])];
+    existing.metadata = {
+      ...existing.metadata,
+      ...artifact.metadata
+    };
+    existing.updatedAt = updatedAt;
+    this.attachArtifactToSourceTask(existing);
+
+    let ledger = this.state.artifactLedger.find((candidate) => candidate.artifactId === existing.artifactId);
+    if (!ledger) {
+      const operationId = this.createArtifactOperation(existing);
+      ledger = {
+        artifactId: existing.artifactId,
+        projectId: existing.projectId,
+        ownerAgentId: existing.ownerAgentId,
+        ...(existing.sourceTaskId ? { taskId: existing.sourceTaskId } : {}),
+        path: existing.path,
+        createdAt: existing.createdAt,
+        updatedAt,
+        sourceOperationId: operationId,
+        status: "pending",
+        reason: "等待工作区写入并计算文件证据。"
+      };
+      this.state.artifactLedger.push(ledger);
+    }
+
+    return existing;
   }
 
   recordArtifactMaterialization(
@@ -524,6 +699,7 @@ export class StudioKernel {
       version: 1,
       savedAt,
       project: this.state.project,
+      agentLoop: this.state.agentLoop,
       rooms: this.state.rooms,
       messages: this.state.messages,
       tasks: this.state.tasks,
@@ -595,6 +771,20 @@ export class StudioKernel {
     return operationId;
   }
 
+  private attachArtifactToSourceTask(artifact: Artifact): void {
+    if (!artifact.sourceTaskId) {
+      return;
+    }
+
+    const task = this.state.tasks.find((candidate) => candidate.taskId === artifact.sourceTaskId);
+    if (!task || task.outputArtifacts.includes(artifact.artifactId)) {
+      return;
+    }
+
+    task.outputArtifacts.push(artifact.artifactId);
+    task.updatedAt = artifact.updatedAt;
+  }
+
   private hasVerifiedTaskOutputs(task: Task): boolean {
     return this.missingVerifiedTaskOutputs(task).length === 0;
   }
@@ -660,6 +850,7 @@ export function createRestartedStudioKernel(project: Project): StudioKernel {
 
 export function createStudioKernelFromSnapshot(snapshot: StudioKernelSnapshot): StudioKernel {
   return new StudioKernel(snapshot.project, {
+    agentLoop: snapshot.agentLoop,
     rooms: snapshot.rooms,
     messages: snapshot.messages,
     tasks: snapshot.tasks,
@@ -671,6 +862,19 @@ export function createStudioKernelFromSnapshot(snapshot: StudioKernelSnapshot): 
     memoryRecords: snapshot.memoryRecords,
     auditEvents: snapshot.auditEvents
   });
+}
+
+function createInitialAgentLoopState(project: Project): AgentLoopState {
+  const status: AgentLoopState["status"] = project.executionStatus === "paused" ? "paused" : "idle";
+  return {
+    projectId: project.projectId,
+    status,
+    iteration: 0,
+    activeAgentIds: [],
+    pendingTaskIds: [],
+    agents: {},
+    updatedAt: project.updatedAt
+  };
 }
 
 function summarizeClaimVerdict(claims: ClaimVerification[]): ClaimVerification["verdict"] | undefined {
