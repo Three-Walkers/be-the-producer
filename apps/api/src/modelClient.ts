@@ -5,6 +5,7 @@ export interface ModelChatInput {
   userPrompt: string;
   model: string;
   maxTokens?: number;
+  timeoutMs?: number;
   abortSignal?: AbortSignal;
 }
 
@@ -47,10 +48,22 @@ export async function generateModelChat(provider: ModelProviderConfig, input: Mo
 }
 
 async function sendChatRequest(provider: ModelProviderConfig, input: Required<Pick<ModelChatInput, "systemPrompt" | "userPrompt" | "model">> & ModelChatInput): Promise<Response> {
+  if (input.abortSignal?.aborted) {
+    throw new Error("模型请求在发起前已被项目暂停、项目切换或任务取消。");
+  }
+
+  const timeoutMs = normalizeTimeoutMs(input.timeoutMs);
   const controller = new AbortController();
-  const abort = (): void => controller.abort();
+  let abortReason: "external" | "timeout" | undefined;
+  const abort = (): void => {
+    abortReason = "external";
+    controller.abort();
+  };
   input.abortSignal?.addEventListener("abort", abort, { once: true });
-  const timeout = setTimeout(() => controller.abort(), 30_000);
+  const timeout = setTimeout(() => {
+    abortReason = "timeout";
+    controller.abort();
+  }, timeoutMs);
   try {
     switch (provider.protocol) {
       case "anthropic":
@@ -105,10 +118,25 @@ async function sendChatRequest(provider: ModelProviderConfig, input: Required<Pi
           signal: controller.signal
         });
     }
+  } catch (error) {
+    if (abortReason === "timeout") {
+      throw new Error(`模型请求超过 ${Math.round(timeoutMs / 1_000)} 秒，已超时终止。Provider 连接可能正常，但本次生成没有在时限内完成。`);
+    }
+    if (abortReason === "external") {
+      throw new Error("模型请求因项目暂停、项目切换或任务取消而终止。");
+    }
+    throw error;
   } finally {
     clearTimeout(timeout);
     input.abortSignal?.removeEventListener("abort", abort);
   }
+}
+
+function normalizeTimeoutMs(timeoutMs?: number): number {
+  if (timeoutMs === undefined || !Number.isFinite(timeoutMs)) {
+    return 120_000;
+  }
+  return Math.max(1_000, Math.round(timeoutMs));
 }
 
 function extractContent(protocol: ModelProviderProtocol, body: string): string {

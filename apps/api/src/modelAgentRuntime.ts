@@ -239,7 +239,8 @@ export class ModelAgentRuntime {
         model,
         systemPrompt: buildSystemPrompt(agent),
         userPrompt: buildUserPrompt(kernel, producerMessage, agent, route?.reasons ?? []),
-        maxTokens: 1800
+        maxTokens: 1800,
+        timeoutMs: 120_000
       });
       const guarded = enforceProducerGateBoundary(kernel, result.content);
       return createAgentMessage(kernel, producerMessage, agent.agentId, guarded.messageType ?? inferMessageType(producerMessage), guarded.content, {
@@ -247,26 +248,52 @@ export class ModelAgentRuntime {
         providerId: result.providerId,
         model: result.model,
         latencyMs: result.latencyMs,
+        executionPath: "direct_model_api",
+        configuredHarnessId: assignment.harnessId,
         routeReasons: route?.reasons ?? [],
         ...guarded.metadata
       });
     } catch (error) {
+      const failure = describeModelReplyFailure(error);
       return createAgentMessage(
         kernel,
         producerMessage,
         agent.agentId,
         "blocker",
-        `我被路由到这条消息，但模型回复失败：${error instanceof Error ? error.message : String(error)} 请在设置里检查该角色的 provider、模型名和连通性测试。`,
+        `我被路由到这条消息，但模型回复失败：${failure.userMessage}`,
         {
           generatedBy: "model_agent_runtime",
           providerId: provider.providerId,
           model,
+          executionPath: "direct_model_api",
+          configuredHarnessId: assignment.harnessId,
+          failureKind: failure.kind,
           routeReasons: route?.reasons ?? [],
           failure: true
         }
       );
     }
   }
+}
+
+function describeModelReplyFailure(error: unknown): { kind: "timeout" | "cancelled" | "configuration_or_provider"; userMessage: string } {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/超时|超过\s*\d+\s*秒/i.test(message)) {
+    return {
+      kind: "timeout",
+      userMessage: `${message} 这不代表 API Key 无效；可以重试消息，系统不会把本次超时误判为角色配置错误。`
+    };
+  }
+  if (/暂停|切换|取消|终止/i.test(message)) {
+    return {
+      kind: "cancelled",
+      userMessage: message
+    };
+  }
+  return {
+    kind: "configuration_or_provider",
+    userMessage: `${message} 请在设置中检查该角色的 Provider、模型名和连通性测试。`
+  };
 }
 
 function buildTaskLoopPrompt(kernel: StudioKernel, task: Task, agent: AgentContract, input: AgentTaskRunInput): string {
