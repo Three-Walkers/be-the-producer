@@ -1,4 +1,4 @@
-import type { AgentContract, AgentHarnessId, AgentLoopControl } from "@game-pipeline/shared-schemas";
+import type { AgentContract, AgentHarnessId, AgentLoopControl, AgentSessionScope } from "@game-pipeline/shared-schemas";
 import type { ModelProviderConfig } from "./modelSettings.js";
 
 export interface AgentHarnessRunInput {
@@ -11,6 +11,10 @@ export interface AgentHarnessRunInput {
   userPrompt: string;
   allowedRoots?: string[];
   expectedPaths?: string[];
+  requireToolProgress?: boolean;
+  toolMode?: "conversation" | "task";
+  sessionKey?: string;
+  sessionScope?: AgentSessionScope;
   sessionId?: string;
   abortSignal?: AbortSignal;
 }
@@ -20,12 +24,24 @@ export interface AgentHarnessRunResult {
   invocationId: string;
   content: string;
   sessionId?: string;
+  resumeAttempted?: boolean;
+  resumed?: boolean;
   model: string;
   providerId: string;
   latencyMs: number;
   rawEventCount: number;
   changedPaths?: string[];
+  toolOperations?: AgentHarnessToolOperation[];
   loopControl?: AgentLoopControl;
+  terminationReason?: "expected_outputs_materialized" | "idle_after_progress" | "timeout_with_progress" | "process_exit_with_progress";
+}
+
+export interface AgentHarnessToolOperation {
+  toolName: string;
+  path: string;
+  hash?: string;
+  sizeBytes?: number;
+  recordedAt?: string;
 }
 
 export interface AgentHarnessStatus {

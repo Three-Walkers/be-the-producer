@@ -11,6 +11,111 @@ export type OperationId = string;
 export type ClaimId = string;
 export type AgentHarnessId = "direct-api" | "claude-cli";
 
+export type AgentSessionScope = "room" | "task_child";
+export type AgentSessionStatus = "active" | "sealed" | "recovering" | "failed";
+export type ContextHealthStatus = "healthy" | "degraded" | "stale" | "oversized";
+export type ContextPacketLayerKind =
+  | "identity"
+  | "durable_memory"
+  | "task_state"
+  | "artifact_evidence"
+  | "handoff_capsules"
+  | "room_delta"
+  | "room_digest";
+export type HandoffCapsuleKind = "parent_to_child" | "child_to_parent" | "agent_handoff" | "resume_recovery";
+
+export interface RoomContextCursor {
+  roomId: RoomId;
+  lastMessageId?: MessageId;
+  lastMessageCreatedAt?: string;
+  deliveredMessageCount: number;
+  updatedAt: string;
+}
+
+export interface ContextHealth {
+  status: ContextHealthStatus;
+  score: number;
+  estimatedTokens: number;
+  budgetTokens: number;
+  deltaMessageCount: number;
+  omittedMessageCount: number;
+  staleCursor: boolean;
+  reasons: string[];
+  checkedAt: string;
+}
+
+export interface ContextPacketLayer {
+  kind: ContextPacketLayerKind;
+  title: string;
+  content: string;
+  sourceRefs: string[];
+  truncated: boolean;
+}
+
+export interface ContextPacket {
+  packetId: string;
+  projectId: ProjectId;
+  sessionKey: string;
+  agentId: AgentId;
+  roomId: RoomId;
+  taskId?: TaskId;
+  cursorBefore: RoomContextCursor;
+  cursorAfter: RoomContextCursor;
+  layers: ContextPacketLayer[];
+  health: ContextHealth;
+  createdAt: string;
+}
+
+export interface AgentSessionRecord {
+  sessionKey: string;
+  logicalSessionKey: string;
+  projectId: ProjectId;
+  agentId: AgentId;
+  roomId: RoomId;
+  taskId?: TaskId;
+  scope: AgentSessionScope;
+  parentSessionKey?: string;
+  predecessorSessionKey?: string;
+  harnessId: AgentHarnessId;
+  providerId: string;
+  model: string;
+  sessionId?: string;
+  epoch: number;
+  status: AgentSessionStatus;
+  cursor: RoomContextCursor;
+  contextHealth?: ContextHealth;
+  contextTokensEstimate: number;
+  resumeFailureCount: number;
+  lastContextPacketId?: string;
+  lastInvocationId?: string;
+  incomingCapsuleIds: string[];
+  outgoingCapsuleIds: string[];
+  sealReason?: string;
+  sealedAt?: string;
+  lastSuccessfulAt?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface SessionHandoffCapsule {
+  capsuleId: string;
+  projectId: ProjectId;
+  kind: HandoffCapsuleKind;
+  sourceSessionKey: string;
+  targetSessionKeys: string[];
+  sourceAgentId: AgentId;
+  targetAgentIds: AgentId[];
+  roomId: RoomId;
+  taskId?: TaskId;
+  summary: string;
+  messageIds: MessageId[];
+  artifactIds: ArtifactId[];
+  changedPaths: string[];
+  contextHealth?: ContextHealth;
+  consumedBySessionKeys: string[];
+  createdAt: string;
+}
+
 export type AgentLoopStatus = "idle" | "running" | "waiting_for_producer" | "paused" | "blocked" | "error";
 export type AgentLoopAgentStatus = "idle" | "queued" | "working" | "waiting" | "blocked" | "error";
 export type AgentLoopControlStatus = "continue" | "waiting_for_producer" | "handoff" | "ready_for_review" | "blocked";

@@ -22,6 +22,26 @@ for await (const chunk of process.stdin) prompt += chunk;
 if (prompt.includes("ABORT_TEST")) {
   await new Promise((resolve) => setTimeout(resolve, 5000));
 }
+if (prompt.includes("HANG_NO_PROGRESS")) {
+  await new Promise((resolve) => setTimeout(resolve, 5000));
+}
+if (prompt.includes("RESUME_FAIL") && args.includes("--resume")) {
+  process.stderr.write("Session does not exist or can no longer be resumed.\\n");
+  process.exit(1);
+}
+if (prompt.includes("PARTIAL_PROGRESS")) {
+  const configIndex = args.indexOf("--mcp-config");
+  const config = JSON.parse(args[configIndex + 1]);
+  const operationLogPath = config.mcpServers.btp_workspace.env.BTP_OPERATION_LOG_PATH;
+  const target = join(process.cwd(), "docs/design/harness-proof.md");
+  mkdirSync(dirname(target), { recursive: true });
+  const content = "# Partial Harness Proof\\n\\nThe tool write completed before the CLI stopped.\\n";
+  writeFileSync(target, content);
+  mkdirSync(dirname(operationLogPath), { recursive: true });
+  writeFileSync(operationLogPath, JSON.stringify({ toolName: "write_artifact", path: "docs/design/harness-proof.md", hash: "test", sizeBytes: content.length, recordedAt: new Date().toISOString() }) + "\\n");
+  process.stdout.write(JSON.stringify({type:"assistant", message:{content:[{type:"text", text:"工具写入已完成，正在继续检查。"}]}}) + "\\n");
+  await new Promise((resolve) => setTimeout(resolve, 5000));
+}
 const target = join(process.cwd(), "docs/design/harness-proof.md");
 mkdirSync(dirname(target), { recursive: true });
 writeFileSync(target, "# Harness Proof\\n\\nClaude CLI wrote this file from its native Write/Edit loop.\\n");
@@ -38,11 +58,16 @@ process.stdout.write(JSON.stringify({type:"result", result:"已实际写入任�
 chmodSync(fakeClaude, 0o755);
 process.env.CLAUDE_CLI_PATH = fakeClaude;
 
-const { ClaudeCliHarness } = await import("../apps/api/dist/claudeCliHarness.js");
+const { ClaudeCliHarness, ClaudeSessionResumeError } = await import("../apps/api/dist/claudeCliHarness.js");
 const { captureWorkspaceSnapshot, recordHarnessWorkspaceChanges } = await import("../apps/api/dist/harnessWorkspaceEvidence.js");
 const { createStudioKernel, defaultAgentContracts } = await import("@game-pipeline/agent-runtime");
 
-const harness = new ClaudeCliHarness();
+const harness = new ClaudeCliHarness({
+  timeoutMs: 600,
+  initialProgressTimeoutMs: 150,
+  idleAfterProgressMs: 150,
+  settleAfterExpectedOutputsMs: 50
+});
 const status = await harness.status();
 assert.equal(status.available, true);
 assert.match(status.version, /9\.9\.9-test/);
@@ -134,6 +159,19 @@ const isolatedEvidence = recordHarnessWorkspaceChanges(
 assert.deepEqual(isolatedEvidence.changedPaths, ["docs/design/harness-proof.md"]);
 assert.deepEqual(isolatedEvidence.violations, []);
 
+const unchangedBefore = captureWorkspaceSnapshot(projectRoot);
+const unchangedAfter = captureWorkspaceSnapshot(projectRoot);
+const repeatedWriteEvidence = recordHarnessWorkspaceChanges(
+  kernel,
+  task,
+  agent,
+  unchangedBefore,
+  unchangedAfter,
+  "inv_repeated_tool_write",
+  ["docs/design/harness-proof.md"]
+);
+assert.deepEqual(repeatedWriteEvidence.changedPaths, ["docs/design/harness-proof.md"]);
+
 await harness.run({
   projectId: kernel.project.projectId,
   projectRoot,
@@ -142,11 +180,59 @@ await harness.run({
   model: "qwen-test",
   systemPrompt: "test",
   userPrompt: "resume the proof",
-  sessionId: result.sessionId
+  sessionId: result.sessionId,
+  sessionKey: "task:harness_test:design-room:task_harness:game_designer:e0",
+  sessionScope: "task_child"
 });
 const args = JSON.parse(readFileSync(join(projectRoot, ".be-the-producer/test/harness-args.json"), "utf8"));
 assert.ok(args.includes("--resume"));
 assert.ok(args.includes(result.sessionId));
+assert.ok(args.includes("--name"));
+assert.ok(args.includes("task-harness_test-design-room-task_harness-game_designer-e0"));
+
+await assert.rejects(
+  harness.run({
+    projectId: kernel.project.projectId,
+    projectRoot,
+    agent,
+    provider,
+    model: "qwen-test",
+    systemPrompt: "test",
+    userPrompt: "RESUME_FAIL",
+    sessionId: result.sessionId,
+    sessionKey: "task:harness_test:design-room:task_harness:game_designer:e0",
+    sessionScope: "task_child",
+    requireToolProgress: false
+  }),
+  (error) => error instanceof ClaudeSessionResumeError && error.sessionId === result.sessionId
+);
+
+const partialResult = await harness.run({
+  projectId: kernel.project.projectId,
+  projectRoot,
+  agent,
+  provider,
+  model: "qwen-test",
+  systemPrompt: "test",
+  userPrompt: "PARTIAL_PROGRESS",
+  expectedPaths: ["docs/design/harness-proof.md"]
+});
+assert.equal(partialResult.terminationReason, "expected_outputs_materialized");
+assert.deepEqual(partialResult.changedPaths, ["docs/design/harness-proof.md"]);
+assert.match(partialResult.content, /工具写入已完成/);
+
+await assert.rejects(
+  harness.run({
+    projectId: kernel.project.projectId,
+    projectRoot,
+    agent,
+    provider,
+    model: "qwen-test",
+    systemPrompt: "test",
+    userPrompt: "HANG_NO_PROGRESS"
+  }),
+  /没有产生工具写入/
+);
 
 const abortController = new AbortController();
 const aborted = harness.run({
@@ -164,4 +250,4 @@ await assert.rejects(aborted, /暂停或取消/);
 assert.equal(existsSync(join(projectRoot, "docs/design/harness-proof.md")), true);
 
 rmSync(tempRoot, { recursive: true, force: true });
-process.stdout.write("Claude CLI Harness smoke passed: session resume, isolated evidence ledger, cancellation\n");
+process.stdout.write("Claude CLI Harness smoke passed: session resume, partial progress recovery, isolated evidence ledger, cancellation\n");

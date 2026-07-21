@@ -1,15 +1,38 @@
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AgentContract, AgentLoopControl } from "@game-pipeline/shared-schemas";
-import type { AgentHarness, AgentHarnessRunInput, AgentHarnessRunResult, AgentHarnessStatus } from "./agentHarness.js";
+import type { AgentHarness, AgentHarnessRunInput, AgentHarnessRunResult, AgentHarnessStatus, AgentHarnessToolOperation } from "./agentHarness.js";
+import { cocosEngineSettingsStore } from "./cocosEngineSettings.js";
 
 const defaultTimeoutMs = 20 * 60 * 1000;
+const defaultInitialProgressTimeoutMs = 3 * 60 * 1000;
+const defaultIdleAfterProgressMs = 2 * 60 * 1000;
+const defaultSettleAfterExpectedOutputsMs = 2 * 60 * 1000;
+
+export interface ClaudeCliHarnessOptions {
+  timeoutMs?: number;
+  initialProgressTimeoutMs?: number;
+  idleAfterProgressMs?: number;
+  settleAfterExpectedOutputsMs?: number;
+}
+
+export class ClaudeSessionResumeError extends Error {
+  readonly sessionId: string;
+
+  constructor(sessionId: string, message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "ClaudeSessionResumeError";
+    this.sessionId = sessionId;
+  }
+}
 
 export class ClaudeCliHarness implements AgentHarness {
   readonly harnessId = "claude-cli" as const;
+
+  constructor(private readonly options: ClaudeCliHarnessOptions = {}) {}
 
   async status(): Promise<AgentHarnessStatus> {
     const testedAt = new Date().toISOString();
@@ -58,14 +81,14 @@ export class ClaudeCliHarness implements AgentHarness {
       "--permission-mode",
       "bypassPermissions",
       "--tools",
-      claudeToolsForAgent(input.agent).join(","),
+      claudeToolsForAgent(input.agent, input.toolMode ?? "task").join(","),
       "--strict-mcp-config",
       "--mcp-config",
       mcpConfig(input, controlPath, operationLogPath),
       "--model",
       input.model,
       "--name",
-      `btp-${input.projectId}-${input.agent.agentId}`,
+      safeSessionName(input.sessionKey ?? `btp-${input.projectId}-${input.agent.agentId}`),
       "--append-system-prompt",
       input.systemPrompt
     ];
@@ -74,31 +97,66 @@ export class ClaudeCliHarness implements AgentHarness {
     }
 
     const startedAt = Date.now();
-    const result = await runProcess(resolveClaudeExecutable(), args, {
-      cwd: input.projectRoot,
-      env: claudeEnvironment(input, configDir),
-      stdin: input.userPrompt,
-      timeoutMs: defaultTimeoutMs,
-      ...(input.abortSignal ? { abortSignal: input.abortSignal } : {})
-    });
+    let result: Awaited<ReturnType<typeof runProcess>>;
+    try {
+      result = await runProcess(resolveClaudeExecutable(), args, {
+        cwd: input.projectRoot,
+        env: claudeEnvironment(input, configDir),
+        stdin: input.userPrompt,
+        timeoutMs: this.options.timeoutMs ?? defaultTimeoutMs,
+        ...(input.requireToolProgress === false
+          ? {}
+          : {
+              progress: {
+                operationLogPath,
+                projectRoot: input.projectRoot,
+                expectedPaths: input.expectedPaths ?? [],
+                initialProgressTimeoutMs: this.options.initialProgressTimeoutMs ?? defaultInitialProgressTimeoutMs,
+                idleAfterProgressMs: this.options.idleAfterProgressMs ?? defaultIdleAfterProgressMs,
+                settleAfterExpectedOutputsMs: this.options.settleAfterExpectedOutputsMs ?? defaultSettleAfterExpectedOutputsMs
+              }
+            }),
+        ...(input.abortSignal ? { abortSignal: input.abortSignal } : {})
+      });
+    } catch (error) {
+      if (input.sessionId && isRecoverableResumeFailure(error)) {
+        const detail = error instanceof Error ? error.message : String(error);
+        throw new ClaudeSessionResumeError(input.sessionId, `Claude CLI --resume ${input.sessionId} 失败：${detail}`, {
+          cause: error
+        });
+      }
+      throw error;
+    }
     const parsed = parseStreamJson(result.stdout);
     const loopControl = readLoopControl(controlPath);
-    const changedPaths = readOperationPaths(operationLogPath);
-    if (!parsed.content.trim()) {
-      throw new Error(`Claude CLI 没有返回可读取内容。${compactProcessError(result.stderr)}`);
+    const toolOperations = readToolOperations(operationLogPath);
+    const changedPaths = [...new Set(toolOperations.map((operation) => operation.path))];
+    if (!parsed.content.trim() && !result.terminationReason) {
+      const error = new Error(`Claude CLI 没有返回可读取内容。${compactProcessError(result.stderr)}`);
+      if (input.sessionId) {
+        throw new ClaudeSessionResumeError(input.sessionId, `Claude CLI --resume ${input.sessionId} 失败：${error.message}`, {
+          cause: error
+        });
+      }
+      throw error;
     }
+    const content = parsed.content.trim() || `Claude CLI 已通过工具写入 ${changedPaths.length} 个文件，调度器已收束本轮并保留产物证据。`;
 
     return {
       harnessId: this.harnessId,
       invocationId,
-      content: parsed.content,
+      content,
       ...(parsed.sessionId ? { sessionId: parsed.sessionId } : input.sessionId ? { sessionId: input.sessionId } : {}),
+      resumeAttempted: Boolean(input.sessionId),
+      resumed: Boolean(input.sessionId && (parsed.sessionId || result.terminationReason)),
       model: input.model,
       providerId: input.provider.providerId,
       latencyMs: Date.now() - startedAt,
       rawEventCount: parsed.eventCount,
       changedPaths,
-      ...(loopControl ? { loopControl } : {})
+      toolOperations,
+      ...(loopControl ? { loopControl } : {}),
+      ...(result.terminationReason ? { terminationReason: result.terminationReason } : {})
     };
   }
 }
@@ -120,7 +178,10 @@ function assertClaudeCompatibleProvider(input: AgentHarnessRunInput): void {
   }
 }
 
-function claudeToolsForAgent(agent: AgentContract): string[] {
+function claudeToolsForAgent(agent: AgentContract, mode: "conversation" | "task"): string[] {
+  if (mode === "conversation") {
+    return ["Read", "Glob", "Grep"];
+  }
   const tools = [
     "Read",
     "Glob",
@@ -130,13 +191,28 @@ function claudeToolsForAgent(agent: AgentContract): string[] {
     "mcp__btp_workspace__list_files",
     "mcp__btp_workspace__report_task_status"
   ];
+  if (["art_director", "asset_production"].includes(agent.agentId)) {
+    tools.push("mcp__btp_workspace__render_svg_to_png");
+  }
   if (["coding", "evaluation"].includes(agent.modelProfile.capability) || ["devops", "wechat_platform", "cocos_automation"].includes(agent.agentId)) {
     tools.push("mcp__btp_workspace__run_project_check");
+  }
+  if (agent.agentId === "qa_evaluator") {
+    tools.push("mcp__btp_workspace__run_playtest");
+  }
+  if (agent.agentId === "cocos_automation") {
+    tools.push(
+      "mcp__btp_workspace__cocos_validate_project",
+      "mcp__btp_workspace__cocos_import_assets",
+      "mcp__btp_workspace__cocos_apply_blueprint",
+      "mcp__btp_workspace__cocos_build"
+    );
   }
   return tools;
 }
 
 function mcpConfig(input: AgentHarnessRunInput, controlPath: string, operationLogPath: string): string {
+  const cocosConfig = cocosEngineSettingsStore.getResolvedConfig();
   return JSON.stringify({
     mcpServers: {
       btp_workspace: {
@@ -146,10 +222,17 @@ function mcpConfig(input: AgentHarnessRunInput, controlPath: string, operationLo
         env: {
           BTP_PROJECT_ROOT: input.projectRoot,
           BTP_AGENT_ID: input.agent.agentId,
+          BTP_SESSION_KEY: input.sessionKey ?? "",
+          BTP_SESSION_SCOPE: input.sessionScope ?? "room",
           BTP_ALLOWED_ROOTS: JSON.stringify(input.allowedRoots ?? [input.agent.workspace.replace(/\/+$/, "")]),
           BTP_EXPECTED_PATHS: JSON.stringify(input.expectedPaths ?? []),
           BTP_CONTROL_PATH: controlPath,
           BTP_OPERATION_LOG_PATH: operationLogPath,
+          BTP_COCOS_EXECUTABLE: cocosConfig.executablePath,
+          BTP_COCOS_VERSION: cocosConfig.version,
+          BTP_COCOS_PLATFORM: cocosConfig.platform,
+          BTP_COCOS_BUILD_CONFIG: cocosConfig.buildConfigPath,
+          BTP_COCOS_TIMEOUT_MS: String(cocosConfig.timeoutMs),
           BTP_ALLOW_PROJECT_CHECKS: String(
             ["coding", "evaluation"].includes(input.agent.modelProfile.capability) || ["devops", "wechat_platform", "cocos_automation"].includes(input.agent.agentId)
           )
@@ -159,23 +242,32 @@ function mcpConfig(input: AgentHarnessRunInput, controlPath: string, operationLo
   });
 }
 
-function readOperationPaths(operationLogPath: string): string[] {
+function readToolOperations(operationLogPath: string): AgentHarnessToolOperation[] {
   if (!existsSync(operationLogPath)) {
     return [];
   }
   try {
-    const paths = readFileSync(operationLogPath, "utf8")
+    const operations = readFileSync(operationLogPath, "utf8")
       .split(/\r?\n/)
       .filter(Boolean)
       .flatMap((line) => {
         try {
-          const parsed = JSON.parse(line) as { path?: unknown };
-          return typeof parsed.path === "string" && parsed.path.trim() ? [parsed.path.trim()] : [];
+          const parsed = JSON.parse(line) as Record<string, unknown>;
+          if (typeof parsed.path !== "string" || !parsed.path.trim() || typeof parsed.toolName !== "string") {
+            return [];
+          }
+          return [{
+            toolName: parsed.toolName,
+            path: parsed.path.trim(),
+            ...(typeof parsed.hash === "string" ? { hash: parsed.hash } : {}),
+            ...(typeof parsed.sizeBytes === "number" ? { sizeBytes: parsed.sizeBytes } : {}),
+            ...(typeof parsed.recordedAt === "string" ? { recordedAt: parsed.recordedAt } : {})
+          } satisfies AgentHarnessToolOperation];
         } catch {
           return [];
         }
       });
-    return [...new Set(paths)];
+    return operations;
   } finally {
     try {
       unlinkSync(operationLogPath);
@@ -240,6 +332,17 @@ function claudeEnvironment(input: AgentHarnessRunInput, configDir: string): Node
 
 function resolveClaudeExecutable(): string {
   return process.env.CLAUDE_CLI_PATH?.trim() || "claude";
+}
+
+function safeSessionName(value: string): string {
+  return value.replace(/[^a-zA-Z0-9._-]+/g, "-").slice(0, 120);
+}
+
+function isRecoverableResumeFailure(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/暂停|取消|abort/i.test(message)) return false;
+  if (/API key|认证|unauthorized|forbidden|余额|rate.?limit/i.test(message)) return false;
+  return /resume|session|conversation|退出异常|没有返回可读取内容|没有产生工具写入|执行超过/i.test(message);
 }
 
 function parseStreamJson(stdout: string): { content: string; sessionId?: string; eventCount: number } {
@@ -310,9 +413,23 @@ interface ProcessOptions {
   stdin?: string;
   timeoutMs: number;
   abortSignal?: AbortSignal;
+  progress?: {
+    operationLogPath: string;
+    projectRoot: string;
+    expectedPaths: string[];
+    initialProgressTimeoutMs: number;
+    idleAfterProgressMs: number;
+    settleAfterExpectedOutputsMs: number;
+  };
 }
 
-function runProcess(command: string, args: string[], options: ProcessOptions): Promise<{ stdout: string; stderr: string }> {
+type ProcessTerminationReason = NonNullable<AgentHarnessRunResult["terminationReason"]>;
+
+function runProcess(
+  command: string,
+  args: string[],
+  options: ProcessOptions
+): Promise<{ stdout: string; stderr: string; terminationReason?: ProcessTerminationReason }> {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       cwd: options.cwd,
@@ -322,12 +439,26 @@ function runProcess(command: string, args: string[], options: ProcessOptions): P
     let stdout = "";
     let stderr = "";
     let settled = false;
+    let requestedTermination: ProcessTerminationReason | undefined;
+    let requestedError: Error | undefined;
+    let lastProgressSignature = "";
+    let lastProgressAt = 0;
+    let progressDetected = false;
+    let timeout: NodeJS.Timeout;
+    let initialProgressTimeout: NodeJS.Timeout | undefined;
+    let progressPoll: NodeJS.Timeout | undefined;
     const finish = (callback: () => void): void => {
       if (settled) {
         return;
       }
       settled = true;
       clearTimeout(timeout);
+      if (initialProgressTimeout) {
+        clearTimeout(initialProgressTimeout);
+      }
+      if (progressPoll) {
+        clearInterval(progressPoll);
+      }
       options.abortSignal?.removeEventListener("abort", abort);
       callback();
     };
@@ -340,13 +471,62 @@ function runProcess(command: string, args: string[], options: ProcessOptions): P
       }, 2_000).unref();
     };
     const abort = (): void => {
+      requestedError = new Error("Agent Harness 已被暂停或取消。");
       terminate();
-      finish(() => reject(new Error("Agent Harness 已被暂停或取消。")));
     };
-    const timeout = setTimeout(() => {
+    const requestProgressTermination = (reason: ProcessTerminationReason): void => {
+      if (requestedTermination || requestedError || settled) {
+        return;
+      }
+      requestedTermination = reason;
       terminate();
-      finish(() => reject(new Error(`Claude CLI 执行超过 ${Math.round(options.timeoutMs / 60_000)} 分钟，已终止。`)));
+    };
+    timeout = setTimeout(() => {
+      if (hasRecordedProgress(options.progress?.operationLogPath)) {
+        requestProgressTermination("timeout_with_progress");
+        return;
+      }
+      requestedError = new Error(`Claude CLI 执行超过 ${Math.round(options.timeoutMs / 60_000)} 分钟且没有产生工具写入，已终止。`);
+      terminate();
     }, options.timeoutMs);
+    const progress = options.progress;
+    if (progress) {
+      initialProgressTimeout = setTimeout(() => {
+        if (progressDetected || hasRecordedProgress(progress.operationLogPath)) {
+          return;
+        }
+        requestedError = new Error(
+          `Claude CLI 在 ${Math.round(progress.initialProgressTimeoutMs / 60_000)} 分钟内没有产生工具写入，已停止本轮。`
+        );
+        terminate();
+      }, progress.initialProgressTimeoutMs);
+      progressPoll = setInterval(() => {
+        const signature = progressSignature(progress.operationLogPath);
+        if (signature && signature !== lastProgressSignature) {
+          lastProgressSignature = signature;
+          lastProgressAt = Date.now();
+          progressDetected = true;
+          if (initialProgressTimeout) {
+            clearTimeout(initialProgressTimeout);
+            initialProgressTimeout = undefined;
+          }
+        }
+        if (!progressDetected || lastProgressAt === 0) {
+          return;
+        }
+        const elapsed = Date.now() - lastProgressAt;
+        if (expectedOutputsExist(progress)) {
+          if (elapsed >= progress.settleAfterExpectedOutputsMs) {
+            requestProgressTermination("expected_outputs_materialized");
+          }
+          return;
+        }
+        if (elapsed >= progress.idleAfterProgressMs) {
+          requestProgressTermination("idle_after_progress");
+        }
+      }, Math.min(500, Math.max(25, Math.round(progress.settleAfterExpectedOutputsMs / 2))));
+      progressPoll.unref();
+    }
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => {
@@ -358,8 +538,20 @@ function runProcess(command: string, args: string[], options: ProcessOptions): P
     child.once("error", (error) => finish(() => reject(error)));
     child.once("close", (code, signal) => {
       finish(() => {
+        if (requestedError) {
+          reject(requestedError);
+          return;
+        }
+        if (requestedTermination) {
+          resolve({ stdout, stderr, terminationReason: requestedTermination });
+          return;
+        }
         if (code === 0) {
           resolve({ stdout, stderr });
+          return;
+        }
+        if (hasRecordedProgress(options.progress?.operationLogPath)) {
+          resolve({ stdout, stderr, terminationReason: "process_exit_with_progress" });
           return;
         }
         reject(new Error(`Claude CLI 退出异常（code=${code ?? "null"}, signal=${signal ?? "none"}）：${compactProcessError(stderr || stdout)}`));
@@ -372,6 +564,22 @@ function runProcess(command: string, args: string[], options: ProcessOptions): P
     }
     child.stdin.end(options.stdin ?? "");
   });
+}
+
+function progressSignature(path: string | undefined): string {
+  if (!path || !existsSync(path)) {
+    return "";
+  }
+  const stats = statSync(path);
+  return stats.isFile() && stats.size > 0 ? `${stats.size}:${stats.mtimeMs}` : "";
+}
+
+function hasRecordedProgress(path: string | undefined): boolean {
+  return Boolean(progressSignature(path));
+}
+
+function expectedOutputsExist(progress: NonNullable<ProcessOptions["progress"]>): boolean {
+  return progress.expectedPaths.length > 0 && progress.expectedPaths.every((path) => existsSync(join(progress.projectRoot, path)));
 }
 
 function compactProcessError(value: string): string {

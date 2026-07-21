@@ -7,8 +7,10 @@ import type {
   TaskId
 } from "@game-pipeline/shared-schemas";
 import type { StudioKernel } from "@game-pipeline/agent-runtime";
-import { ModelAgentRuntime } from "./modelAgentRuntime.js";
+import { finalizeTaskSessionProtocol, ModelAgentRuntime } from "./modelAgentRuntime.js";
 import { executeAgentToolRequests, type ToolExecutionResult } from "./toolExecutor.js";
+import { taskOutputsVerified } from "./taskOutputEvidence.js";
+import { resumeQaTasksAfterVerifiedRepairs } from "./qaRepairFlow.js";
 
 export interface AgentLoopWakeOptions {
   reason: string;
@@ -135,6 +137,7 @@ export class AgentLoopService {
           unlockRetryableAgentFailures(kernel);
           options = { ...options, unlockRetryableFailures: false };
         }
+        resumeQaTasksAfterVerifiedRepairs(kernel);
         advanceVerifiedTasksToReview(kernel);
 
         const candidates = selectRunnableTasks(kernel, options.preferredAgentIds).slice(0, maxParallelAgents);
@@ -156,6 +159,11 @@ export class AgentLoopService {
           updatedAt: now
         });
         for (const task of candidates) {
+          kernel.updateTask(task.taskId, {
+            status: "doing",
+            progressPercent: Math.max(5, task.progressPercent ?? 0),
+            updatedAt: now
+          });
           kernel.updateAgentLoopAgent(task.ownerAgentId, {
             status: "working",
             taskId: task.taskId,
@@ -184,7 +192,7 @@ export class AgentLoopService {
         for (const message of messages) {
           kernel.recordMessage(message);
         }
-        executeAgentToolRequests(kernel, messages);
+        await executeAgentToolRequests(kernel, messages);
         this.dependencies.checkpoint(kernel);
 
         for (let index = 0; index < candidates.length; index += 1) {
@@ -192,6 +200,7 @@ export class AgentLoopService {
           const message = messages[index];
           if (task && message) {
             applyTaskOutcome(kernel, task, message, noProgressCounts, failureCounts);
+            finalizeTaskSessionProtocol(kernel, kernel.findTask(task.taskId) ?? task, message);
           }
         }
         advanceVerifiedTasksToReview(kernel);
@@ -281,19 +290,6 @@ function inputArtifactsVerified(kernel: StudioKernel, task: Task): boolean {
   });
 }
 
-function taskOutputsVerified(kernel: StudioKernel, task: Task): boolean {
-  if (task.outputArtifacts.length === 0) {
-    return false;
-  }
-  const artifacts = kernel.listArtifacts();
-  const ledger = kernel.listArtifactLedger();
-  return task.outputArtifacts.every((artifactId) => {
-    const artifact = artifacts.find((candidate) => candidate.artifactId === artifactId);
-    const evidence = ledger.find((candidate) => candidate.artifactId === artifactId);
-    return Boolean(artifact?.metadata.toolExecutedAt && evidence?.status === "verified");
-  });
-}
-
 function advanceVerifiedTasksToReview(kernel: StudioKernel): void {
   for (const task of kernel.listTasks()) {
     if (
@@ -374,13 +370,37 @@ function applyTaskOutcome(
   const now = new Date().toISOString();
 
   if (message.metadata.failure === true) {
-    retryTransientFailure(kernel, task, message, failureCounts, message.content);
+    const retryLimit = message.metadata.failureKind === "harness_timeout_no_progress" ? 2 : maxTransientFailures;
+    retryTransientFailure(kernel, task, message, failureCounts, message.content, retryLimit);
     return;
   }
 
   if (failedTools.length > 0) {
     const error = failedTools.map((result) => `${result.toolName}: ${result.error ?? "未知错误"}`).join("；");
     retryTransientFailure(kernel, task, message, failureCounts, `工具执行失败：${error}`);
+    return;
+  }
+
+  const currentTask = kernel.findTask(task.taskId) ?? task;
+  const qaFailureBlocker = currentTask.blockers.find((blocker) => blocker.startsWith("QA_PLAYTEST_FAILED:"));
+  if (currentTask.status === "blocked" && qaFailureBlocker) {
+    kernel.updateAgentLoopAgent(task.ownerAgentId, {
+      status: "blocked",
+      taskId: task.taskId,
+      lastMessageId: message.messageId,
+      lastError: qaFailureBlocker,
+      updatedAt: now
+    });
+    return;
+  }
+  if (["review", "done"].includes(currentTask.status) && taskOutputsVerified(kernel, currentTask)) {
+    kernel.updateAgentLoopAgent(task.ownerAgentId, {
+      status: "waiting",
+      taskId: task.taskId,
+      lastMessageId: message.messageId,
+      lastError: undefined,
+      updatedAt: now
+    });
     return;
   }
 
@@ -519,12 +539,13 @@ function retryTransientFailure(
   task: Task,
   message: StudioMessage,
   failureCounts: Map<TaskId, number>,
-  error: string
+  error: string,
+  retryLimit = maxTransientFailures
 ): void {
   const failureCount = (failureCounts.get(task.taskId) ?? 0) + 1;
   failureCounts.set(task.taskId, failureCount);
   const now = new Date().toISOString();
-  if (failureCount < maxTransientFailures) {
+  if (failureCount < retryLimit) {
     kernel.updateTask(task.taskId, {
       status: "doing",
       blockers: task.blockers.filter((blocker) => !blocker.startsWith(loopBlockerPrefix)),
@@ -534,7 +555,7 @@ function retryTransientFailure(
       status: "queued",
       taskId: task.taskId,
       lastMessageId: message.messageId,
-      lastError: `${error}（自动重试 ${failureCount}/${maxTransientFailures}）`,
+      lastError: `${error}（自动重试 ${failureCount}/${retryLimit}）`,
       updatedAt: now
     });
     return;

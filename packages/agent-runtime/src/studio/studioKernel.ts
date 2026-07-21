@@ -2,17 +2,20 @@ import type {
   AgentLoopAgentState,
   AgentLoopState,
   AgentId,
+  AgentSessionRecord,
   Artifact,
   ArtifactLedgerEntry,
   ArtifactOperation,
   AuditEvent,
   ClaimRepair,
   ClaimVerification,
+  ContextPacket,
   MemoryRecord,
   Project,
   ProjectId,
   Room,
   RoomKind,
+  SessionHandoffCapsule,
   StageId,
   StudioMessage,
   Task,
@@ -37,13 +40,19 @@ export interface StudioKernelState {
   artifactLedger: ArtifactLedgerEntry[];
   claimVerifications: ClaimVerification[];
   claimRepairs: ClaimRepair[];
+  agentSessions: AgentSessionRecord[];
+  contextPackets: ContextPacket[];
+  handoffCapsules: SessionHandoffCapsule[];
 }
 
-export interface StudioKernelSnapshot extends StudioKernelState {
+export interface StudioKernelSnapshot extends Omit<StudioKernelState, "agentSessions" | "contextPackets" | "handoffCapsules"> {
   version: 1;
   savedAt: string;
   memoryRecords: MemoryRecord[];
   auditEvents: AuditEvent[];
+  agentSessions?: AgentSessionRecord[];
+  contextPackets?: ContextPacket[];
+  handoffCapsules?: SessionHandoffCapsule[];
 }
 
 type AgentLoopUpdateFields = {
@@ -85,7 +94,10 @@ export class StudioKernel {
       artifactOperations: restoredState.artifactOperations ?? [],
       artifactLedger: restoredState.artifactLedger ?? [],
       claimVerifications: restoredState.claimVerifications ?? [],
-      claimRepairs: restoredState.claimRepairs ?? []
+      claimRepairs: restoredState.claimRepairs ?? [],
+      agentSessions: restoredState.agentSessions ?? [],
+      contextPackets: restoredState.contextPackets ?? [],
+      handoffCapsules: restoredState.handoffCapsules ?? []
     };
   }
 
@@ -731,6 +743,78 @@ export class StudioKernel {
     };
   }
 
+  listAgentSessions(): AgentSessionRecord[] {
+    return this.state.agentSessions.map(cloneAgentSession);
+  }
+
+  findAgentSession(sessionKey: string): AgentSessionRecord | undefined {
+    const session = this.state.agentSessions.find((candidate) => candidate.sessionKey === sessionKey);
+    return session ? cloneAgentSession(session) : undefined;
+  }
+
+  findActiveAgentSession(logicalSessionKey: string): AgentSessionRecord | undefined {
+    const session = this.state.agentSessions
+      .filter((candidate) => candidate.logicalSessionKey === logicalSessionKey && candidate.status !== "sealed")
+      .sort((left, right) => right.epoch - left.epoch)[0];
+    return session ? cloneAgentSession(session) : undefined;
+  }
+
+  upsertAgentSession(session: AgentSessionRecord): AgentSessionRecord {
+    const index = this.state.agentSessions.findIndex((candidate) => candidate.sessionKey === session.sessionKey);
+    const next = cloneAgentSession(session);
+    if (index === -1) {
+      this.state.agentSessions.push(next);
+    } else {
+      this.state.agentSessions[index] = next;
+    }
+    return cloneAgentSession(next);
+  }
+
+  recordContextPacket(packet: ContextPacket): ContextPacket {
+    const index = this.state.contextPackets.findIndex((candidate) => candidate.packetId === packet.packetId);
+    const next = cloneContextPacket(packet);
+    if (index === -1) {
+      this.state.contextPackets.push(next);
+    } else {
+      this.state.contextPackets[index] = next;
+    }
+    if (this.state.contextPackets.length > 200) {
+      this.state.contextPackets.splice(0, this.state.contextPackets.length - 200);
+    }
+    return cloneContextPacket(next);
+  }
+
+  listContextPackets(sessionKey?: string): ContextPacket[] {
+    return this.state.contextPackets
+      .filter((packet) => !sessionKey || packet.sessionKey === sessionKey)
+      .map(cloneContextPacket);
+  }
+
+  recordHandoffCapsule(capsule: SessionHandoffCapsule): SessionHandoffCapsule {
+    const existing = this.state.handoffCapsules.find((candidate) => candidate.capsuleId === capsule.capsuleId);
+    if (existing) {
+      return cloneHandoffCapsule(existing);
+    }
+    const next = cloneHandoffCapsule(capsule);
+    this.state.handoffCapsules.push(next);
+    return cloneHandoffCapsule(next);
+  }
+
+  listHandoffCapsules(sessionKey?: string): SessionHandoffCapsule[] {
+    return this.state.handoffCapsules
+      .filter((capsule) => !sessionKey || capsule.targetSessionKeys.includes(sessionKey) || capsule.sourceSessionKey === sessionKey)
+      .map(cloneHandoffCapsule);
+  }
+
+  consumeHandoffCapsules(sessionKey: string, capsuleIds: string[]): void {
+    const selected = new Set(capsuleIds);
+    for (const capsule of this.state.handoffCapsules) {
+      if (selected.has(capsule.capsuleId) && !capsule.consumedBySessionKeys.includes(sessionKey)) {
+        capsule.consumedBySessionKeys.push(sessionKey);
+      }
+    }
+  }
+
   listMessages(): StudioMessage[] {
     return [...this.state.messages];
   }
@@ -753,6 +837,9 @@ export class StudioKernel {
       artifactLedger: this.state.artifactLedger,
       claimVerifications: this.state.claimVerifications,
       claimRepairs: this.state.claimRepairs,
+      agentSessions: this.state.agentSessions,
+      contextPackets: this.state.contextPackets,
+      handoffCapsules: this.state.handoffCapsules,
       memoryRecords: this.memory.list(this.state.project.projectId),
       auditEvents: this.auditLog.list(this.state.project.projectId)
     };
@@ -904,6 +991,9 @@ export function createStudioKernelFromSnapshot(snapshot: StudioKernelSnapshot): 
     artifactLedger: snapshot.artifactLedger,
     claimVerifications: snapshot.claimVerifications,
     claimRepairs: snapshot.claimRepairs,
+    agentSessions: snapshot.agentSessions ?? [],
+    contextPackets: snapshot.contextPackets ?? [],
+    handoffCapsules: snapshot.handoffCapsules ?? [],
     memoryRecords: snapshot.memoryRecords,
     auditEvents: snapshot.auditEvents
   });
@@ -940,5 +1030,42 @@ function cloneRoom(room: Room): Room {
     ...room,
     participants: [...room.participants],
     routingPolicy: { ...room.routingPolicy }
+  };
+}
+
+function cloneAgentSession(session: AgentSessionRecord): AgentSessionRecord {
+  return {
+    ...session,
+    cursor: { ...session.cursor },
+    ...(session.contextHealth
+      ? { contextHealth: { ...session.contextHealth, reasons: [...session.contextHealth.reasons] } }
+      : {}),
+    incomingCapsuleIds: [...session.incomingCapsuleIds],
+    outgoingCapsuleIds: [...session.outgoingCapsuleIds]
+  };
+}
+
+function cloneContextPacket(packet: ContextPacket): ContextPacket {
+  return {
+    ...packet,
+    cursorBefore: { ...packet.cursorBefore },
+    cursorAfter: { ...packet.cursorAfter },
+    layers: packet.layers.map((layer) => ({ ...layer, sourceRefs: [...layer.sourceRefs] })),
+    health: { ...packet.health, reasons: [...packet.health.reasons] }
+  };
+}
+
+function cloneHandoffCapsule(capsule: SessionHandoffCapsule): SessionHandoffCapsule {
+  return {
+    ...capsule,
+    targetSessionKeys: [...capsule.targetSessionKeys],
+    targetAgentIds: [...capsule.targetAgentIds],
+    messageIds: [...capsule.messageIds],
+    artifactIds: [...capsule.artifactIds],
+    changedPaths: [...capsule.changedPaths],
+    consumedBySessionKeys: [...capsule.consumedBySessionKeys],
+    ...(capsule.contextHealth
+      ? { contextHealth: { ...capsule.contextHealth, reasons: [...capsule.contextHealth.reasons] } }
+      : {})
   };
 }

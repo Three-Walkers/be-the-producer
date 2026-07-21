@@ -71,6 +71,7 @@ let activeCalls = 0;
 let maximumConcurrency = 0;
 let modelCallCount = 0;
 let responseDelayMs = 40;
+let forcedFailureKind;
 const fakeModelRuntime = {
   async respondToTask(currentKernel, task, input) {
     activeCalls += 1;
@@ -78,6 +79,27 @@ const fakeModelRuntime = {
     maximumConcurrency = Math.max(maximumConcurrency, activeCalls);
     await new Promise((resolve) => setTimeout(resolve, responseDelayMs));
     activeCalls -= 1;
+
+    if (forcedFailureKind) {
+      return {
+        messageId: `msg_${task.ownerAgentId}_failure_${modelCallCount}`,
+        projectId,
+        roomId: task.roomId ?? currentKernel.getRoom("studio-main").roomId,
+        senderType: "agent",
+        senderId: task.ownerAgentId,
+        messageType: "blocker",
+        content: "Harness 没有产生工具写入。",
+        mentions: [],
+        relatedTaskIds: [task.taskId],
+        relatedArtifactIds: [],
+        metadata: {
+          failure: true,
+          failureKind: forcedFailureKind,
+          loopIteration: input.iteration
+        },
+        createdAt: new Date().toISOString()
+      };
+    }
 
     const artifactId = task.outputArtifacts[0];
     const artifact = currentKernel.listArtifacts().find((candidate) => candidate.artifactId === artifactId);
@@ -172,6 +194,38 @@ assert.equal(
   "暂停后迟到的模型结果不得写入产物"
 );
 
+kernel.addTask({
+  taskId: "task_harness_no_progress",
+  projectId,
+  stageId: "concept_discussion",
+  roomId: kernel.getRoom("design-room").roomId,
+  parentTaskId: "task_group_stage_1",
+  taskLevel: "task",
+  title: "验证无进展 Harness 重试上限",
+  description: "模拟 Claude CLI 没有调用任何工具。",
+  ownerAgentId: "game_designer",
+  participantAgentIds: [],
+  status: "doing",
+  priority: 200,
+  sortOrder: 5,
+  progressPercent: 0,
+  blockers: [],
+  inputArtifacts: [],
+  outputArtifacts: [],
+  acceptanceCriteria: ["两次无进展后停止自动重试"],
+  createdAt: new Date().toISOString(),
+  updatedAt: new Date().toISOString()
+});
+forcedFailureKind = "harness_timeout_no_progress";
+responseDelayMs = 0;
+const callsBeforeNoProgressFailure = modelCallCount;
+service.start(projectId, { reason: "no-progress retry limit smoke" });
+await waitFor(() => kernel.getAgentLoopState().status !== "running", 4_000);
+assert.equal(modelCallCount - callsBeforeNoProgressFailure, 2, "无工具进展的 Harness 超时最多自动尝试两次");
+assert.equal(kernel.findTask("task_harness_no_progress")?.status, "blocked");
+assert.match(kernel.findTask("task_harness_no_progress")?.blockers.join("；") ?? "", /连续失败 2 次/);
+forcedFailureKind = undefined;
+
 const toolMessages = [
   createToolMessage("asset_production", {
     loopControl: { status: "continue", reason: "继续生成配套资产。", handoffAgentIds: [] },
@@ -200,7 +254,7 @@ const toolMessages = [
     ]
   })
 ];
-const directToolResults = executeAgentToolRequests(kernel, toolMessages);
+const directToolResults = await executeAgentToolRequests(kernel, toolMessages);
 syncProjectWorkspace(kernel);
 assert.deepEqual(directToolResults.map((result) => result.status), ["completed", "completed", "completed"]);
 assert.ok(existsSync(join(process.env.STUDIO_WORKSPACE_ROOT, projectId, "assets/art/smoke-ball.svg")));
