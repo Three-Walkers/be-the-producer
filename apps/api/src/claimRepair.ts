@@ -20,7 +20,7 @@ export function reconcileClaimRepairs(kernel: StudioKernel): ClaimRepair[] {
   const claims = kernel.listClaimVerifications();
 
   for (const claim of claims) {
-    if (claim.verdict === "verified") {
+    if (claim.verdict === "verified" || claim.claimType === "path_reference") {
       continue;
     }
 
@@ -48,7 +48,7 @@ function openOrUpdateRepair(kernel: StudioKernel, claim: ClaimVerification): Cla
     return undefined;
   }
 
-  const repairId = repairIdForClaim(claim.claimId);
+  const repairId = repairIdForClaim(claim);
   const taskId = taskIdForRepair(repairId);
   const nearestArtifactPath = stringMetadata(claim.metadata, "nearestArtifactPath");
   const action: ClaimRepairAction = nearestArtifactPath ? "correct_claim" : "supply_evidence";
@@ -127,12 +127,9 @@ function resolveRepairIfEvidenceAppeared(kernel: StudioKernel, repair: ClaimRepa
 }
 
 function findCorrectiveVerifiedClaim(kernel: StudioKernel, repair: ClaimRepair): ClaimVerification | undefined {
-  if (!repair.nearestArtifactPath) {
-    return undefined;
-  }
-
   const sourceMessage = kernel.listMessages().find((message) => message.messageId === repair.messageId);
   const sourceTime = sourceMessage ? new Date(sourceMessage.createdAt).getTime() : 0;
+  const targetPaths = [repair.claimedPath, repair.nearestArtifactPath].filter((path): path is string => Boolean(path));
   return kernel
     .listClaimVerifications()
     .filter(
@@ -140,7 +137,12 @@ function findCorrectiveVerifiedClaim(kernel: StudioKernel, repair: ClaimRepair):
         claim.claimId !== repair.claimId &&
         claim.agentId === repair.agentId &&
         claim.verdict === "verified" &&
-        claim.claimedPath === repair.nearestArtifactPath &&
+        (targetPaths.length > 0
+          ? Boolean(claim.claimedPath && targetPaths.includes(claim.claimedPath))
+          : sameArtifactSet(
+              claim.relatedArtifactIds,
+              kernel.listClaimVerifications().find((candidate) => candidate.claimId === repair.claimId)?.relatedArtifactIds ?? []
+            )) &&
         new Date(kernel.listMessages().find((message) => message.messageId === claim.messageId)?.createdAt ?? claim.checkedAt).getTime() >= sourceTime
     )
     .sort((left, right) => right.checkedAt.localeCompare(left.checkedAt))[0];
@@ -329,7 +331,8 @@ function writeRepairMessageOnce(
       generatedBy: "claim_repair_guardian",
       repairId: input.repair.repairId,
       repairMessage: input.marker,
-      sourceClaimId: input.repair.claimId
+      sourceClaimId: input.repair.claimId,
+      claimRepairProtocolVersion: 2
     },
     createdAt: now
   });
@@ -404,8 +407,11 @@ function repairNextStep(repair: ClaimRepair): string {
   return `${repair.agentId} 必须通过 write_artifact / append_document 工具写入声明产物并生成 artifact ledger 证据，或明确撤回该完成类声明。`;
 }
 
-function repairIdForClaim(claimId: string): string {
-  return `repair_${claimId}`;
+function repairIdForClaim(claim: ClaimVerification): string {
+  const artifactTarget = [...claim.relatedArtifactIds].sort().join(",");
+  const target = claim.claimedPath ?? (artifactTarget || claim.claimType);
+  const signature = `${claim.agentId}:${claim.claimType}:${target}`;
+  return `repair_${createHash("sha1").update(signature).digest("hex").slice(0, 16)}`;
 }
 
 function taskIdForRepair(repairId: string): string {
@@ -419,4 +425,8 @@ function hashNumber(value: string, modulo: number): number {
 function stringMetadata(metadata: Record<string, unknown>, key: string): string | undefined {
   const value = metadata[key];
   return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+function sameArtifactSet(left: string[], right: string[]): boolean {
+  return [...left].sort().join("|") === [...right].sort().join("|");
 }

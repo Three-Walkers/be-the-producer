@@ -4,9 +4,11 @@ import { spawn } from "node:child_process";
 import { dirname } from "node:path";
 import { verifyProjectClaims } from "./claimVerifier.js";
 import { reconcileClaimRepairs } from "./claimRepair.js";
+import { migrateLegacyClaimRepairStorm } from "./claimRepairMigration.js";
 import { AgentLoopService } from "./agentLoop.js";
 import { ModelAgentRuntime } from "./modelAgentRuntime.js";
 import { ProjectPersistenceStore, type ProjectSummary } from "./projectPersistence.js";
+import { reconcileQaPlaytestResults } from "./qaResultIngestion.js";
 import { executeAgentToolRequests } from "./toolExecutor.js";
 import {
   deleteProjectWorkspace,
@@ -52,12 +54,15 @@ export class StudioProjectStore {
       modelRuntime: this.modelRuntime
     });
     const resumableProjectIds: string[] = [];
-    for (const kernel of this.persistence.loadAll()) {
+    for (const persistedKernel of this.persistence.loadAll()) {
+      const migration = migrateLegacyClaimRepairStorm(persistedKernel);
+      const kernel = migration.kernel;
+      const runtimeAssetTaskReopened = migrateRuntimeAssetPipeline(kernel);
       this.projects.set(kernel.project.projectId, kernel);
       this.checkpointKernel(kernel);
       if (
         kernel.project.executionStatus === "running" &&
-        ["idle", "running", "blocked", "error"].includes(kernel.getAgentLoopState().status)
+        (["idle", "running", "blocked", "error"].includes(kernel.getAgentLoopState().status) || runtimeAssetTaskReopened)
       ) {
         resumableProjectIds.push(kernel.project.projectId);
       }
@@ -318,7 +323,7 @@ export class StudioProjectStore {
       const modelResult = await this.modelRuntime.respond(kernel, message, result.routePlan);
       result.agentMessages.push(...modelResult.agentMessages);
     }
-    executeAgentToolRequests(kernel, result.agentMessages);
+    await executeAgentToolRequests(kernel, result.agentMessages);
     const workspace = this.checkpointKernel(kernel);
     this.agentLoop.start(projectId, {
       reason: `制作人消息唤醒 Agent Loop：${message.messageId}`,
@@ -421,22 +426,73 @@ export class StudioProjectStore {
   }
 
   private loadProject(projectId: string): StudioKernel | undefined {
-    const kernel = this.persistence.load(projectId);
-    if (kernel) {
+    const persistedKernel = this.persistence.load(projectId);
+    if (persistedKernel) {
+      const kernel = migrateLegacyClaimRepairStorm(persistedKernel).kernel;
+      migrateRuntimeAssetPipeline(kernel);
       this.projects.set(projectId, kernel);
       syncProjectWorkspace(kernel);
+      return kernel;
     }
-    return kernel;
+    return undefined;
   }
 
   private checkpointKernel(kernel: StudioKernel): WorkspaceSyncResult {
+    const qaIngestion = reconcileQaPlaytestResults(kernel);
     let workspace = syncProjectWorkspace(kernel);
     verifyProjectClaims(kernel);
     reconcileClaimRepairs(kernel);
     workspace = syncProjectWorkspace(kernel);
     this.persistence.save(kernel);
+    if (qaIngestion.queuedAgentIds.length > 0 && kernel.project.executionStatus === "running") {
+      queueMicrotask(() => {
+        this.agentLoop.start(kernel.project.projectId, {
+          reason: `QA 真实试玩失败已回流：${qaIngestion.failedOperationIds.join("、")}`,
+          preferredAgentIds: qaIngestion.queuedAgentIds
+        });
+      });
+    }
     return workspace;
   }
+}
+
+function migrateRuntimeAssetPipeline(kernel: StudioKernel): boolean {
+  const task = kernel.findTask("task_stage_2_asset_pipeline");
+  if (!task) {
+    return false;
+  }
+  const criteria = [
+    "asset manifest 存在且 runtimePath 指向 PNG",
+    "每个 SVG 源资产都有经工具验证的同名 PNG",
+    "关键资产符合 Art Bible"
+  ];
+  const artifacts = kernel.listArtifacts();
+  const ledger = kernel.listArtifactLedger();
+  const sourcePaths = task.outputArtifacts
+    .map((artifactId) => artifacts.find((artifact) => artifact.artifactId === artifactId)?.path)
+    .filter((path): path is string => Boolean(path?.toLowerCase().endsWith(".svg")));
+  const missingRuntimePng = sourcePaths.some((sourcePath) => {
+    const runtimePath = sourcePath.replace(/\.svg$/i, ".png");
+    const artifact = artifacts.find((candidate) => candidate.path === runtimePath);
+    const evidence = artifact ? ledger.find((entry) => entry.artifactId === artifact.artifactId) : undefined;
+    return !artifact?.metadata.toolExecutedAt || evidence?.status !== "verified";
+  });
+  const fields: Parameters<StudioKernel["updateTask"]>[1] = {
+    description: "根据 Art Bible 生成 SVG 源资产，渲染 Cocos 可直接导入的透明 PNG，并维护 asset manifest。",
+    acceptanceCriteria: criteria
+  };
+  const requiresRuntimePngWork = sourcePaths.length > 0 && missingRuntimePng;
+  if (requiresRuntimePngWork && ["review", "done"].includes(task.status)) {
+    fields.status = "doing";
+    fields.progressPercent = Math.min(task.progressPercent ?? 80, 80);
+    fields.blockers = task.blockers.filter((blocker) => !/Claude CLI.*(超时|没有产生工具写入)/i.test(blocker));
+  }
+  const criteriaChanged = task.acceptanceCriteria.join("\n") !== criteria.join("\n");
+  if (criteriaChanged || fields.status) {
+    fields.updatedAt = new Date().toISOString();
+    kernel.updateTask(task.taskId, fields);
+  }
+  return requiresRuntimePngWork && (task.status === "doing" || fields.status === "doing");
 }
 
 const mentionAliases: Record<string, string[]> = {

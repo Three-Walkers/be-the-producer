@@ -6,6 +6,9 @@ import { artifactFilePath, resolveWorkspacePathTarget } from "./workspaceWriter.
 
 const completionClaimPattern =
   /(已完成|已经完成|完成了|已生成|已经生成|已更新|已经更新|已提交|已经提交|已创建|已经创建|已写入|已经写入|写入了|已固化|已经固化)/;
+const artifactCompletionPattern =
+  /(产物|文件|文档|报告|代码|脚本|资产|构建|清单|manifest|artifact)/i;
+const claimVerificationExcludedGenerators = new Set(["claim_repair_guardian"]);
 
 const workspacePathPattern =
   /(?:\.\/)?(?:agents|shared|docs|assets|artifacts|outputs|builds|release|releases|intermediate|cocos|settings|workspace)\/[A-Za-z0-9._~@%+\-/]+|(?:\.\/)?[A-Za-z0-9._~@%+-]+\/[A-Za-z0-9._~@%+\-/]*[A-Za-z0-9._~@%+-]\.[A-Za-z0-9]{2,10}/g;
@@ -13,7 +16,8 @@ const workspacePathPattern =
 export function verifyProjectClaims(kernel: StudioKernel): ClaimVerification[] {
   const verifiedClaims: ClaimVerification[] = [];
   for (const message of kernel.listMessages()) {
-    if (message.senderType !== "agent") {
+    if (message.senderType !== "agent" || shouldSkipClaimVerification(message)) {
+      kernel.setMessageClaimVerifications(message.messageId, []);
       continue;
     }
 
@@ -36,11 +40,15 @@ function verifyMessageClaims(kernel: StudioKernel, message: StudioMessage): Clai
 
   if (paths.length > 0) {
     for (const path of paths) {
-      claims.push(verifyPathClaim(kernel, message, path, hasCompletionClaim ? "artifact_written" : "path_reference"));
+      claims.push(verifyPathClaim(kernel, message, path.path, path.completionClaim ? "artifact_written" : "path_reference"));
     }
   }
 
-  if (hasCompletionClaim && paths.length === 0) {
+  if (
+    hasCompletionClaim &&
+    paths.length === 0 &&
+    (relatedArtifactIds.length > 0 || artifactCompletionPattern.test(message.content))
+  ) {
     claims.push(verifyCompletionClaim(kernel, message, relatedArtifactIds));
   }
 
@@ -76,6 +84,24 @@ function verifyPathClaim(
       });
     }
 
+    if (claimType === "path_reference") {
+      return buildClaim(kernel, message, {
+        claimType,
+        claimedPath: normalizedPath,
+        relatedArtifactIds: artifactIds,
+        verdict: "verified",
+        reason: `${normalizedPath} 路径引用存在。`,
+        evidenceRefs: ledger ? [ledger.sourceOperationId] : [],
+        resolver: "filesystem",
+        checkedAt,
+        metadata: {
+          pathType: target.type,
+          sizeBytes: target.sizeBytes,
+          referenceOnly: true
+        }
+      });
+    }
+
     if (!ledger) {
       return buildClaim(kernel, message, {
         claimType,
@@ -93,7 +119,7 @@ function verifyPathClaim(
       });
     }
 
-    if (ledger.ownerAgentId !== message.senderId) {
+    if (ledger.ownerAgentId !== message.senderId && !canReportDelegatedEvidence(message)) {
       return buildClaim(kernel, message, {
         claimType,
         claimedPath: normalizedPath,
@@ -149,7 +175,10 @@ function verifyPathClaim(
       claimedPath: normalizedPath,
       relatedArtifactIds: [ledger.artifactId],
       verdict: "verified",
-      reason: `${normalizedPath} 已由 ${message.senderId} 的 artifact 写入工具物化，hash/size 已登记。`,
+      reason:
+        ledger.ownerAgentId === message.senderId
+          ? `${normalizedPath} 已由 ${message.senderId} 的 artifact 写入工具物化，hash/size 已登记。`
+          : `${normalizedPath} 已由 ${ledger.ownerAgentId} 的工具物化；总控 Agent 的项目状态转述已核对 ledger。`,
       evidenceRefs: [ledger.sourceOperationId, ledger.artifactId],
       resolver: "artifact_ledger",
       checkedAt,
@@ -225,7 +254,9 @@ function verifyCompletionClaim(kernel: StudioKernel, message: StudioMessage, rel
   }
 
   const existingLedgers = ledgers.filter((entry): entry is ArtifactLedgerEntry => entry !== undefined);
-  const wrongOwner = existingLedgers.filter((entry) => entry.ownerAgentId !== message.senderId);
+  const wrongOwner = existingLedgers.filter(
+    (entry) => entry.ownerAgentId !== message.senderId && !canReportDelegatedEvidence(message)
+  );
   if (wrongOwner.length > 0) {
     return buildClaim(kernel, message, {
       claimType: "completion",
@@ -312,16 +343,44 @@ function buildClaim(
   };
 }
 
-function extractWorkspacePaths(content: string): string[] {
-  const paths = new Set<string>();
+function extractWorkspacePaths(content: string): Array<{ path: string; completionClaim: boolean }> {
+  const paths = new Map<string, boolean>();
   const text = String(content ?? "");
   for (const match of text.matchAll(workspacePathPattern)) {
     const candidate = normalizeWorkspacePathCandidate(match[0]);
     if (candidate) {
-      paths.add(candidate);
+      const completionClaim = isCompletionClaimForOccurrence(text, match.index ?? 0);
+      paths.set(candidate, Boolean(paths.get(candidate)) || completionClaim);
     }
   }
-  return [...paths];
+  return [...paths].map(([path, completionClaim]) => ({ path, completionClaim }));
+}
+
+function isCompletionClaimForOccurrence(content: string, index: number): boolean {
+  const lineStart = content.lastIndexOf("\n", Math.max(0, index - 1)) + 1;
+  const lineEndCandidate = content.indexOf("\n", index);
+  const lineEnd = lineEndCandidate === -1 ? content.length : lineEndCandidate;
+  const line = content.slice(lineStart, lineEnd);
+  if (completionClaimPattern.test(line)) {
+    return true;
+  }
+
+  const previousLineEnd = Math.max(0, lineStart - 1);
+  const previousLineStart = content.lastIndexOf("\n", Math.max(0, previousLineEnd - 1)) + 1;
+  const previousLine = content.slice(previousLineStart, previousLineEnd).trim();
+  return completionClaimPattern.test(previousLine) && /(?:文件|产物|输出|清单|报告)[：:]?\s*$/.test(previousLine);
+}
+
+function shouldSkipClaimVerification(message: StudioMessage): boolean {
+  const generatedBy = message.metadata?.generatedBy;
+  if (typeof generatedBy === "string" && claimVerificationExcludedGenerators.has(generatedBy)) {
+    return true;
+  }
+  return generatedBy === "local_agent_runtime" && message.senderId === "studio_orchestrator";
+}
+
+function canReportDelegatedEvidence(message: StudioMessage): boolean {
+  return message.senderId === "studio_orchestrator";
 }
 
 function normalizeWorkspacePathCandidate(value: string): string | undefined {
