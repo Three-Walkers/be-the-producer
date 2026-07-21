@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { URL } from "node:url";
 import { modelSettingsStore, type SaveAgentModelAssignmentInput, type SaveModelProviderInput } from "./modelSettings.js";
 import { claudeCliHarness } from "./claudeCliHarness.js";
+import { cocosEngineSettingsStore, type SaveCocosEngineConfigInput } from "./cocosEngineSettings.js";
 import { HttpError, studioStore, type CreateProjectInput, type PostMessageInput } from "./store.js";
 
 const defaultPort = 8787;
@@ -103,7 +104,10 @@ export async function handleRequest(request: IncomingMessage, response: ServerRe
 
     const url = new URL(request.url ?? "/", "http://localhost");
 
-    if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/app.js" || url.pathname === "/styles.css")) {
+    if (
+      request.method === "GET" &&
+      (url.pathname === "/" || url.pathname === "/app.js" || url.pathname === "/dashboard-progress.js" || url.pathname === "/styles.css")
+    ) {
       await sendStatic(response, url.pathname === "/" ? "index.html" : url.pathname.slice(1));
       return;
     }
@@ -174,6 +178,28 @@ export async function handleRequest(request: IncomingMessage, response: ServerRe
       return;
     }
 
+    if (settingsRoute?.resource === "cocos-engine") {
+      if (request.method === "GET") {
+        sendJson(response, 200, { config: cocosEngineSettingsStore.getPublic() });
+        return;
+      }
+      if (request.method === "PUT") {
+        const input = await readJson<SaveCocosEngineConfigInput>(request);
+        sendJson(response, 200, { config: cocosEngineSettingsStore.save(input) });
+        return;
+      }
+    }
+
+    if (settingsRoute?.resource === "cocos-engine-detect" && request.method === "POST") {
+      sendJson(response, 200, { config: cocosEngineSettingsStore.autodetect() });
+      return;
+    }
+
+    if (settingsRoute?.resource === "cocos-engine-test" && request.method === "POST") {
+      sendJson(response, 200, { result: await cocosEngineSettingsStore.test() });
+      return;
+    }
+
     if (request.method === "GET" && url.pathname === "/projects") {
       sendJson(response, 200, { projects: studioStore.listProjects() });
       return;
@@ -225,6 +251,15 @@ export async function handleRequest(request: IncomingMessage, response: ServerRe
 
     if (request.method === "GET" && resource === "agent-loop") {
       sendJson(response, 200, { agentLoop: studioStore.getAgentLoopState(projectRoute.projectId) });
+      return;
+    }
+
+    if (request.method === "GET" && resource === "agent-sessions") {
+      sendJson(response, 200, {
+        sessions: kernel.listAgentSessions(),
+        contextPackets: kernel.listContextPackets(),
+        handoffCapsules: kernel.listHandoffCapsules()
+      });
       return;
     }
 

@@ -187,6 +187,47 @@
               <span>正在检测本机 Claude Code CLI。</span>
             </div>
           </section>
+          <section class="cocos-engine-section">
+            <div class="panel-heading">
+              <h2>Cocos Engine Bridge</h2>
+              <span id="cocos-engine-summary">未配置</span>
+            </div>
+            <form id="cocos-engine-form">
+              <label>
+                Creator 可执行文件
+                <input id="cocos-executable-path" autocomplete="off" placeholder="/Applications/CocosCreator/Creator/3.8.*/CocosCreator.app/Contents/MacOS/CocosCreator" />
+              </label>
+              <div class="cocos-engine-grid">
+                <label>
+                  Creator 版本
+                  <input id="cocos-engine-version" autocomplete="off" placeholder="3.8.x" />
+                </label>
+                <label>
+                  构建平台
+                  <select id="cocos-engine-platform">
+                    <option value="wechatgame">微信小游戏 (wechatgame)</option>
+                  </select>
+                </label>
+              </div>
+              <label>
+                构建配置（可选）
+                <input id="cocos-build-config-path" autocomplete="off" placeholder="相对项目根目录，或 Creator 导出的绝对 configPath" />
+              </label>
+              <label>
+                构建超时（分钟）
+                <input id="cocos-build-timeout" type="number" min="1" max="60" step="1" value="20" />
+              </label>
+              <div class="key-actions">
+                <button type="submit">保存引擎配置</button>
+                <button id="detect-cocos-engine" type="button">自动检测</button>
+                <button id="test-cocos-engine" type="button">测试 Creator</button>
+              </div>
+            </form>
+            <div id="cocos-engine-status" class="model-test-status idle">
+              <span class="test-light"></span>
+              <span>保存或自动检测 Creator 3.8 LTS 后可测试真实 CLI。</span>
+            </div>
+          </section>
           <section class="assignment-section">
             <div class="panel-heading">
               <h2>角色模型分配</h2>

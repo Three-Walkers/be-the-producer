@@ -1,3 +1,5 @@
+import { selectTeamTasks, summarizeTaskProgress, taskProgressPercent } from "/dashboard-progress.js";
+
 const state = {
   projectId: null,
   project: null,
@@ -13,6 +15,8 @@ const state = {
   modelAssignments: [],
   modelTestResults: {},
   harnessStatuses: [],
+  cocosEngine: null,
+  cocosEngineTestResult: null,
   pendingAgentResponses: [],
   roomSettingsKind: null,
   selectedModelProviderId: "dashscope"
@@ -142,6 +146,7 @@ const teamDefinitions = [
     teamId: "design",
     name: "策划团队",
     agents: ["game_designer", "producer"],
+    taskOwners: ["game_designer"],
     idle: "等待项目启动，启动后先进行立项、机制和第一可玩范围讨论。"
   },
   {
@@ -516,6 +521,82 @@ $("#test-claude-harness").addEventListener("click", async () => {
     renderHarnessStatus();
     showToast(response.result.message);
   } catch (error) {
+    showToast(error.message);
+  } finally {
+    button.disabled = false;
+    button.textContent = originalText;
+  }
+});
+
+$("#cocos-engine-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const button = $("#cocos-engine-form button[type='submit']");
+  const originalText = button.textContent;
+  button.disabled = true;
+  button.textContent = "保存中";
+  try {
+    const response = await request("/settings/cocos-engine", {
+      method: "PUT",
+      body: JSON.stringify({
+        executablePath: $("#cocos-executable-path").value.trim(),
+        version: $("#cocos-engine-version").value.trim(),
+        platform: $("#cocos-engine-platform").value,
+        buildConfigPath: $("#cocos-build-config-path").value.trim(),
+        timeoutMs: Math.max(1, Number($("#cocos-build-timeout").value) || 20) * 60 * 1000
+      })
+    });
+    state.cocosEngine = response.config;
+    state.cocosEngineTestResult = null;
+    renderCocosEngineSettings();
+    button.textContent = "已保存";
+  } catch (error) {
+    button.textContent = "失败";
+    showToast(error.message);
+  } finally {
+    setTimeout(() => {
+      button.disabled = false;
+      button.textContent = originalText;
+    }, 1200);
+  }
+});
+
+$("#detect-cocos-engine").addEventListener("click", async () => {
+  const button = $("#detect-cocos-engine");
+  const originalText = button.textContent;
+  button.disabled = true;
+  button.textContent = "检测中";
+  try {
+    const response = await request("/settings/cocos-engine-detect", { method: "POST" });
+    state.cocosEngine = response.config;
+    state.cocosEngineTestResult = null;
+    renderCocosEngineSettings();
+    showToast(`已检测到 Cocos Creator：${response.config.executablePath}`);
+  } catch (error) {
+    state.cocosEngineTestResult = { ok: false, message: error.message };
+    renderCocosEngineStatus();
+    showToast(error.message);
+  } finally {
+    button.disabled = false;
+    button.textContent = originalText;
+  }
+});
+
+$("#test-cocos-engine").addEventListener("click", async () => {
+  const button = $("#test-cocos-engine");
+  const originalText = button.textContent;
+  button.disabled = true;
+  button.textContent = "测试中";
+  try {
+    const response = await request("/settings/cocos-engine-test", { method: "POST" });
+    state.cocosEngineTestResult = response.result;
+    if (response.result.version && state.cocosEngine) {
+      state.cocosEngine.version = response.result.version;
+    }
+    renderCocosEngineSettings();
+    showToast(response.result.message);
+  } catch (error) {
+    state.cocosEngineTestResult = { ok: false, message: error.message };
+    renderCocosEngineStatus();
     showToast(error.message);
   } finally {
     button.disabled = false;
@@ -961,13 +1042,15 @@ function hideMentionSuggestions() {
 }
 
 async function loadModelProviders() {
-  const [settings, harnessSettings] = await Promise.all([
+  const [settings, harnessSettings, cocosSettings] = await Promise.all([
     request("/settings/model-providers"),
-    request("/settings/agent-harnesses")
+    request("/settings/agent-harnesses"),
+    request("/settings/cocos-engine")
   ]);
   state.modelProviders = settings.providers;
   state.modelAssignments = settings.assignments ?? [];
   state.harnessStatuses = harnessSettings.harnesses ?? [];
+  state.cocosEngine = cocosSettings.config ?? null;
   if (!state.modelProviders.some((provider) => provider.providerId === state.selectedModelProviderId)) {
     state.selectedModelProviderId = state.modelProviders[0]?.providerId ?? "openai";
   }
@@ -1025,6 +1108,45 @@ function renderModelSettings() {
   });
   renderAgentAssignments();
   renderHarnessStatus();
+  renderCocosEngineSettings();
+}
+
+function renderCocosEngineSettings() {
+  const config = state.cocosEngine;
+  if (!config) {
+    $("#cocos-engine-summary").textContent = "未加载";
+    return;
+  }
+  $("#cocos-executable-path").value = config.executablePath ?? "";
+  $("#cocos-engine-version").value = config.version ?? "3.8.x";
+  $("#cocos-engine-platform").value = config.platform ?? "wechatgame";
+  $("#cocos-build-config-path").value = config.buildConfigPath ?? "";
+  $("#cocos-build-timeout").value = String(Math.max(1, Math.round((config.timeoutMs ?? 1_200_000) / 60_000)));
+  $("#cocos-engine-summary").textContent = config.executableExists
+    ? `${config.version} · 已就绪`
+    : config.executablePath
+      ? "路径无效"
+      : "未配置";
+  renderCocosEngineStatus();
+}
+
+function renderCocosEngineStatus() {
+  const container = $("#cocos-engine-status");
+  const result = state.cocosEngineTestResult;
+  const config = state.cocosEngine;
+  if (result) {
+    container.className = `model-test-status ${result.ok ? "success" : "failure"}`;
+    const latency = result.latencyMs ? ` · ${result.latencyMs}ms` : "";
+    container.innerHTML = `<span class="test-light"></span><span>${escapeHtml(result.message)}${escapeHtml(latency)}</span>`;
+    return;
+  }
+  if (config?.executableExists) {
+    container.className = "model-test-status idle";
+    container.innerHTML = `<span class="test-light"></span><span>已找到 ${escapeHtml(config.executablePath)}，尚未启动真实 CLI 测试。</span>`;
+    return;
+  }
+  container.className = config?.executablePath ? "model-test-status failure" : "model-test-status idle";
+  container.innerHTML = `<span class="test-light"></span><span>${config?.executablePath ? `可执行文件不存在或不可执行：${escapeHtml(config.executablePath)}` : "未配置 Cocos Creator。Agent 构建会立即报告环境阻塞。"}</span>`;
 }
 
 function renderHarnessStatus() {
@@ -1869,12 +1991,12 @@ function renderTaskBoard() {
     .map((group) => `<section class="task-group">
       <div class="task-title">
         <span>${escapeHtml(group.title)}</span>
-        <span class="status-pill status-${escapeHtml(group.status)}">${escapeHtml(localStatus(group.status))}</span>
+        <span class="status-pill status-${escapeHtml(group.status)}">${escapeHtml(localStatus(group.status))} · ${taskProgressPercent(group)}%</span>
       </div>
       ${group.tasks
         .map((task) => `<div class="task-item">
           <strong>${escapeHtml(task.title)}</strong>
-          <div>${escapeHtml(agentName(task.ownerAgentId))} · <span class="status-${escapeHtml(task.status)}">${escapeHtml(localStatus(task.status))}</span> · ${task.progressPercent ?? 0}%</div>
+          <div>${escapeHtml(agentName(task.ownerAgentId))} · <span class="status-${escapeHtml(task.status)}">${escapeHtml(localStatus(task.status))}</span> · ${taskProgressPercent(task)}%</div>
           ${task.blockers.length ? `<div>阻塞：${escapeHtml(task.blockers.join("；"))}</div>` : ""}
         </div>`)
         .join("")}
@@ -2027,13 +2149,14 @@ function renderWorkspace() {
 }
 
 function renderTeamProgress(team) {
-  const tasks = collectTaskItems().filter((task) => team.agents.includes(task.ownerAgentId));
-  const recentMessage = [...state.messages].reverse().find((message) => team.agents.includes(message.senderId));
+  const taskOwners = team.taskOwners ?? team.agents;
+  const tasks = selectTeamTasks(collectTaskItems(), taskOwners);
+  const recentMessage = [...state.messages]
+    .reverse()
+    .find((message) => team.agents.includes(message.senderId) && message.metadata?.generatedBy !== "claim_repair_guardian");
   const activeTask = pickActiveTask(tasks);
-  const doneCount = tasks.filter((task) => task.status === "done").length;
-  const blockedCount = tasks.filter((task) => task.status === "blocked").length;
+  const { doneCount, blockedCount, progressPercent } = summarizeTaskProgress(tasks);
   const status = blockedCount > 0 ? "blocked" : activeTask?.status ?? (doneCount > 0 ? "done" : "todo");
-  const progress = tasks.length ? Math.round(tasks.reduce((sum, task) => sum + (task.progressPercent ?? statusProgress(task.status)), 0) / tasks.length) : 0;
   const headline = activeTask
     ? `${localStatus(activeTask.status)}：${activeTask.title}`
     : recentMessage
@@ -2049,11 +2172,11 @@ function renderTeamProgress(team) {
     </div>
     <p>${escapeHtml(headline)}</p>
     <div class="team-progress-bar" aria-label="${escapeHtml(team.name)}进度">
-      <span style="width: ${Math.max(0, Math.min(progress, 100))}%"></span>
+      <span style="width: ${progressPercent}%"></span>
     </div>
     <div class="team-progress-meta">
       <span>${tasks.length ? `${doneCount}/${tasks.length} 项完成` : "暂无任务"}</span>
-      <span>${progress}%</span>
+      <span>${progressPercent}%</span>
     </div>
     <small>成员：${escapeHtml(agents)}</small>
     <small>最新：${escapeHtml(recent)}</small>
@@ -2177,24 +2300,6 @@ function deliverableName(artifact) {
   const type = artifactTypeLabels[artifact.type] ?? artifact.type;
   const version = artifact.version ? ` v${artifact.version}` : "";
   return `${type}${version}`;
-}
-
-function statusProgress(status) {
-  switch (status) {
-    case "done":
-      return 100;
-    case "review":
-      return 80;
-    case "doing":
-      return 50;
-    case "blocked":
-      return 35;
-    case "cancelled":
-      return 0;
-    case "todo":
-    default:
-      return 0;
-  }
 }
 
 function summarizeText(text, limit) {
