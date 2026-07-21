@@ -1,12 +1,16 @@
-import { readdirSync, statSync } from "node:fs";
+import { readFileSync, readdirSync, statSync } from "node:fs";
 import { relative, resolve, sep } from "node:path";
 import type { AgentContract, Artifact, StudioMessage, Task } from "@game-pipeline/shared-schemas";
 import type { StudioKernel } from "@game-pipeline/agent-runtime";
 import { inferArtifactType, stableArtifactId, type ToolExecutionResult } from "./toolExecutor.js";
 import { artifactFilePath, hashWorkspaceFile } from "./workspaceWriter.js";
+import { parsePlaytestMarker } from "./playtestEvidence.js";
+import type { AgentHarnessToolOperation } from "./agentHarness.js";
+import { isQaHarnessManagedPath } from "./qaEvidenceProtection.js";
 
 export interface WorkspaceFileEvidence {
   path: string;
+  absolutePath: string;
   hash: string;
   sizeBytes: number;
   updatedAt: string;
@@ -61,21 +65,27 @@ export function recordHarnessWorkspaceChanges(
   before: WorkspaceSnapshot,
   after: WorkspaceSnapshot,
   invocationId: string,
-  invocationChangedPaths?: string[]
+  invocationChangedPaths?: string[],
+  invocationToolOperations?: AgentHarnessToolOperation[]
 ): HarnessEvidenceResult {
   const workspaceChangedPaths = [...after.values()]
     .filter((file) => before.get(file.path)?.hash !== file.hash)
     .map((file) => file.path)
     .sort();
   const changedPaths = invocationChangedPaths
-    ? [...new Set(invocationChangedPaths)].filter((path) => workspaceChangedPaths.includes(path)).sort()
+    ? [...new Set(invocationChangedPaths)].filter((path) => after.has(path)).sort()
     : workspaceChangedPaths;
   const deletedPaths = [...before.keys()].filter((path) => !after.has(path)).sort();
   const expectedArtifacts = task.outputArtifacts
     .map((artifactId) => kernel.listArtifacts().find((artifact) => artifact.artifactId === artifactId))
     .filter((artifact): artifact is Artifact => Boolean(artifact));
+  const protectedMutationPaths = changedPaths.filter((path) => {
+    if (!isQaHarnessManagedPath(path)) return false;
+    return invocationToolOperations?.filter((operation) => operation.path === path).at(-1)?.toolName !== "run_playtest";
+  });
   const violations = [
     ...changedPaths.filter((path) => !isAllowedAgentPath(agent, path, expectedArtifacts)),
+    ...protectedMutationPaths.map((path) => `受保护 QA 机器证据被非 run_playtest 工具修改：${path}`),
     ...deletedPaths.map((path) => `删除：${path}`)
   ];
   const artifactIds = new Set<string>();
@@ -83,7 +93,7 @@ export function recordHarnessWorkspaceChanges(
   const now = new Date().toISOString();
 
   for (const path of changedPaths) {
-    if (violations.includes(path)) {
+    if (violations.includes(path) || protectedMutationPaths.includes(path)) {
       continue;
     }
     const file = after.get(path);
@@ -91,6 +101,8 @@ export function recordHarnessWorkspaceChanges(
       continue;
     }
     const existing = findArtifactForPath(kernel, task, path);
+    const sourceTool = invocationToolOperations?.filter((operation) => operation.path === path).at(-1)?.toolName;
+    const playtest = path.endsWith(".md") ? parsePlaytestMarker(readFileSync(file.absolutePath, "utf8")) : undefined;
     const artifact: Artifact = {
       artifactId: existing?.artifactId ?? stableArtifactId(kernel.project.projectId, agent.agentId, path),
       projectId: kernel.project.projectId,
@@ -107,15 +119,26 @@ export function recordHarnessWorkspaceChanges(
         generatedBy: "claude_cli_harness",
         nativeHarnessManaged: true,
         harnessInvocationId: invocationId,
+        ...(sourceTool ? { harnessToolName: sourceTool } : {}),
         toolExecutedAt: now,
-        changedPath: path
+        changedPath: path,
+        ...(playtest
+          ? {
+              playtestOperationId: playtest.operationId,
+              playtestVerdict: playtest.verdict,
+              playtestChecks: playtest.checks,
+              playtestDefects: playtest.defects,
+              playtestEvidencePaths: playtest.evidencePaths,
+              playtestRuntime: playtest.runtime
+            }
+          : {})
       },
       createdAt: existing?.createdAt ?? now,
       updatedAt: file.updatedAt
     };
     const stored = kernel.upsertArtifact(artifact);
     stored.metadata = artifact.metadata;
-    stored.status = "submitted";
+    stored.status = playtest && playtest.verdict !== "pass" ? "change_requested" : "submitted";
     stored.updatedAt = file.updatedAt;
     kernel.recordArtifactMaterialization(stored.artifactId, {
       path,
@@ -172,6 +195,7 @@ function walkDirectory(root: string, directory: string, files: WorkspaceSnapshot
     const stats = statSync(absolutePath);
     files.set(path, {
       path,
+      absolutePath,
       hash: hashWorkspaceFile(absolutePath),
       sizeBytes: stats.size,
       updatedAt: stats.mtime.toISOString()
@@ -211,7 +235,7 @@ export function allowedRootsForAgent(agent: AgentContract): string[] {
     asset_production: ["agents/art/processed-assets", "assets/art", "artifacts", "intermediate"],
     cocos_tech_lead: ["agents/engineering", "assets", "settings", "docs/engineering", "intermediate"],
     gameplay_programmer: ["assets/scripts", "assets/resources", "docs/engineering", "intermediate"],
-    cocos_automation: ["agents/cocos-automation", "assets", "settings", "builds", "intermediate"],
+    cocos_automation: ["agents/cocos-automation", "assets", "settings", "builds", "shared/build-artifacts", "artifacts/builds", "intermediate"],
     qa_evaluator: ["agents/qa", "docs/qa", "artifacts", "outputs"],
     wechat_platform: ["shared/build-artifacts", "builds", "outputs", "release", "docs/release"],
     devops: ["agents/devops", "builds", "outputs", "release", "docs/release"],

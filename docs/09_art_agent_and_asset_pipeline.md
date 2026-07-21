@@ -109,6 +109,8 @@ agents/art/
 
 raw-assets 保存模型输出和原始参考。processed-assets 保存清洗后资产。sprite-sheets 保存运行时图集和动画条。
 
+SVG 是可编辑源资产，不是 Cocos 运行时交付格式。Asset Production Agent 必须通过服务端 `render_svg_to_png` 工具生成透明 PNG；源 SVG 和运行时 PNG 同时保留并分别登记证据。
+
 ## 6. Asset Manifest
 
 ```json
@@ -171,6 +173,7 @@ flowchart LR
 
 后处理包括：
 
+- 将 SVG 源资产通过受控渲染器转换为同名透明 PNG。
 - 背景移除。
 - 透明边缘修复。
 - 帧切分。
@@ -187,6 +190,8 @@ flowchart LR
 - 处理脚本和参数。
 - 预览文件。
 - metadata。
+
+资产任务进入评审前必须同时满足：每个登记 SVG 都有同名 PNG、PNG 由工具调用产生并通过 Artifact Ledger 验证、`asset-manifest.json` 的 `runtime_path` 指向对应 PNG。任一条件不成立时，任务保持 `doing`。
 
 ## 10. 美术 QA
 

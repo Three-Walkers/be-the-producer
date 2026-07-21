@@ -326,10 +326,12 @@ function buildPlayableReview(kernel: StudioKernel, gate: GateAction, stageApplic
   const qaTask = kernel.findTask("task_stage_2_qa_playtest");
   const build = kernel.listArtifacts().find((artifact) => artifact.artifactId === "artifact_wechat_dev_build");
   const qaReport = kernel.listArtifacts().find((artifact) => artifact.artifactId === "artifact_qa_playtest_report");
+  const qaPassed = qaReport?.metadata.playtestVerdict === "pass" &&
+    (qaReport.metadata.toolName === "run_playtest" || qaReport.metadata.harnessToolName === "run_playtest");
   const blockers = [...(assetTask?.blockers ?? []), ...(codeTask?.blockers ?? []), ...(qaTask?.blockers ?? [])];
   const missing = [
     ...(build ? [] : ["微信小游戏开发构建尚未生成"]),
-    ...(qaReport ? [] : ["首个可玩 QA 试玩报告尚未生成"])
+    ...(qaPassed ? [] : [qaReport ? "QA 报告存在，但真实试玩结论尚未通过" : "首个可玩 QA 试玩报告尚未生成"])
   ];
   const risks = [
     ...blockers,
@@ -354,7 +356,7 @@ function buildPlayableReview(kernel: StudioKernel, gate: GateAction, stageApplic
       agentId: "qa_evaluator",
       roomKind: "qa-room",
       messageType: "review",
-      content: `门禁评审：${gate.label}。QA 准备度：${readinessText(stageApplicable && Boolean(qaReport) && !qaTask?.blockers.length)}。${taskStatusText(qaTask)} 风险：${formatList([...(qaTask?.blockers ?? []), qaReport ? "QA 报告仍需制作人审阅结论。" : "缺少试玩报告、截图或问题清单。"])}`
+      content: `门禁评审：${gate.label}。QA 准备度：${readinessText(stageApplicable && qaPassed && !qaTask?.blockers.length)}。${taskStatusText(qaTask)} 风险：${formatList([...(qaTask?.blockers ?? []), qaPassed ? "真实试玩已通过，仍需制作人审阅证据。" : "缺少通过结论、完整状态路径、截图或问题闭环。"])}`
     },
     gateSummaryLine(kernel, gate, stageApplicable, risks)
   ];
@@ -366,12 +368,14 @@ function buildReleaseReview(kernel: StudioKernel, gate: GateAction, stageApplica
   const devopsTask = kernel.findTask("task_stage_3_devops_deploy");
   const releaseBuild = kernel.listArtifacts().find((artifact) => artifact.artifactId === "artifact_wechat_release_build");
   const releaseGate = kernel.listArtifacts().find((artifact) => artifact.artifactId === "artifact_release_gate_report");
+  const releaseQaPassed = releaseGate?.metadata.playtestVerdict === "pass" &&
+    (releaseGate.metadata.toolName === "run_playtest" || releaseGate.metadata.harnessToolName === "run_playtest");
   const deployment = kernel.listArtifacts().find((artifact) => artifact.artifactId === "artifact_deployment_report");
   const rollback = kernel.listArtifacts().find((artifact) => artifact.artifactId === "artifact_rollback_plan");
   const blockers = [...(releaseTask?.blockers ?? []), ...(qaTask?.blockers ?? []), ...(devopsTask?.blockers ?? [])];
   const missing = [
     ...(releaseBuild ? [] : ["微信 release 构建尚未生成"]),
-    ...(releaseGate ? [] : ["发布门禁报告尚未生成"]),
+    ...(releaseQaPassed ? [] : [releaseGate ? "发布门禁报告存在，但真实试玩结论尚未通过" : "发布门禁报告尚未生成"]),
     ...(deployment ? [] : ["部署记录尚未生成"]),
     ...(rollback ? [] : ["回滚方案尚未生成"])
   ];
@@ -392,7 +396,7 @@ function buildReleaseReview(kernel: StudioKernel, gate: GateAction, stageApplica
       agentId: "qa_evaluator",
       roomKind: "qa-room",
       messageType: "review",
-      content: `门禁评审：${gate.label}。发布 QA 准备度：${readinessText(stageApplicable && Boolean(releaseGate) && !qaTask?.blockers.length)}。${taskStatusText(qaTask)} 门禁报告：${releaseGate ? artifactStatusText(releaseGate) : "未生成"}。`
+      content: `门禁评审：${gate.label}。发布 QA 准备度：${readinessText(stageApplicable && releaseQaPassed && !qaTask?.blockers.length)}。${taskStatusText(qaTask)} 门禁报告：${releaseGate ? artifactStatusText(releaseGate) : "未生成"}；真实试玩：${releaseQaPassed ? "pass" : "未通过"}。`
     },
     {
       agentId: "devops",
@@ -622,6 +626,7 @@ function formatList(items: string[]): string {
 
 function approveFirstPlayable(kernel: StudioKernel, message: StudioMessage, now: string): void {
   requireVerifiedArtifacts(kernel, ["artifact_asset_manifest_draft", "artifact_scene_blueprint_draft", "artifact_wechat_dev_build", "artifact_qa_playtest_report"]);
+  requirePassingPlaytest(kernel, "artifact_qa_playtest_report");
   for (const taskId of [
     "task_stage_2_asset_pipeline",
     "task_stage_2_cocos_implementation",
@@ -658,6 +663,7 @@ function approveRelease(kernel: StudioKernel, message: StudioMessage, now: strin
     "artifact_rollback_plan",
     "artifact_release_notes"
   ]);
+  requirePassingPlaytest(kernel, "artifact_release_gate_report");
   for (const taskId of [
     "task_stage_3_wechat_release",
     "task_stage_3_qa_release_gate",
@@ -1026,7 +1032,7 @@ function ensureStageTwoTasksAndArtifacts(kernel: StudioKernel, message: StudioMe
     taskLevel: "task",
     ownerAgentId: "asset_production",
     title: "生产并打包第一可玩美术资产",
-    description: "根据 Art Bible 生成 sprite、UI、背景和 asset manifest。",
+    description: "根据 Art Bible 生成 SVG 源资产，渲染 Cocos 可直接导入的透明 PNG，并维护 asset manifest。",
     status: "doing",
     priority: 90,
     sortOrder: 110,
@@ -1034,7 +1040,7 @@ function ensureStageTwoTasksAndArtifacts(kernel: StudioKernel, message: StudioMe
     childrenSummary: emptyChildrenSummary(),
     inputArtifacts: ["artifact_art_bible_baseline_draft"],
     outputArtifacts: ["artifact_asset_manifest_draft"],
-    acceptanceCriteria: ["asset manifest 存在", "关键资产符合 Art Bible"],
+    acceptanceCriteria: ["asset manifest 存在且 runtimePath 指向 PNG", "每个 SVG 源资产都有经工具验证的同名 PNG", "关键资产符合 Art Bible"],
     blockers: [],
     createdAt: now,
     updatedAt: now
@@ -1121,7 +1127,14 @@ function ensureStageTwoTasksAndArtifacts(kernel: StudioKernel, message: StudioMe
     childrenSummary: emptyChildrenSummary(),
     inputArtifacts: ["artifact_wechat_dev_build"],
     outputArtifacts: ["artifact_qa_playtest_report"],
-    acceptanceCriteria: ["Runtime Playability 通过", "QA 报告存在"],
+    acceptanceCriteria: [
+      "真实 Cocos Web 构建已在 Chrome 中启动",
+      "开始、运行、胜负终局和重新开始状态路径全部通过",
+      "终局统计不存在 N/M/下划线等占位值",
+      "文字不溢出且活动 UI 组件不存在显著重叠",
+      "控制台无运行时错误",
+      "截图、控制台日志和机器可读 QA 报告均已登记证据"
+    ],
     blockers: [],
     createdAt: now,
     updatedAt: now
@@ -1186,7 +1199,7 @@ function ensureStageTwoTasksAndArtifacts(kernel: StudioKernel, message: StudioMe
     path: "shared/build-artifacts/wechat/dev",
     ownerAgentId: "cocos_automation",
     stageId,
-    status: "submitted",
+    status: "draft",
     version: 1,
     sourceTaskId: "task_stage_2_cocos_build",
     sourceDecisionIds: [],
@@ -1210,7 +1223,7 @@ function ensureStageTwoTasksAndArtifacts(kernel: StudioKernel, message: StudioMe
     sourceDecisionIds: [],
     metadata: {
       bench: "Cocos MiniGame Bench",
-      verdict: "pending_first_playable_review"
+      playtestVerdict: "not_run"
     },
     createdAt: now,
     updatedAt: now
@@ -1311,7 +1324,7 @@ function ensureReleaseTasksAndArtifacts(kernel: StudioKernel, message: StudioMes
       childrenSummary: emptyChildrenSummary(),
       inputArtifacts: ["artifact_wechat_release_build"],
       outputArtifacts: ["artifact_release_gate_report"],
-      acceptanceCriteria: ["release gate 通过或制作人豁免"],
+      acceptanceCriteria: ["真实 Cocos 试玩全状态路径通过", "不存在 blocker/critical/major 缺陷", "发布门禁证据完整"],
       blockers: [],
       createdAt: now,
       updatedAt: now
@@ -1371,7 +1384,7 @@ function ensureReleaseTasksAndArtifacts(kernel: StudioKernel, message: StudioMes
       path: "shared/build-artifacts/wechat/release",
       ownerAgentId: "wechat_platform",
       stageId,
-      status: "submitted",
+      status: "draft",
       version: 1,
       sourceTaskId: "task_stage_3_wechat_release",
       sourceDecisionIds: [],
@@ -1390,7 +1403,7 @@ function ensureReleaseTasksAndArtifacts(kernel: StudioKernel, message: StudioMes
       version: 1,
       sourceTaskId: "task_stage_3_qa_release_gate",
       sourceDecisionIds: [],
-      metadata: { verdict: "pending_release_approval" },
+      metadata: { playtestVerdict: "not_run" },
       createdAt: now,
       updatedAt: now
     },
@@ -1545,6 +1558,18 @@ function requireVerifiedArtifacts(kernel: StudioKernel, artifactIds: string[]): 
   });
   if (missing.length > 0) {
     throw new Error(`缺少已验证产物证据：${missing.join("、")}`);
+  }
+}
+
+function requirePassingPlaytest(kernel: StudioKernel, artifactId: string): void {
+  const artifact = kernel.listArtifacts().find((candidate) => candidate.artifactId === artifactId);
+  const provenByPlaytestTool = artifact?.metadata.toolName === "run_playtest" || artifact?.metadata.harnessToolName === "run_playtest";
+  if (!artifact || !provenByPlaytestTool || artifact.metadata.playtestVerdict !== "pass") {
+    throw new Error(`QA 真实试玩尚未通过：${artifactId} 当前结论为 ${String(artifact?.metadata.playtestVerdict ?? "not_run")}`);
+  }
+  const defects = Array.isArray(artifact.metadata.playtestDefects) ? artifact.metadata.playtestDefects : [];
+  if (defects.some((defect) => typeof defect === "object" && defect !== null && ["blocker", "critical", "major"].includes(String((defect as { severity?: unknown }).severity)))) {
+    throw new Error(`QA 真实试玩仍有 blocker/critical/major 缺陷：${artifactId}`);
   }
 }
 

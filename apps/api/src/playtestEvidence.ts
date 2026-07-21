@@ -1,0 +1,69 @@
+export type PlaytestVerdict = "pass" | "fail" | "blocked";
+export type PlaytestSeverity = "blocker" | "critical" | "major" | "minor";
+
+export interface PlaytestCheckResult {
+  checkId: string;
+  label: string;
+  status: "passed" | "failed" | "blocked";
+  details: string;
+}
+
+export interface PlaytestDefect {
+  defectId: string;
+  severity: PlaytestSeverity;
+  category: "runtime" | "interaction" | "dynamic_value" | "ui_layout" | "console" | "coverage";
+  title: string;
+  details: string;
+  ownerAgentId: "gameplay_programmer" | "cocos_tech_lead" | "art_director" | "cocos_automation";
+  evidencePaths: string[];
+}
+
+export interface PlaytestReportEvidence {
+  operationId: string;
+  verdict: PlaytestVerdict;
+  completedAt: string;
+  buildOperationId?: string;
+  checks: PlaytestCheckResult[];
+  defects: PlaytestDefect[];
+  evidencePaths: string[];
+  runtime: {
+    initialState?: string;
+    playingState?: string;
+    terminalState?: string;
+    restartedState?: string;
+    consoleErrorCount: number;
+    durationMs: number;
+  };
+}
+
+const markerPrefix = "<!-- BTP_PLAYTEST_RESULT:";
+const markerSuffix = " -->";
+
+export function renderPlaytestMarker(result: PlaytestReportEvidence): string {
+  return `${markerPrefix}${JSON.stringify(result)}${markerSuffix}`;
+}
+
+export function parsePlaytestMarker(content: string): PlaytestReportEvidence | undefined {
+  const start = content.lastIndexOf(markerPrefix);
+  if (start === -1) {
+    return undefined;
+  }
+  const valueStart = start + markerPrefix.length;
+  const end = content.indexOf(markerSuffix, valueStart);
+  if (end === -1) {
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(content.slice(valueStart, end)) as unknown;
+    if (!isRecord(parsed) || !["pass", "fail", "blocked"].includes(String(parsed.verdict))) {
+      return undefined;
+    }
+    return parsed as unknown as PlaytestReportEvidence;
+  } catch {
+    return undefined;
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}

@@ -1,9 +1,15 @@
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { defaultAgentContracts, type StudioKernel } from "@game-pipeline/agent-runtime";
 import type { AgentContract, AgentId, AgentLoopControl, Artifact, ArtifactStatus, StudioMessage, TaskId } from "@game-pipeline/shared-schemas";
 import * as ts from "typescript";
 import { resolveWorkspacePathTarget, writeToolArtifactContent } from "./workspaceWriter.js";
+import { rasterizeSvgFile } from "./svgRasterizer.js";
+import { resolveProjectWorkspaceRoot } from "./workspaceWriter.js";
+import { CocosEngineBridge } from "./cocosEngineBridge.js";
+import { cocosEngineSettingsStore } from "./cocosEngineSettings.js";
+import { CocosPlaytestHarness } from "./cocosPlaytestHarness.js";
+import { assertQaEvidenceWriteAllowed } from "./qaEvidenceProtection.js";
 
 export type ExecutableToolName =
   | "write_artifact"
@@ -11,9 +17,16 @@ export type ExecutableToolName =
   | "write_code"
   | "run_typecheck"
   | "generate_image"
+  | "render_svg_to_png"
+  | "cocos_validate_project"
+  | "cocos_import_assets"
+  | "cocos_apply_blueprint"
+  | "cocos_build"
+  | "run_playtest"
   | "write_asset_manifest"
   | "create_scene_blueprint"
   | "create_bug_report"
+  | "create_release_gate"
   | "create_deploy_plan"
   | "create_rollback_plan"
   | "prepare_upload_report"
@@ -25,11 +38,14 @@ interface ToolRequest {
   toolName: ExecutableToolName;
   path: string;
   content: string;
+  sourcePath?: string;
+  width?: number;
   artifactId?: string;
   artifactType?: Artifact["type"];
   taskId?: TaskId;
   status?: ArtifactStatus;
   metadata?: Record<string, unknown>;
+  arguments?: Record<string, unknown>;
 }
 
 export interface ToolExecutionResult {
@@ -40,6 +56,7 @@ export interface ToolExecutionResult {
   hash?: string;
   sizeBytes?: number;
   error?: string;
+  details?: Record<string, unknown>;
 }
 
 const artifactTypes: Artifact["type"][] = [
@@ -65,9 +82,16 @@ const executableToolNames: ExecutableToolName[] = [
   "write_code",
   "run_typecheck",
   "generate_image",
+  "render_svg_to_png",
+  "cocos_validate_project",
+  "cocos_import_assets",
+  "cocos_apply_blueprint",
+  "cocos_build",
+  "run_playtest",
   "write_asset_manifest",
   "create_scene_blueprint",
   "create_bug_report",
+  "create_release_gate",
   "create_deploy_plan",
   "create_rollback_plan",
   "prepare_upload_report",
@@ -85,7 +109,7 @@ export function executableToolsForAgent(agent: AgentContract): ExecutableToolNam
   return tools;
 }
 
-export function executeAgentToolRequests(kernel: StudioKernel, messages: StudioMessage[]): ToolExecutionResult[] {
+export async function executeAgentToolRequests(kernel: StudioKernel, messages: StudioMessage[]): Promise<ToolExecutionResult[]> {
   const results: ToolExecutionResult[] = [];
   for (const message of messages) {
     if (message.senderType !== "agent") {
@@ -105,7 +129,7 @@ export function executeAgentToolRequests(kernel: StudioKernel, messages: StudioM
     const messageResults: ToolExecutionResult[] = [];
     const artifactIds = new Set(message.relatedArtifactIds);
     for (const request of extracted.requests) {
-      const result = executeToolRequest(kernel, message, agent, request);
+      const result = await executeToolRequest(kernel, message, agent, request);
       messageResults.push(result);
       results.push(result);
       if (result.artifactId) {
@@ -126,10 +150,16 @@ export function executeAgentToolRequests(kernel: StudioKernel, messages: StudioM
   return results;
 }
 
-function executeToolRequest(kernel: StudioKernel, message: StudioMessage, agent: AgentContract, request: ToolRequest): ToolExecutionResult {
+async function executeToolRequest(kernel: StudioKernel, message: StudioMessage, agent: AgentContract, request: ToolRequest): Promise<ToolExecutionResult> {
   try {
     assertToolAllowed(agent, request.toolName);
     const now = new Date().toISOString();
+    if (request.toolName.startsWith("cocos_")) {
+      return executeCocosBridgeTool(kernel, message, agent, request, now);
+    }
+    if (request.toolName === "run_playtest") {
+      return executePlaytestTool(kernel, message, agent, request, now);
+    }
     const path = normalizeToolPath(request.path, agent);
     if (request.toolName === "run_typecheck") {
       return runTypeScriptSyntaxCheck(kernel.project.projectId, path);
@@ -141,6 +171,10 @@ function executeToolRequest(kernel: StudioKernel, message: StudioMessage, agent:
     const existing = kernel
       .listArtifacts()
       .find((artifact) => artifact.artifactId === request.artifactId || (artifact.ownerAgentId === agent.agentId && artifact.path === path));
+    assertQaEvidenceWriteAllowed(path, request.toolName);
+    if (request.toolName === "render_svg_to_png") {
+      return executeSvgRasterization(kernel, message, agent, request, path, now, sourceTaskId, existing);
+    }
     const artifact: Artifact = {
       artifactId: existing?.artifactId ?? request.artifactId ?? stableArtifactId(kernel.project.projectId, agent.agentId, path),
       projectId: kernel.project.projectId,
@@ -198,6 +232,152 @@ function executeToolRequest(kernel: StudioKernel, message: StudioMessage, agent:
       error: error instanceof Error ? error.message : String(error)
     };
   }
+}
+
+async function executePlaytestTool(
+  kernel: StudioKernel,
+  message: StudioMessage,
+  agent: AgentContract,
+  request: ToolRequest,
+  now: string
+): Promise<ToolExecutionResult> {
+  const projectRoot = resolveProjectWorkspaceRoot(kernel.project.projectId);
+  const args = request.arguments ?? {};
+  const sourceTaskId = resolveSourceTaskId(kernel, agent.agentId, request.taskId);
+  const registeredReportPath = sourceTaskId
+    ? kernel.findTask(sourceTaskId)?.outputArtifacts
+        .map((artifactId) => kernel.listArtifacts().find((artifact) => artifact.artifactId === artifactId))
+        .find((artifact) => artifact?.type === "qa_report")?.path
+    : undefined;
+  const result = await new CocosPlaytestHarness(projectRoot, cocosEngineSettingsStore.getResolvedConfig()).run({
+    ...(typeof args.maxDurationSec === "number" ? { maxDurationSec: args.maxDurationSec } : {}),
+    ...(registeredReportPath ? { reportPath: registeredReportPath } : {})
+  });
+  const taskOutputIds = sourceTaskId ? kernel.findTask(sourceTaskId)?.outputArtifacts ?? [] : [];
+  let primary: ToolExecutionResult | undefined;
+  for (const item of result.evidence) {
+    const existing = kernel.listArtifacts().find((artifact) =>
+      artifact.path === item.path || (taskOutputIds.includes(artifact.artifactId) && item.path === result.reportPath)
+    );
+    const artifact = kernel.upsertArtifact({
+      artifactId: existing?.artifactId ?? stableArtifactId(kernel.project.projectId, agent.agentId, item.path),
+      projectId: kernel.project.projectId,
+      type: existing?.type ?? inferArtifactType(agent.agentId, item.path),
+      path: existing?.path ?? item.path,
+      ownerAgentId: agent.agentId,
+      stageId: kernel.project.currentStage,
+      status: result.verdict === "pass" ? "submitted" : "change_requested",
+      version: existing ? existing.version + 1 : 1,
+      ...(sourceTaskId ? { sourceTaskId } : {}),
+      sourceDecisionIds: existing?.sourceDecisionIds ?? [],
+      metadata: {
+        ...(existing?.metadata ?? {}),
+        toolName: request.toolName,
+        toolSourceMessageId: message.messageId,
+        toolExecutedAt: now,
+        playtestOperationId: result.operationId,
+        playtestVerdict: result.verdict,
+        playtestChecks: result.checks,
+        playtestDefects: result.defects,
+        playtestEvidencePaths: result.evidencePaths,
+        playtestRuntime: result.runtime
+      },
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now
+    });
+    kernel.recordArtifactMaterialization(artifact.artifactId, {
+      path: item.path,
+      hash: item.hash,
+      sizeBytes: item.sizeBytes,
+      materializedAt: now
+    });
+    if (item.path === result.reportPath) {
+      primary = {
+        toolName: "run_playtest",
+        status: "completed",
+        path: item.path,
+        artifactId: artifact.artifactId,
+        hash: item.hash,
+        sizeBytes: item.sizeBytes,
+        details: {
+          operationId: result.operationId,
+          verdict: result.verdict,
+          defectCount: result.defects.length,
+          evidencePaths: result.evidencePaths
+        }
+      };
+    }
+  }
+  if (!primary) {
+    throw new Error(`试玩 ${result.operationId} 没有生成主 QA 报告。`);
+  }
+  return primary;
+}
+
+function executeSvgRasterization(
+  kernel: StudioKernel,
+  message: StudioMessage,
+  agent: AgentContract,
+  request: ToolRequest,
+  path: string,
+  now: string,
+  sourceTaskId: TaskId | undefined,
+  existing: Artifact | undefined
+): ToolExecutionResult {
+  if (!request.sourcePath) {
+    throw new Error("render_svg_to_png 必须提供 sourcePath。");
+  }
+  const sourcePath = normalizeToolPath(request.sourcePath, agent);
+  const source = resolveWorkspacePathTarget(kernel.project.projectId, sourcePath);
+  if (!source.exists || source.type !== "file") {
+    throw new Error(`SVG 源文件不存在：${sourcePath}`);
+  }
+  const target = resolveWorkspacePathTarget(kernel.project.projectId, path);
+  const rendered = rasterizeSvgFile(source.absolutePath, target.absolutePath, request.width);
+  const materializedAt = statSync(target.absolutePath).mtime.toISOString();
+  const artifact: Artifact = {
+    artifactId: existing?.artifactId ?? request.artifactId ?? stableArtifactId(kernel.project.projectId, agent.agentId, path),
+    projectId: kernel.project.projectId,
+    type: "asset",
+    path,
+    ownerAgentId: agent.agentId,
+    stageId: kernel.project.currentStage,
+    status: request.status ?? existing?.status ?? "draft",
+    version: existing ? existing.version + 1 : 1,
+    ...(sourceTaskId ? { sourceTaskId } : {}),
+    sourceDecisionIds: existing?.sourceDecisionIds ?? [],
+    metadata: {
+      ...(existing?.metadata ?? {}),
+      ...(request.metadata ?? {}),
+      toolName: request.toolName,
+      toolSourceMessageId: message.messageId,
+      toolExecutedAt: now,
+      toolWriteMode: "render",
+      sourcePath,
+      outputWidth: rendered.width,
+      outputHeight: rendered.height,
+      toolHash: rendered.hash,
+      toolSizeBytes: rendered.sizeBytes,
+      toolMaterializedAt: materializedAt
+    },
+    createdAt: existing?.createdAt ?? now,
+    updatedAt: materializedAt
+  };
+  const registered = kernel.upsertArtifact(artifact);
+  kernel.recordArtifactMaterialization(registered.artifactId, {
+    path: target.relativePath,
+    hash: rendered.hash,
+    sizeBytes: rendered.sizeBytes,
+    materializedAt
+  });
+  return {
+    toolName: request.toolName,
+    status: "completed",
+    path: target.relativePath,
+    artifactId: registered.artifactId,
+    hash: rendered.hash,
+    sizeBytes: rendered.sizeBytes
+  };
 }
 
 function extractToolRequests(
@@ -301,23 +481,134 @@ function normalizeToolRequest(raw: Record<string, unknown>, agent: AgentContract
   const path = stringValue(args.path ?? args.filePath ?? args.artifactPath ?? args.relativePath);
   const rawContent = args.content ?? args.body ?? args.markdown ?? args.text;
   const content = typeof rawContent === "string" ? rawContent : rawContent === undefined ? "" : JSON.stringify(rawContent, null, 2);
-  if (!path || (toolName !== "run_typecheck" && !content.trim())) {
+  const isServiceTool = toolName.startsWith("cocos_") || toolName === "run_playtest";
+  if ((!path && !isServiceTool) || (!isServiceTool && !["run_typecheck", "render_svg_to_png"].includes(toolName) && !content.trim())) {
     return undefined;
   }
 
   const artifactId = stringValue(args.artifactId ?? args.artifact_id);
   const taskId = stringValue(args.taskId ?? args.task_id);
+  const sourcePath = stringValue(args.sourcePath ?? args.source_path);
+  const width = typeof args.width === "number" && Number.isFinite(args.width) ? args.width : undefined;
   const status = normalizeArtifactStatus(args.status);
   return {
     toolName,
-    path,
+    path: path || defaultServiceToolPath(toolName, args),
     content,
+    ...(isServiceTool ? { arguments: args } : {}),
+    ...(sourcePath ? { sourcePath } : {}),
+    ...(width !== undefined ? { width } : {}),
     ...(artifactId ? { artifactId } : {}),
     artifactType: normalizeArtifactType(args.artifactType ?? args.artifact_type ?? args.type) ?? inferArtifactType(agent.agentId, path),
     ...(taskId ? { taskId } : {}),
     ...(status ? { status } : {}),
     ...(isRecord(args.metadata) ? { metadata: args.metadata } : {})
   };
+}
+
+function executeCocosBridgeTool(
+  kernel: StudioKernel,
+  message: StudioMessage,
+  agent: AgentContract,
+  request: ToolRequest,
+  now: string
+): ToolExecutionResult {
+  const bridge = new CocosEngineBridge(resolveProjectWorkspaceRoot(kernel.project.projectId), cocosEngineSettingsStore.getResolvedConfig());
+  const args = request.arguments ?? {};
+  const result = request.toolName === "cocos_validate_project"
+    ? bridge.validateProject()
+    : request.toolName === "cocos_import_assets"
+      ? bridge.importAssets({ ...(stringValue(args.manifestPath) ? { manifestPath: stringValue(args.manifestPath) } : {}) })
+      : request.toolName === "cocos_apply_blueprint"
+        ? bridge.applySceneBlueprint({
+            ...(stringValue(args.blueprintPath) ? { blueprintPath: stringValue(args.blueprintPath) } : {}),
+            ...(stringValue(args.scenePath) ? { scenePath: stringValue(args.scenePath) } : {})
+          })
+        : bridge.build({
+            ...(args.platform === "wechatgame" ? { platform: "wechatgame" as const } : {}),
+            ...(typeof args.debug === "boolean" ? { debug: args.debug } : {}),
+            ...(stringValue(args.outputDir) ? { outputDir: stringValue(args.outputDir) } : {}),
+            ...(stringValue(args.configPath) ? { configPath: stringValue(args.configPath) } : {})
+          });
+
+  const primaryEvidence = result.evidence.find((entry) => entry.path === result.reportPath) ?? result.evidence.at(-1);
+  if (!primaryEvidence) {
+    throw new Error(`Cocos Bridge 没有返回可登记证据：${result.operationId}`);
+  }
+  const sourceTaskId = resolveSourceTaskId(kernel, agent.agentId, request.taskId);
+  const taskOutputIds = sourceTaskId ? kernel.findTask(sourceTaskId)?.outputArtifacts ?? [] : [];
+  const existing = kernel.listArtifacts().find((artifact) =>
+    taskOutputIds.includes(artifact.artifactId)
+      && (primaryEvidence.path === artifact.path || primaryEvidence.path.startsWith(`${artifact.path.replace(/\/+$/, "")}/`))
+  );
+  const artifactId = existing?.artifactId ?? stableArtifactId(kernel.project.projectId, agent.agentId, primaryEvidence.path);
+  const artifact = kernel.upsertArtifact({
+    artifactId,
+    projectId: kernel.project.projectId,
+    type: existing?.type ?? (request.toolName === "cocos_build" ? "build" : inferArtifactType(agent.agentId, primaryEvidence.path)),
+    path: existing?.path ?? primaryEvidence.path,
+    ownerAgentId: agent.agentId,
+    stageId: kernel.project.currentStage,
+    status: result.ok ? existing?.status ?? "submitted" : "change_requested",
+    version: existing ? existing.version + 1 : 1,
+    ...(sourceTaskId ? { sourceTaskId } : {}),
+    sourceDecisionIds: existing?.sourceDecisionIds ?? [],
+    metadata: {
+      ...(existing?.metadata ?? {}),
+      bridgeOperationId: result.operationId,
+      bridgeOperationType: result.operationType,
+      bridgeReportPath: result.reportPath,
+      bridgeResult: result.details,
+      bridgeOk: result.ok,
+      toolName: request.toolName,
+      toolSourceMessageId: message.messageId,
+      toolExecutedAt: now
+    },
+    createdAt: existing?.createdAt ?? now,
+    updatedAt: now
+  });
+  kernel.recordArtifactMaterialization(artifact.artifactId, {
+    path: primaryEvidence.path,
+    hash: primaryEvidence.hash,
+    sizeBytes: primaryEvidence.sizeBytes,
+    materializedAt: now
+  });
+  if (!result.ok) {
+    return {
+      toolName: request.toolName,
+      status: "failed",
+      path: primaryEvidence.path,
+      artifactId: artifact.artifactId,
+      hash: primaryEvidence.hash,
+      sizeBytes: primaryEvidence.sizeBytes,
+      error: result.error ?? result.summary
+    };
+  }
+  return {
+    toolName: request.toolName,
+    status: "completed",
+    path: primaryEvidence.path,
+    artifactId: artifact.artifactId,
+    hash: primaryEvidence.hash,
+    sizeBytes: primaryEvidence.sizeBytes
+  };
+}
+
+function defaultServiceToolPath(toolName: ExecutableToolName, args: Record<string, unknown>): string {
+  switch (toolName) {
+    case "cocos_validate_project":
+      return "agents/cocos-automation/validation";
+    case "cocos_import_assets":
+      return stringValue(args.manifestPath) || "agents/art/asset-manifest.json";
+    case "cocos_apply_blueprint":
+      return stringValue(args.scenePath) || "assets/scenes/MainGame.scene";
+    case "cocos_build":
+      return stringValue(args.outputDir) || "shared/build-artifacts/wechat/dev";
+    case "run_playtest":
+      return "agents/qa/playtest-reports/report-001.md";
+    default:
+      return "agents/cocos-automation";
+  }
 }
 
 function requestArgs(raw: Record<string, unknown>): Record<string, unknown> {

@@ -134,7 +134,7 @@ export const defaultAgentContracts: AgentContract[] = [
       read: ["project", "decision", "artifact", "producer_preference"],
       write: ["role", "artifact", "knowledge"]
     },
-    tools: ["generate_image", "postprocess_asset", "write_asset_manifest", "create_task"],
+    tools: ["generate_image", "render_svg_to_png", "postprocess_asset", "write_asset_manifest", "create_task"],
     forbiddenActions: ["decide_art_direction", "write_gameplay_code", "read_provider_api_key", "deploy_release"],
     handoffTargets: ["art_director", "cocos_automation", "qa_evaluator"],
     messageTypes: ["deliverable", "asset_review", "progress_update", "blocker", "handoff"],
@@ -222,7 +222,7 @@ export const defaultAgentContracts: AgentContract[] = [
       read: ["project", "decision", "artifact", "qa", "release", "producer_preference"],
       write: ["role", "qa", "artifact", "knowledge"]
     },
-    tools: ["run_playtest", "capture_screenshot", "record_video", "create_bug_report", "create_release_gate"],
+    tools: ["run_playtest", "create_bug_report", "create_release_gate"],
     forbiddenActions: ["fix_code_directly", "approve_producer_decision", "read_secret_plaintext"],
     handoffTargets: ["gameplay_programmer", "art_director", "asset_production", "cocos_automation", "wechat_platform", "devops"],
     messageTypes: ["playtest_summary", "bug_report", "qa_failure", "release_gate", "progress_update", "blocker"],

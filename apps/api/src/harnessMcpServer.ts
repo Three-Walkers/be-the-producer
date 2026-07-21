@@ -3,6 +3,11 @@ import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statS
 import { dirname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
 import { spawnSync } from "node:child_process";
+import { rasterizeSvgFile } from "./svgRasterizer.js";
+import { CocosEngineBridge, type CocosBridgeResult } from "./cocosEngineBridge.js";
+import { cocosEngineSettingsStore } from "./cocosEngineSettings.js";
+import { CocosPlaytestHarness } from "./cocosPlaytestHarness.js";
+import { assertQaEvidenceWriteAllowed } from "./qaEvidenceProtection.js";
 
 interface JsonRpcRequest {
   jsonrpc?: string;
@@ -12,6 +17,7 @@ interface JsonRpcRequest {
 }
 
 const projectRoot = resolve(requiredEnvironment("BTP_PROJECT_ROOT"));
+const agentId = requiredEnvironment("BTP_AGENT_ID");
 const allowedRoots = parseStringArray(process.env.BTP_ALLOWED_ROOTS);
 const expectedPaths = parseStringArray(process.env.BTP_EXPECTED_PATHS);
 const controlPath = process.env.BTP_CONTROL_PATH?.trim();
@@ -54,7 +60,7 @@ async function handleRequest(request: JsonRpcRequest): Promise<void> {
         respond(request.id, { tools: toolDefinitions() });
         return;
       case "tools/call":
-        respond(request.id, callTool(request.params));
+        respond(request.id, await callTool(request.params));
         return;
       default:
         respondError(request.id, -32601, `Method not found: ${request.method ?? "unknown"}`);
@@ -133,6 +139,23 @@ function toolDefinitions(): Array<Record<string, unknown>> {
       }
     }
   ];
+  if (["art_director", "asset_production"].includes(agentId)) {
+    tools.push({
+      name: "render_svg_to_png",
+      title: "Render SVG source to PNG",
+      description: "Rasterize an authorized SVG source into a transparent PNG runtime asset for Cocos Creator. The PNG is recorded as tool evidence.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          sourcePath: { type: "string", description: "Authorized project-relative .svg source path" },
+          path: { type: "string", description: "Authorized project-relative .png output path" },
+          width: { type: "integer", minimum: 1, maximum: 4096, description: "Optional output width; aspect ratio is preserved" }
+        },
+        required: ["sourcePath", "path"],
+        additionalProperties: false
+      }
+    });
+  }
   if (process.env.BTP_ALLOW_PROJECT_CHECKS === "true") {
     tools.push({
       name: "run_project_check",
@@ -148,10 +171,72 @@ function toolDefinitions(): Array<Record<string, unknown>> {
       }
     });
   }
+  if (agentId === "qa_evaluator") {
+    tools.push({
+      name: "run_playtest",
+      title: "Run real Cocos playtest",
+      description: "Build a QA-only Cocos Web package, drive it in Chrome through start, gameplay, terminal and restart states, then write screenshots, console logs and a machine-verifiable report. A failed verdict is valid evidence and must be handed back to the responsible Agent.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          maxDurationSec: { type: "integer", minimum: 10, maximum: 120, description: "Maximum real-time gameplay window before the run is considered incomplete" }
+        },
+        additionalProperties: false
+      }
+    });
+  }
+  if (agentId === "cocos_automation") {
+    tools.push(
+      {
+        name: "cocos_validate_project",
+        title: "Validate Cocos Creator project",
+        description: "Validate the real Cocos project root and configured Creator 3.8+ executable before performing editor operations.",
+        inputSchema: { type: "object", properties: {}, additionalProperties: false }
+      },
+      {
+        name: "cocos_import_assets",
+        title: "Import manifest assets into Cocos",
+        description: "Validate runtime assets from AssetManifest, copy them into assets/resources, and create an auditable native-import report.",
+        inputSchema: {
+          type: "object",
+          properties: { manifestPath: { type: "string", description: "Project-relative AssetManifest JSON path" } },
+          additionalProperties: false
+        }
+      },
+      {
+        name: "cocos_apply_blueprint",
+        title: "Apply SceneBlueprint",
+        description: "Apply a structured SceneBlueprint through the controlled bridge and generate a Cocos scene, runtime descriptor, bootstrap component, and operation report.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            blueprintPath: { type: "string", description: "Project-relative SceneBlueprint JSON path" },
+            scenePath: { type: "string", description: "Destination under assets/scenes ending in .scene" }
+          },
+          additionalProperties: false
+        }
+      },
+      {
+        name: "cocos_build",
+        title: "Build WeChat game with Cocos Creator",
+        description: "Invoke the configured real Cocos Creator CLI for a wechatgame build. Success requires a successful Creator exit code and fresh non-empty build output.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            platform: { type: "string", enum: ["wechatgame"] },
+            debug: { type: "boolean" },
+            outputDir: { type: "string", description: "Project-relative output under shared/build-artifacts or builds" },
+            configPath: { type: "string", description: "Optional exported Creator build config JSON" }
+          },
+          additionalProperties: false
+        }
+      }
+    );
+  }
   return tools;
 }
 
-function callTool(params: Record<string, unknown> | undefined): Record<string, unknown> {
+async function callTool(params: Record<string, unknown> | undefined): Promise<Record<string, unknown>> {
   const name = typeof params?.name === "string" ? params.name : "";
   const args = isRecord(params?.arguments) ? params.arguments : {};
   if (name === "write_artifact" || name === "append_document") {
@@ -161,6 +246,7 @@ function callTool(params: Record<string, unknown> | undefined): Record<string, u
       throw new Error("单次 MCP 文本写入不能超过 5 MB。");
     }
     const target = resolveAuthorizedTarget(path, false);
+    assertQaEvidenceWriteAllowed(target.relativePath, name);
     mkdirSync(dirname(target.absolutePath), { recursive: true });
     if (name === "append_document") {
       const needsSeparator = existsSync(target.absolutePath) && statSync(target.absolutePath).size > 0 && !readFileSync(target.absolutePath, "utf8").endsWith("\n");
@@ -184,6 +270,27 @@ function callTool(params: Record<string, unknown> | undefined): Record<string, u
     return {
       content: [{ type: "text", text: files.length > 0 ? files.join("\n") : "目录中暂无文件。" }],
       structuredContent: { path: target.relativePath, files }
+    };
+  }
+  if (name === "render_svg_to_png" && ["art_director", "asset_production"].includes(agentId)) {
+    const source = resolveAuthorizedTarget(requiredString(args.sourcePath, "sourcePath"), false);
+    const target = resolveAuthorizedTarget(requiredString(args.path, "path"), false);
+    const width = typeof args.width === "number" ? args.width : undefined;
+    const rendered = rasterizeSvgFile(source.absolutePath, target.absolutePath, width);
+    recordOperation(name, target.relativePath, rendered.hash, rendered.sizeBytes);
+    return {
+      content: [{
+        type: "text",
+        text: `PNG 渲染成功：${source.relativePath} → ${target.relativePath}；${rendered.width}x${rendered.height}；hash=${rendered.hash}；size=${rendered.sizeBytes} bytes`
+      }],
+      structuredContent: {
+        sourcePath: source.relativePath,
+        path: target.relativePath,
+        hash: rendered.hash,
+        sizeBytes: rendered.sizeBytes,
+        width: rendered.width,
+        height: rendered.height
+      }
     };
   }
   if (name === "report_task_status") {
@@ -222,6 +329,66 @@ function callTool(params: Record<string, unknown> | undefined): Record<string, u
       content: [{ type: "text", text: `${check} ${ok ? "通过" : "失败"}（exit=${result.status ?? "null"}）${output ? `\n${output}` : ""}` }],
       structuredContent: { check, ok, exitCode: result.status, output },
       isError: !ok
+    };
+  }
+  if (name === "run_playtest" && agentId === "qa_evaluator") {
+    const maxDurationSec = typeof args.maxDurationSec === "number" ? Math.max(10, Math.min(120, Math.floor(args.maxDurationSec))) : undefined;
+    const result = await new CocosPlaytestHarness(projectRoot, cocosEngineSettingsStore.getResolvedConfig()).run({
+      ...(maxDurationSec ? { maxDurationSec } : {}),
+      ...(expectedPaths.find((path) => path.startsWith("agents/qa/") && path.endsWith(".md"))
+        ? { reportPath: expectedPaths.find((path) => path.startsWith("agents/qa/") && path.endsWith(".md")) as string }
+        : {})
+    });
+    for (const item of result.evidence) {
+      recordOperation(name, item.path, item.hash, item.sizeBytes);
+    }
+    return {
+      content: [{
+        type: "text",
+        text: `${result.summary}\n结论：${result.verdict}\n缺陷：${result.defects.length}\n报告：${result.reportPath}\n证据：${result.evidencePaths.join("、") || "无"}`
+      }],
+      structuredContent: {
+        operationId: result.operationId,
+        verdict: result.verdict,
+        reportPath: result.reportPath,
+        checks: result.checks,
+        defects: result.defects,
+        evidencePaths: result.evidencePaths,
+        runtime: result.runtime
+      }
+    };
+  }
+  if (agentId === "cocos_automation" && name.startsWith("cocos_")) {
+    const bridge = new CocosEngineBridge(projectRoot, cocosEngineSettingsStore.getResolvedConfig());
+    let result: CocosBridgeResult;
+    if (name === "cocos_validate_project") {
+      result = bridge.validateProject();
+    } else if (name === "cocos_import_assets") {
+      result = bridge.importAssets({
+        ...(typeof args.manifestPath === "string" && args.manifestPath.trim() ? { manifestPath: args.manifestPath } : {})
+      });
+    } else if (name === "cocos_apply_blueprint") {
+      result = bridge.applySceneBlueprint({
+        ...(typeof args.blueprintPath === "string" && args.blueprintPath.trim() ? { blueprintPath: args.blueprintPath } : {}),
+        ...(typeof args.scenePath === "string" && args.scenePath.trim() ? { scenePath: args.scenePath } : {})
+      });
+    } else if (name === "cocos_build") {
+      result = bridge.build({
+        ...(args.platform === "wechatgame" ? { platform: args.platform } : {}),
+        ...(typeof args.debug === "boolean" ? { debug: args.debug } : {}),
+        ...(typeof args.outputDir === "string" && args.outputDir.trim() ? { outputDir: args.outputDir } : {}),
+        ...(typeof args.configPath === "string" && args.configPath.trim() ? { configPath: args.configPath } : {})
+      });
+    } else {
+      throw new Error(`不支持的 Cocos Bridge 工具：${name}`);
+    }
+    for (const item of result.evidence) {
+      recordOperation(name, item.path, item.hash, item.sizeBytes);
+    }
+    return {
+      content: [{ type: "text", text: `${result.summary}${result.error ? `\n错误：${result.error}` : ""}\n报告：${result.reportPath}` }],
+      structuredContent: result,
+      isError: !result.ok
     };
   }
   throw new Error(`不支持的 BTP MCP 工具：${name || "unknown"}`);

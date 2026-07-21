@@ -14,6 +14,28 @@ Cocos Engine Bridge 是 Agent 与 Cocos Creator 的受控交互层。Agent 不�
 - 支持脚本生成和编译检查。
 - 支持构建日志和编辑器操作日志留痕。
 
+## 2.1 本机配置
+
+Cocos Engine Bridge 使用本机安装的 Cocos Creator，不下载、不内嵌编辑器。制作人在设置页的 **Cocos Engine Bridge** 区域配置：
+
+- Creator 可执行文件路径；
+- Creator 版本，要求 3.8 或更高版本；
+- 构建平台，当前固定为 `wechatgame`；
+- Creator Build 面板导出的 `configPath`，可选；
+- 单次构建超时，范围 1 至 60 分钟。
+
+系统会扫描 macOS 常见的 `/Applications/CocosCreator/Creator/*`、`/Applications/Cocos/Creator/*` 和用户 Applications 目录。自动检测只保存真实存在且可执行的文件。连通性测试会启动 `CocosCreator --version`，不会仅根据路径字符串返回成功。
+
+也可以在启动服务前使用环境变量覆盖本机配置：
+
+```bash
+export BTP_COCOS_EXECUTABLE="/Applications/CocosCreator/Creator/3.8.7/CocosCreator.app/Contents/MacOS/CocosCreator"
+export BTP_COCOS_VERSION="3.8.7"
+export BTP_COCOS_PLATFORM="wechatgame"
+export BTP_COCOS_BUILD_CONFIG=""
+export BTP_COCOS_TIMEOUT_MS="1200000"
+```
+
 ## 3. Bridge 架构
 
 ```mermaid
@@ -47,6 +69,17 @@ interface CocosBridge {
   build(input: BuildInput): Promise<BuildResult>;
 }
 ```
+
+当前 Cocos Automation Agent 的 Claude CLI Harness 和 Direct API Runtime 都暴露以下受控工具：
+
+| 工具 | 真实行为 | 成功条件 |
+| --- | --- | --- |
+| `cocos_validate_project` | 校验项目根、`package.json`、`assets`、`settings`、Creator 可执行文件和版本。 | 工程结构有效且 Creator 3.8+ 可执行。 |
+| `cocos_import_assets` | 读取 AssetManifest，校验 PNG 等 runtime 文件，复制到 `assets/resources/btp-art` 并生成资源映射和导入报告。 | 所有 runtime 文件存在、格式有效并完成物化。 |
+| `cocos_apply_blueprint` | 解析 SceneBlueprint，生成受控场景、场景 meta、运行时描述、Bootstrap 组件及操作报告。 | 全部输出文件写入并计算 hash/size。 |
+| `cocos_build` | 启动真实 Creator CLI 执行 `wechatgame` 构建。 | Creator 退出码为 `0` 或官方成功码 `36`，且输出目录出现本轮新构建文件。 |
+
+执行顺序固定为：项目校验、资产导入、蓝图应用、微信构建。任一步失败后 Agent 必须进入 `blocked` 并引用失败报告，不能跳过或宣布构建完成。
 
 ## 5. SceneBlueprint
 
@@ -89,6 +122,15 @@ SceneBlueprint 是 Agent 可编辑的结构化场景中间层。
   ]
 }
 ```
+
+Bridge 不允许模型直接编辑 Cocos 私有序列化结构。应用蓝图时会生成：
+
+- `assets/resources/btp/scene-blueprint.json`：规范化运行时描述；
+- `assets/scripts/btp/BtpRuntimeBootstrap.ts`：受控节点和组件物化入口；
+- `assets/scenes/MainGame.scene` 与 `.meta`：Creator 可导入的启动场景；
+- `agents/cocos-automation/scene-ops/*.json`：操作证据。
+
+Bootstrap 会发现 `assets/scripts` 下带 `@ccclass` 的 Component 并建立受控组件注册表。Creator 在真实构建中负责 AssetDB 导入、TypeScript 编译、场景反序列化和资源引用校验。
 
 ## 6. AssetManifest 到 Cocos 导入
 
@@ -144,6 +186,14 @@ BuildInput：
 }
 ```
 
+未提供 `configPath` 时，Bridge 使用 Creator 官方命令行参数生成构建任务：
+
+```text
+CocosCreator --project <projectRoot> --build "platform=wechatgame;debug=true;buildPath=project://shared/build-artifacts/wechat;outputName=dev;startScene=<sceneUuid>;scenes=<sceneUuid>;logDest=<logPath>"
+```
+
+提供 Build 面板导出的配置后，Bridge 使用 `configPath=<path>;stage=build;logDest=<logPath>`。构建日志固定保存在 `agents/cocos-automation/cocos-build-logs/`，构建操作报告保存在 `agents/cocos-automation/build-ops/`。
+
 BuildResult：
 
 ```json
@@ -191,7 +241,9 @@ BuildResult：
 | Blueprint 无效 | 返回 schema 错误和节点路径。 |
 | Cocos 编译失败 | 生成 build_failure 消息并交给 Programmer。 |
 | 构建失败 | 保存完整脱敏日志并进入 QA/Engineering 修复。 |
-| 编辑器命令超时 | 重试一次，失败后标记 Cocos Automation blocked。 |
+| 编辑器命令超时 | 保存日志并立即标记 Cocos Automation blocked；修复环境后由制作人或调度器显式重试。 |
+
+未安装或未配置 Creator 时，`cocos_validate_project` 和 `cocos_build` 会立即失败并写入报告。Agent Loop 不会再等待通用 Claude CLI 写出伪构建产物。
 
 ## 12. 禁止规则
 
