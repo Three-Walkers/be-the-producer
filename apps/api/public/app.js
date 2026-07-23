@@ -6,6 +6,8 @@ const state = {
   rooms: [],
   activeRoomKind: "studio-main",
   projectSummaries: [],
+  startingProjectIds: new Set(),
+  deletingProjectIds: new Set(),
   messages: [],
   taskBoard: null,
   artifacts: [],
@@ -217,6 +219,7 @@ const mentionSuggestions = $("#mention-suggestions");
 let pendingStartProjectId = null;
 let pendingStartMode = "start";
 let pendingDeleteProjectId = null;
+let deleteRequestInFlight = false;
 let activePreviewArtifactId = null;
 let mentionState = {
   active: false,
@@ -240,11 +243,15 @@ settingsDialog.addEventListener("click", (event) => {
   }
 });
 
-$("#cancel-start-project").addEventListener("click", () => {
+function closeStartConfirmation() {
   pendingStartProjectId = null;
   pendingStartMode = "start";
-  startConfirmDialog.close();
-});
+  if (startConfirmDialog.open) {
+    startConfirmDialog.close();
+  }
+}
+
+$("#cancel-start-project").addEventListener("click", closeStartConfirmation);
 
 $("#confirm-start-project").addEventListener("click", async () => {
   if (!pendingStartProjectId) {
@@ -254,18 +261,14 @@ $("#confirm-start-project").addEventListener("click", async () => {
   const button = $("#confirm-start-project");
   const projectId = pendingStartProjectId;
   const mode = pendingStartMode;
+  closeStartConfirmation();
   button.disabled = true;
   button.textContent = mode === "resume" ? "继续中" : "启动中";
   try {
-    await startProject(projectId, {
+    await executeStartProject(projectId, {
       resumed: mode === "resume",
       restarted: mode === "restart"
     });
-    pendingStartProjectId = null;
-    pendingStartMode = "start";
-    startConfirmDialog.close();
-  } catch (error) {
-    showToast(error.message);
   } finally {
     button.disabled = false;
     button.textContent = mode === "resume" ? "确认继续" : "确认启动";
@@ -274,16 +277,23 @@ $("#confirm-start-project").addEventListener("click", async () => {
 
 startConfirmDialog.addEventListener("click", (event) => {
   if (event.target === startConfirmDialog) {
-    pendingStartProjectId = null;
-    pendingStartMode = "start";
-    startConfirmDialog.close();
+    closeStartConfirmation();
   }
 });
 
-$("#cancel-delete-project").addEventListener("click", () => {
-  pendingDeleteProjectId = null;
-  deleteConfirmDialog.close();
+startConfirmDialog.addEventListener("cancel", () => {
+  pendingStartProjectId = null;
+  pendingStartMode = "start";
 });
+
+function closeDeleteConfirmation() {
+  pendingDeleteProjectId = null;
+  if (deleteConfirmDialog.open) {
+    deleteConfirmDialog.close();
+  }
+}
+
+$("#cancel-delete-project").addEventListener("click", closeDeleteConfirmation);
 
 $("#confirm-delete-project").addEventListener("click", async () => {
   if (!pendingDeleteProjectId) {
@@ -292,32 +302,53 @@ $("#confirm-delete-project").addEventListener("click", async () => {
 
   const button = $("#confirm-delete-project");
   const projectId = pendingDeleteProjectId;
+  const deletingCurrentProject = state.projectId === projectId;
+  const previousSummaries = [...state.projectSummaries];
+  deleteRequestInFlight = true;
+  state.deletingProjectIds.add(projectId);
+  state.projectSummaries = state.projectSummaries.filter((project) => project.projectId !== projectId);
+  closeDeleteConfirmation();
   button.disabled = true;
   button.textContent = "删除中";
+  if (deletingCurrentProject) {
+    clearCurrentProject();
+  } else {
+    renderProjectList();
+  }
+
+  let deletionCompleted = false;
   try {
     await request(`/projects/${projectId}`, {
       method: "DELETE"
     });
-    if (state.projectId === projectId) {
-      clearCurrentProject();
-    }
-    pendingDeleteProjectId = null;
-    deleteConfirmDialog.close();
-    await loadProjects({ autoOpenLatest: !state.projectId });
+    deletionCompleted = true;
+    state.deletingProjectIds.delete(projectId);
+    await loadProjects({ autoOpenLatest: deletingCurrentProject && !state.projectId });
     showToast("项目已删除。");
   } catch (error) {
-    showToast(error.message);
+    state.deletingProjectIds.delete(projectId);
+    if (!deletionCompleted) {
+      await restoreProjectListAfterFailedDeletion(projectId, previousSummaries, deletingCurrentProject);
+      showToast(`删除失败：${error.message}`);
+    } else {
+      showToast(`项目已删除，但列表刷新失败：${error.message}`);
+    }
   } finally {
+    deleteRequestInFlight = false;
     button.disabled = false;
     button.textContent = "确认删除";
+    renderProjectList();
   }
 });
 
 deleteConfirmDialog.addEventListener("click", (event) => {
   if (event.target === deleteConfirmDialog) {
-    pendingDeleteProjectId = null;
-    deleteConfirmDialog.close();
+    closeDeleteConfirmation();
   }
+});
+
+deleteConfirmDialog.addEventListener("cancel", () => {
+  pendingDeleteProjectId = null;
 });
 
 $("#close-artifact-preview").addEventListener("click", () => {
@@ -843,15 +874,20 @@ function buildPresetMessage(presetId, preset) {
 
 async function refreshProject() {
   ensureProject();
+  const projectId = state.projectId;
   const [project, rooms, messages, taskBoard, artifacts, workspace, agentLoop] = await Promise.all([
-    request(`/projects/${state.projectId}`),
-    request(`/projects/${state.projectId}/rooms`),
-    request(`/projects/${state.projectId}/messages`),
-    request(`/projects/${state.projectId}/task-board`),
-    request(`/projects/${state.projectId}/artifacts`),
-    request(`/projects/${state.projectId}/workspace-tree`),
-    request(`/projects/${state.projectId}/agent-loop`)
+    request(`/projects/${projectId}`),
+    request(`/projects/${projectId}/rooms`),
+    request(`/projects/${projectId}/messages`),
+    request(`/projects/${projectId}/task-board`),
+    request(`/projects/${projectId}/artifacts`),
+    request(`/projects/${projectId}/workspace-tree`),
+    request(`/projects/${projectId}/agent-loop`)
   ]);
+
+  if (state.projectId !== projectId || state.deletingProjectIds.has(projectId)) {
+    return;
+  }
 
   state.project = project.project;
   state.rooms = rooms.rooms;
@@ -865,7 +901,7 @@ async function refreshProject() {
 
 async function loadProjects({ autoOpenLatest = true } = {}) {
   const listing = await request("/projects");
-  state.projectSummaries = listing.projects;
+  state.projectSummaries = listing.projects.filter((project) => !state.deletingProjectIds.has(project.projectId));
   renderProjectList();
   if (autoOpenLatest && !state.projectId && state.projectSummaries.length > 0) {
     await loadProject(state.projectSummaries[0].projectId);
@@ -1410,21 +1446,24 @@ function renderProjectList() {
       const active = project.projectId === state.projectId ? " active" : "";
       const stage = stageLabels[project.currentStage] ?? project.currentStage;
       const execution = project.executionStatus ?? "draft";
+      const starting = state.startingProjectIds.has(project.projectId);
       const startLabel = execution === "paused" ? "继续项目" : "启动项目";
       const actionButton =
-        execution === "running"
+        starting
+          ? '<button class="project-action-button is-loading" type="button" title="项目启动中" aria-label="项目启动中" disabled></button>'
+          : execution === "running"
           ? `<button class="project-action-button pause-icon-button" data-pause-project type="button" title="暂停项目" aria-label="暂停项目">${pauseIcon()}</button>`
           : `<button class="project-action-button" data-start-project type="button" title="${startLabel}" aria-label="${startLabel}">${playIcon()}</button>`;
       return `<div class="project-row${active}" data-project-id="${escapeHtml(project.projectId)}">
         <button class="project-open" data-open-project type="button" title="打开项目" aria-label="打开项目">
           <span>
             <strong>${escapeHtml(project.name)}</strong>
-            <small>${escapeHtml(stage)} · ${escapeHtml(executionLabel(execution))} · ${new Date(project.savedAt).toLocaleString()}</small>
+            <small>${escapeHtml(stage)} · ${starting ? "启动中" : escapeHtml(executionLabel(execution))} · ${new Date(project.savedAt).toLocaleString()}</small>
           </span>
         </button>
         <div class="project-actions">
           ${actionButton}
-          <button class="project-action-button danger-icon-button" data-delete-project type="button" title="删除项目" aria-label="删除项目">${trashIcon()}</button>
+          <button class="project-action-button danger-icon-button" data-delete-project type="button" title="删除项目" aria-label="删除项目" ${starting ? "disabled" : ""}>${trashIcon()}</button>
         </div>
       </div>`;
     })
@@ -1453,10 +1492,14 @@ function renderProjectList() {
 }
 
 function requestStartProject(projectId) {
+  if (state.startingProjectIds.size > 0) {
+    showToast("已有项目正在启动，请等待当前启动操作完成。");
+    return;
+  }
   const target = state.projectSummaries.find((project) => project.projectId === projectId);
   const running = state.projectSummaries.find((project) => project.executionStatus === "running");
   if (target?.executionStatus === "paused" && (!running || running.projectId === projectId)) {
-    startProject(projectId, { resumed: true }).catch((error) => showToast(error.message));
+    void executeStartProject(projectId, { resumed: true });
     return;
   }
 
@@ -1474,6 +1517,23 @@ function requestStartProject(projectId) {
   $("#start-confirm-message").textContent = `${base}${interruption}`;
   $("#confirm-start-project").textContent = pendingStartMode === "resume" ? "确认继续" : "确认启动";
   startConfirmDialog.showModal();
+}
+
+async function executeStartProject(projectId, options = {}) {
+  if (state.startingProjectIds.has(projectId)) {
+    return;
+  }
+  state.startingProjectIds.add(projectId);
+  renderProjectList();
+  try {
+    await startProject(projectId, options);
+  } catch (error) {
+    showToast(`项目启动失败：${error.message}`);
+    await loadProjects({ autoOpenLatest: false }).catch(() => renderProjectList());
+  } finally {
+    state.startingProjectIds.delete(projectId);
+    renderProjectList();
+  }
 }
 
 async function startProject(projectId, { resumed = false, restarted = false } = {}) {
@@ -1512,10 +1572,32 @@ async function pauseProject(projectId) {
 }
 
 function requestDeleteProject(projectId) {
+  if (deleteRequestInFlight) {
+    showToast("正在删除项目，请等待当前删除操作完成。");
+    return;
+  }
   const target = state.projectSummaries.find((project) => project.projectId === projectId);
   pendingDeleteProjectId = projectId;
   $("#delete-confirm-message").textContent = `确认删除「${target?.name ?? projectId}」？删除后会移除本地进度、任务记录和工作空间文件。`;
   deleteConfirmDialog.showModal();
+}
+
+async function restoreProjectListAfterFailedDeletion(projectId, previousSummaries, restoreCurrentProject) {
+  try {
+    const listing = await request("/projects");
+    state.projectSummaries = listing.projects.filter((project) => !state.deletingProjectIds.has(project.projectId));
+  } catch {
+    state.projectSummaries = previousSummaries;
+  }
+
+  renderProjectList();
+  if (restoreCurrentProject && !state.projectId && state.projectSummaries.some((project) => project.projectId === projectId)) {
+    try {
+      await loadProject(projectId);
+    } catch {
+      // The project may have been deleted even if the response was interrupted.
+    }
+  }
 }
 
 function executionLabel(status) {

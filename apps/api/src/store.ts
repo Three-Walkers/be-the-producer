@@ -162,7 +162,7 @@ export class StudioProjectStore {
       },
       {
         scriptedReplies: false,
-        modelReplies: true,
+        modelReplies: false,
         bootstrapProjectState: true,
         protocolFlows: true
       }
