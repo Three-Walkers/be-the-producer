@@ -20,6 +20,9 @@ export interface AgentTaskRunInput {
   abortSignal?: AbortSignal;
 }
 
+const defaultRoomHarnessTimeoutMs = 30_000;
+const defaultRoomFallbackTimeoutMs = 60_000;
+
 export class ModelAgentRuntime {
   async respond(kernel: StudioKernel, producerMessage: StudioMessage, routePlan: RoutePlan): Promise<ModelAgentRunResult> {
     const targets = selectTargets(producerMessage, routePlan);
@@ -228,14 +231,54 @@ export class ModelAgentRuntime {
       let prepared = sessionCoordinator.prepareContext(kernel, lockedSession, agent, producerMessage.roomId, undefined, producerMessage.messageId);
       try {
         if (assignment.harnessId === "claude-cli") {
-          let result;
+          let result: Awaited<ReturnType<typeof runClaudeRoomSession>> | undefined;
+          let fallbackReason: string | undefined;
           try {
             result = await runClaudeRoomSession(kernel, producerMessage, agent, provider, model, route?.reasons ?? [], prepared.session, prepared.context.prompt);
           } catch (error) {
-            if (!(error instanceof ClaudeSessionResumeError)) throw error;
-            const recovered = sessionCoordinator.recoverResumeFailure(kernel, prepared.session, error.message);
-            prepared = sessionCoordinator.prepareContext(kernel, recovered, agent, producerMessage.roomId, undefined, producerMessage.messageId);
-            result = await runClaudeRoomSession(kernel, producerMessage, agent, provider, model, route?.reasons ?? [], prepared.session, prepared.context.prompt);
+            if (error instanceof ClaudeSessionResumeError) {
+              const recovered = sessionCoordinator.recoverResumeFailure(kernel, prepared.session, error.message);
+              prepared = sessionCoordinator.prepareContext(kernel, recovered, agent, producerMessage.roomId, undefined, producerMessage.messageId);
+              if (!isHarnessTimeoutFailure(error)) {
+                try {
+                  result = await runClaudeRoomSession(kernel, producerMessage, agent, provider, model, route?.reasons ?? [], prepared.session, prepared.context.prompt);
+                } catch (retryError) {
+                  fallbackReason = compactFailure(retryError);
+                }
+              } else {
+                fallbackReason = compactFailure(error);
+              }
+            } else {
+              fallbackReason = compactFailure(error);
+            }
+          }
+          if (!result) {
+            const fallback = await generateModelChat(provider, {
+              model,
+              systemPrompt: buildClaudeRoomSystemPrompt(agent),
+              userPrompt: buildRoomUserPrompt(kernel, producerMessage, route?.reasons ?? [], prepared.context.prompt),
+              maxTokens: 1800,
+              timeoutMs: roomFallbackTimeoutMs()
+            });
+            const committed = sessionCoordinator.commitSuccess(kernel, prepared.session, prepared.context.packet, { outputText: fallback.content });
+            const guarded = enforceProducerGateBoundary(kernel, fallback.content);
+            return createAgentMessage(kernel, producerMessage, agent.agentId, guarded.messageType ?? inferMessageType(producerMessage), guarded.content, {
+              generatedBy: "model_agent_runtime",
+              providerId: fallback.providerId,
+              model: fallback.model,
+              latencyMs: fallback.latencyMs,
+              executionPath: "direct_model_api_fallback",
+              configuredHarnessId: assignment.harnessId,
+              harnessFallback: true,
+              harnessFailure: fallbackReason ?? "Claude CLI 房间会话未返回结果。",
+              sessionStrategy: "persistent_room_cursor",
+              sessionKey: committed.sessionKey,
+              sessionScope: committed.scope,
+              contextPacketId: prepared.context.packet.packetId,
+              contextHealth: prepared.context.packet.health,
+              routeReasons: route?.reasons ?? [],
+              ...guarded.metadata
+            });
           }
           const committed = sessionCoordinator.commitSuccess(kernel, prepared.session, prepared.context.packet, {
             ...(result.sessionId ? { sessionId: result.sessionId } : {}),
@@ -428,21 +471,53 @@ async function runClaudeRoomSession(
     provider,
     model,
     systemPrompt: buildClaudeRoomSystemPrompt(agent),
-    userPrompt: [
-      contextPrompt,
-      "",
-      `本次路由原因：${routeReasons.join("、") || "房间职责匹配"}`,
-      `制作人当前消息：${producerMessage.content}`,
-      "请直接以当前角色回复制作人。当前是房间讨论 session，不创建产物；需要落地工作时应明确关联或创建任务，由独立 task child session 执行。"
-    ].join("\n"),
+    userPrompt: buildRoomUserPrompt(kernel, producerMessage, routeReasons, contextPrompt),
     allowedRoots: allowedRootsForAgent(agent),
     expectedPaths: [],
     requireToolProgress: false,
     toolMode: "conversation",
+    timeoutMs: roomHarnessTimeoutMs(),
     sessionKey: session.sessionKey,
     sessionScope: session.scope,
     ...(session.sessionId ? { sessionId: session.sessionId } : {})
   });
+}
+
+function buildRoomUserPrompt(
+  kernel: StudioKernel,
+  producerMessage: StudioMessage,
+  routeReasons: string[],
+  contextPrompt: string
+): string {
+  return [
+    contextPrompt,
+    "",
+    `本次路由原因：${routeReasons.join("、") || "房间职责匹配"}`,
+    `项目：${kernel.project.name}`,
+    `制作人当前消息：${producerMessage.content}`,
+    "请直接以当前角色回复制作人。当前是房间讨论 session，不创建产物；需要落地工作时应明确关联或创建任务，由独立 task child session 执行。"
+  ].join("\n");
+}
+
+function roomHarnessTimeoutMs(): number {
+  return boundedTimeout(process.env.BTP_ROOM_HARNESS_TIMEOUT_MS, defaultRoomHarnessTimeoutMs);
+}
+
+function roomFallbackTimeoutMs(): number {
+  return boundedTimeout(process.env.BTP_ROOM_FALLBACK_TIMEOUT_MS, defaultRoomFallbackTimeoutMs);
+}
+
+function boundedTimeout(value: string | undefined, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? Math.max(100, Math.round(parsed)) : fallback;
+}
+
+function isHarnessTimeoutFailure(error: unknown): boolean {
+  return /执行超过|timeout|timed?\s*out/i.test(error instanceof Error ? error.message : String(error));
+}
+
+function compactFailure(error: unknown): string {
+  return (error instanceof Error ? error.message : String(error)).replace(/\s+/g, " ").trim().slice(0, 500);
 }
 
 function buildClaudeRoomSystemPrompt(agent: AgentContract): string {

@@ -234,6 +234,23 @@ await assert.rejects(
   /没有产生工具写入/
 );
 
+const perRunTimeoutStartedAt = Date.now();
+await assert.rejects(
+  harness.run({
+    projectId: kernel.project.projectId,
+    projectRoot,
+    agent,
+    provider,
+    model: "qwen-test",
+    systemPrompt: "test",
+    userPrompt: "HANG_NO_PROGRESS",
+    requireToolProgress: false,
+    timeoutMs: 100
+  }),
+  /执行超过/
+);
+assert.ok(Date.now() - perRunTimeoutStartedAt < 500, "per-run conversation timeout should override the task harness default");
+
 const abortController = new AbortController();
 const aborted = harness.run({
   projectId: kernel.project.projectId,
@@ -250,4 +267,4 @@ await assert.rejects(aborted, /暂停或取消/);
 assert.equal(existsSync(join(projectRoot, "docs/design/harness-proof.md")), true);
 
 rmSync(tempRoot, { recursive: true, force: true });
-process.stdout.write("Claude CLI Harness smoke passed: session resume, partial progress recovery, isolated evidence ledger, cancellation\n");
+process.stdout.write("Claude CLI Harness smoke passed: session resume, per-run timeout, partial progress recovery, isolated evidence ledger, cancellation\n");

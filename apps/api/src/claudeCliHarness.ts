@@ -103,7 +103,7 @@ export class ClaudeCliHarness implements AgentHarness {
         cwd: input.projectRoot,
         env: claudeEnvironment(input, configDir),
         stdin: input.userPrompt,
-        timeoutMs: this.options.timeoutMs ?? defaultTimeoutMs,
+        timeoutMs: input.timeoutMs ?? this.options.timeoutMs ?? defaultTimeoutMs,
         ...(input.requireToolProgress === false
           ? {}
           : {
@@ -486,7 +486,7 @@ function runProcess(
         requestProgressTermination("timeout_with_progress");
         return;
       }
-      requestedError = new Error(`Claude CLI 执行超过 ${Math.round(options.timeoutMs / 60_000)} 分钟且没有产生工具写入，已终止。`);
+      requestedError = new Error(`Claude CLI 执行超过 ${formatTimeout(options.timeoutMs)} 且没有产生工具写入，已终止。`);
       terminate();
     }, options.timeoutMs);
     const progress = options.progress;
@@ -584,6 +584,13 @@ function expectedOutputsExist(progress: NonNullable<ProcessOptions["progress"]>)
 
 function compactProcessError(value: string): string {
   return value.replace(/\s+/g, " ").trim().slice(0, 500);
+}
+
+function formatTimeout(timeoutMs: number): string {
+  if (timeoutMs < 60_000) {
+    return `${Math.max(1, Math.round(timeoutMs / 1_000))} 秒`;
+  }
+  return `${Math.max(1, Math.round(timeoutMs / 60_000))} 分钟`;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

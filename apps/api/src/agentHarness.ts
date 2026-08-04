@@ -16,6 +16,7 @@ export interface AgentHarnessRunInput {
   sessionKey?: string;
   sessionScope?: AgentSessionScope;
   sessionId?: string;
+  timeoutMs?: number;
   abortSignal?: AbortSignal;
 }
 
