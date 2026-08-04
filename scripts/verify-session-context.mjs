@@ -10,7 +10,39 @@ const targetAgent = defaultAgentContracts.find((candidate) => candidate.agentId 
 assert.ok(agent);
 assert.ok(targetAgent);
 const room = kernel.getRoom("design-room");
+const studioRoom = kernel.getRoom("studio-main");
+const qaRoom = kernel.getRoom("qa-room");
+const unrelatedRoom = kernel.getRoom("art-room");
 const identity = { providerId: "test-provider", model: "test-model", harnessId: "claude-cli" };
+
+kernel.recordMessage(message(
+  kernel.project.projectId,
+  studioRoom.roomId,
+  "msg_cross_room_producer",
+  -3,
+  "producer",
+  "producer",
+  "跨房间确认：单局目标时长为 90 秒。",
+  [agent.agentId]
+));
+kernel.recordMessage(message(
+  kernel.project.projectId,
+  studioRoom.roomId,
+  "msg_cross_room_agent",
+  -2,
+  "agent",
+  agent.agentId,
+  "收到，后续玩法设计沿用 90 秒目标时长。"
+));
+kernel.recordMessage(message(
+  kernel.project.projectId,
+  unrelatedRoom.roomId,
+  "msg_unrelated_art_room",
+  -1,
+  "producer",
+  "producer",
+  "仅供美术房间讨论的无关色板口令。"
+));
 
 for (let index = 0; index < 12; index += 1) {
   kernel.recordMessage(message(kernel.project.projectId, room.roomId, `msg_${index}`, index));
@@ -19,9 +51,14 @@ for (let index = 0; index < 12; index += 1) {
 let roomSession = coordinator.getOrCreateRoomSession(kernel, agent, room.roomId, identity);
 let prepared = coordinator.prepareContext(kernel, roomSession, agent, room.roomId, undefined, "msg_11");
 const firstDelta = layer(prepared.context.packet, "room_delta");
+const firstSharedRoleMemory = layer(prepared.context.packet, "role_cross_room_memory");
 assert.equal(prepared.context.packet.health.deltaMessageCount, 12);
 assert.match(firstDelta.content, /msg_0/);
 assert.match(firstDelta.content, /msg_11/);
+assert.match(firstSharedRoleMemory.content, /#studio-main/);
+assert.match(firstSharedRoleMemory.content, /单局目标时长为 90 秒/);
+assert.match(firstSharedRoleMemory.content, /后续玩法设计沿用 90 秒/);
+assert.doesNotMatch(firstSharedRoleMemory.content, /无关色板口令/);
 roomSession = coordinator.commitSuccess(kernel, prepared.session, prepared.context.packet, {
   sessionId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
   invocationId: "inv_room_first",
@@ -42,6 +79,14 @@ roomSession = coordinator.commitSuccess(kernel, prepared.session, prepared.conte
   outputText: "second room response"
 });
 assert.equal(roomSession.cursor.lastMessageId, "msg_13");
+
+const qaSession = coordinator.getOrCreateRoomSession(kernel, agent, qaRoom.roomId, identity);
+const qaPrepared = coordinator.prepareContext(kernel, qaSession, agent, qaRoom.roomId, undefined, "msg_13");
+const qaSharedRoleMemory = layer(qaPrepared.context.packet, "role_cross_room_memory");
+assert.notEqual(qaSession.logicalSessionKey, roomSession.logicalSessionKey);
+assert.match(qaSharedRoleMemory.content, /#design-room/);
+assert.match(qaSharedRoleMemory.content, /msg_13/);
+assert.doesNotMatch(layer(qaPrepared.context.packet, "room_delta").content, /msg_13/);
 
 const previousRoomSession = roomSession;
 roomSession = coordinator.getOrCreateRoomSession(kernel, agent, room.roomId, {
@@ -166,9 +211,18 @@ assert.equal(restored.listContextPackets().length, kernel.listContextPackets().l
 assert.equal(restored.listHandoffCapsules().length, kernel.listHandoffCapsules().length);
 assert.equal(restored.findAgentSession(recovered.sessionKey)?.predecessorSessionKey, recovered.predecessorSessionKey);
 
-process.stdout.write("Session context smoke passed: cursor packets, persistent resume records, mutex, health rotation, recovery, child return, handoff, restart persistence\n");
+process.stdout.write("Session context smoke passed: cursor packets, cross-room role memory, persistent resume records, mutex, health rotation, recovery, child return, handoff, restart persistence\n");
 
-function message(projectId, roomId, messageId, index, senderType = "producer", senderId = "producer") {
+function message(
+  projectId,
+  roomId,
+  messageId,
+  index,
+  senderType = "producer",
+  senderId = "producer",
+  content = `消息 ${index}：用于验证房间级游标，不允许退化为固定最后 8 条。`,
+  mentions = []
+) {
   return {
     messageId,
     projectId,
@@ -176,8 +230,8 @@ function message(projectId, roomId, messageId, index, senderType = "producer", s
     senderType,
     senderId,
     messageType: "progress_update",
-    content: `消息 ${index}：用于验证房间级游标，不允许退化为固定最后 8 条。`,
-    mentions: [],
+    content,
+    mentions,
     relatedTaskIds: [],
     relatedArtifactIds: [],
     metadata: {},

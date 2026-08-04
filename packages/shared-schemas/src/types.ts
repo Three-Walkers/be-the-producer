@@ -17,6 +17,7 @@ export type ContextHealthStatus = "healthy" | "degraded" | "stale" | "oversized"
 export type ContextPacketLayerKind =
   | "identity"
   | "durable_memory"
+  | "role_cross_room_memory"
   | "task_state"
   | "artifact_evidence"
   | "handoff_capsules"

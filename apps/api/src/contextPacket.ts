@@ -15,6 +15,7 @@ import type {
 
 const defaultContextBudgetTokens = 64_000;
 const charsPerTokenEstimate = 3.2;
+const roleCrossRoomMemoryBudgetChars = 12_000;
 
 export interface BuildContextPacketInput {
   session: AgentSessionRecord;
@@ -74,6 +75,22 @@ export function buildContextPacket(kernel: StudioKernel, input: BuildContextPack
   const durableMemory = renderMemoryPack(memoryPack);
   layers.push(layer("durable_memory", "持久记忆与已确认事实", limitText(durableMemory, 10_000), memoryRefs(memoryPack), durableMemory.length > 10_000));
 
+  const roleCrossRoomMemory = renderRoleCrossRoomMemory(
+    kernel,
+    input.agent,
+    input.roomId,
+    roleCrossRoomMemoryBudgetChars
+  );
+  if (roleCrossRoomMemory.messageCount > 0) {
+    layers.push(layer(
+      "role_cross_room_memory",
+      `同角色跨房间共享记忆（${input.agent.displayName}）`,
+      roleCrossRoomMemory.content,
+      roleCrossRoomMemory.sourceRefs,
+      roleCrossRoomMemory.truncated
+    ));
+  }
+
   if (input.task) {
     const taskState = renderTask(input.task);
     layers.push(layer("task_state", "当前任务", limitText(taskState, 8_000), [input.task.taskId], taskState.length > 8_000));
@@ -122,7 +139,7 @@ export function buildContextPacket(kernel: StudioKernel, input: BuildContextPack
     estimatedTokens: projectedSessionTokens,
     budgetTokens,
     deltaMessageCount: deltaMessages.length,
-    omittedMessageCount: roomLayer.omitted.length,
+    omittedMessageCount: roomLayer.omitted.length + roleCrossRoomMemory.omittedCount,
     staleCursor,
     checkedAt: now
   });
@@ -157,7 +174,8 @@ export function renderContextPacket(packet: ContextPacket): string {
     header,
     ...packet.layers.map((item) => `\n## ${item.title}\n${item.content}`),
     "\n## 上下文协议",
-    "只使用本 Context Packet 与工具读取到的真实项目状态工作。房间增量由服务端游标维护；不要假设未出现的信息，也不要要求回退到固定条数的聊天历史。"
+    "只使用本 Context Packet 与工具读取到的真实项目状态工作。房间增量由服务端游标维护；不要假设未出现的信息，也不要要求回退到固定条数的聊天历史。",
+    "同角色跨房间共享记忆是带来源房间的只读快照。可以延续其中已经讨论的事实，但必须区分来源房间，当前回复仍只发送到当前房间。"
   ].join("\n");
 }
 
@@ -235,6 +253,128 @@ function renderOwnedWork(kernel: StudioKernel, agentId: string): string {
     "相关产物：",
     ...(artifacts.length > 0 ? artifacts.map((artifact) => `- ${artifact.artifactId}: ${artifact.path} [${artifact.status}]`) : ["- 无"])
   ].join("\n");
+}
+
+interface RoleCrossRoomMemory {
+  content: string;
+  sourceRefs: string[];
+  messageCount: number;
+  omittedCount: number;
+  truncated: boolean;
+}
+
+function renderRoleCrossRoomMemory(
+  kernel: StudioKernel,
+  agent: AgentContract,
+  currentRoomId: string,
+  budgetChars: number
+): RoleCrossRoomMemory {
+  const allMessages = kernel.listMessages();
+  const roomEntries = kernel.listRooms()
+    .filter((room) => room.roomId !== currentRoomId)
+    .map((room) => {
+      const messages = allMessages.filter((message) => message.roomId === room.roomId);
+      const agentParticipated = messages.some(
+        (message) =>
+          (message.senderType === "agent" && message.senderId === agent.agentId)
+          || message.mentions.includes(agent.agentId)
+      );
+      return { room, messages, relevant: room.participants.includes(agent.agentId) || agentParticipated };
+    })
+    .filter((entry) => entry.relevant && entry.messages.length > 0)
+    .sort((left, right) => {
+      const leftTime = left.messages.at(-1)?.createdAt ?? "";
+      const rightTime = right.messages.at(-1)?.createdAt ?? "";
+      return rightTime.localeCompare(leftTime);
+    });
+
+  if (roomEntries.length === 0) {
+    return { content: "", sourceRefs: [], messageCount: 0, omittedCount: 0, truncated: false };
+  }
+
+  const intro = [
+    `该角色在当前项目的 ${roomEntries.length} 个其他房间中存在可共享对话。`,
+    "以下内容按来源房间隔离展示；摘要覆盖较早消息，原文区保留预算内的最近消息。"
+  ].join("\n");
+  const availableChars = Math.max(1_200, budgetChars - intro.length - 2);
+  const perRoomBudget = Math.max(1_200, Math.floor(availableChars / roomEntries.length));
+  const sections: string[] = [];
+  const sourceRefs: string[] = [];
+  let messageCount = 0;
+  let omittedCount = 0;
+
+  for (const entry of roomEntries) {
+    messageCount += entry.messages.length;
+    const digestBudget = Math.min(2_200, Math.max(600, Math.floor(perRoomBudget * 0.36)));
+    const recentBudget = Math.max(600, perRoomBudget - digestBudget - 240);
+    const recent = renderRoomDelta(entry.messages, recentBudget);
+    omittedCount += recent.omitted.length;
+    const digest = recent.omitted.length > 0
+      ? summarizeRoleMessages(recent.omitted, agent.agentId, digestBudget)
+      : "";
+    const section = [
+      `### ${entry.room.name} (${entry.room.roomId})`,
+      digest ? `较早对话摘要：\n${digest}` : "",
+      recent.content ? `最近对话原文：\n${recent.content}` : ""
+    ].filter(Boolean).join("\n");
+    sections.push(limitText(section, perRoomBudget));
+    sourceRefs.push(entry.room.roomId, ...recent.included.map((message) => message.messageId));
+    if (recent.omitted.length > 0) {
+      sourceRefs.push(
+        `message-range:${recent.omitted[0]?.messageId ?? "unknown"}:${recent.omitted.at(-1)?.messageId ?? "unknown"}`
+      );
+    }
+  }
+
+  const content = limitText([intro, ...sections].join("\n\n"), budgetChars);
+  return {
+    content,
+    sourceRefs: [...new Set(sourceRefs)],
+    messageCount,
+    omittedCount,
+    truncated: omittedCount > 0 || content.length >= budgetChars
+  };
+}
+
+function summarizeRoleMessages(messages: StudioMessage[], agentId: string, budgetChars: number): string {
+  if (messages.length === 0) return "无。";
+  const statements = selectRoleConversationStatements(messages, agentId, Math.max(240, budgetChars - 180));
+  return limitText([
+    `范围：${messages[0]?.messageId} → ${messages.at(-1)?.messageId}，共 ${messages.length} 条。`,
+    statements.length > 0 ? `与该角色相关的原始摘录：\n${statements.join("\n")}` : "未发现需单列的原始摘录。"
+  ].join("\n"), budgetChars);
+}
+
+function selectRoleConversationStatements(messages: StudioMessage[], agentId: string, budgetChars: number): string[] {
+  const selected: string[] = [];
+  let used = 0;
+  const highValueTypes = new Set([
+    "decision_record",
+    "decision_request",
+    "change_request",
+    "review",
+    "blocker",
+    "handoff",
+    "bug_report",
+    "qa_failure"
+  ]);
+  const candidates = messages.filter(
+    (message) =>
+      message.senderType === "producer"
+      || (message.senderType === "agent" && message.senderId === agentId)
+      || message.mentions.includes(agentId)
+      || highValueTypes.has(message.messageType)
+  );
+  for (let index = candidates.length - 1; index >= 0; index -= 1) {
+    const message = candidates[index];
+    if (!message) continue;
+    const sender = message.senderType === "producer" ? "制作人" : message.senderId;
+    const statement = `- [${message.messageId}] ${sender}: ${limitText(message.content.replace(/\s+/g, " "), 360)}`;
+    if (selected.length > 0 && used + statement.length > budgetChars) break;
+    selected.unshift(statement);
+    used += statement.length;
+  }
+  return selected;
 }
 
 function renderRoomDelta(messages: StudioMessage[], budgetChars: number): { content: string; included: StudioMessage[]; omitted: StudioMessage[] } {
@@ -333,7 +473,7 @@ function assessContextHealth(input: {
     reasons.push("会话累计上下文估算已达到预算，需要 seal 并创建后继会话。");
   } else if (ratio >= 0.78 || input.omittedMessageCount > 0) {
     status = "degraded";
-    reasons.push(input.omittedMessageCount > 0 ? "本次消息增量已压缩为摘要。" : "会话累计上下文接近预算。");
+    reasons.push(input.omittedMessageCount > 0 ? "上下文中的部分房间消息已压缩为摘要。" : "会话累计上下文接近预算。");
   }
   if (reasons.length === 0) reasons.push("游标连续，分层上下文处于预算内。");
   return {
