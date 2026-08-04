@@ -24,6 +24,8 @@ const state = {
   selectedModelProviderId: "dashscope"
 };
 
+const agentTypingIndicatorTimeoutMs = 2 * 60 * 1000;
+
 const presets = {
   stage1: {
     roomKind: "studio-main",
@@ -832,6 +834,17 @@ function removeAgentTypingIndicator(indicatorId) {
 
   state.pendingAgentResponses = next;
   renderMessages();
+}
+
+function expireStaleAgentTypingIndicators() {
+  const cutoff = Date.now() - agentTypingIndicatorTimeoutMs;
+  const next = state.pendingAgentResponses.filter((indicator) => new Date(indicator.createdAt).getTime() >= cutoff);
+  if (next.length === state.pendingAgentResponses.length) {
+    return;
+  }
+  state.pendingAgentResponses = next;
+  renderMessages();
+  showToast("Agent 回复等待超时，输入状态已结束；服务端会记录超时或降级结果。");
 }
 
 function markOptimisticMessageFailed(messageId) {
@@ -2465,6 +2478,7 @@ loadProjects().catch((error) => showToast(error.message));
 
 let backgroundRefreshInFlight = false;
 setInterval(() => {
+  expireStaleAgentTypingIndicators();
   if (!state.projectId || currentExecutionStatus() !== "running" || backgroundRefreshInFlight) {
     return;
   }
