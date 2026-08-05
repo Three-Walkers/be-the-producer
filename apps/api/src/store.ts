@@ -320,7 +320,11 @@ export class StudioProjectStore {
     };
     const result = this.runtime.handleProducerMessage(kernel, message, runtimeOptions);
     if (options.modelReplies && result.agentMessages.length === 0) {
-      const modelResult = await this.modelRuntime.respond(kernel, message, result.routePlan);
+      const modelResult = await this.modelRuntime.respond(kernel, message, result.routePlan, {
+        onAgentMessage: () => {
+          this.checkpointKernel(kernel);
+        }
+      });
       result.agentMessages.push(...modelResult.agentMessages);
     }
     await executeAgentToolRequests(kernel, result.agentMessages);
