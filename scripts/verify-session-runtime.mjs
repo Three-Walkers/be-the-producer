@@ -20,6 +20,10 @@ if (args.includes("--version")) {
   process.stdout.write("9.9.9-runtime-test\\n");
   process.exit(0);
 }
+if (!args.includes("--include-partial-messages") || args[args.indexOf("--effort") + 1] !== "low") {
+  process.stderr.write("Room session must enable partial messages and low effort.\\n");
+  process.exit(2);
+}
 let prompt = "";
 for await (const chunk of process.stdin) prompt += chunk;
 if (prompt.includes("ROOM_TIMEOUT_FALLBACK")) {
@@ -98,9 +102,11 @@ assert.ok(kernel.listHandoffCapsules(active.sessionKey).some((capsule) => capsul
 const projectRoot = join(process.env.STUDIO_WORKSPACE_ROOT, kernel.project.projectId);
 assert.equal(readFileSync(join(projectRoot, ".be-the-producer", "runtime-test-count.txt"), "utf8"), "3");
 
+let fallbackRequestCount = 0;
 const fallbackServer = createServer((_request, response) => {
+  fallbackRequestCount += 1;
   response.writeHead(200, { "content-type": "application/json" });
-  response.end(JSON.stringify({ content: [{ type: "text", text: "已通过直接 API 降级回复制作人。" }] }));
+  response.end(JSON.stringify({ content: [{ type: "text", text: "不应调用到这里。" }] }));
 });
 await new Promise((resolve) => fallbackServer.listen(0, "127.0.0.1", resolve));
 const fallbackAddress = fallbackServer.address();
@@ -116,14 +122,16 @@ const thirdProducerMessage = producerMessage(kernel.project.projectId, room.room
 kernel.recordMessage(thirdProducerMessage);
 const third = await runtime.respond(kernel, thirdProducerMessage, routePlan);
 assert.equal(third.agentMessages.length, 1);
-assert.equal(third.agentMessages[0].metadata.failure, undefined);
-assert.equal(third.agentMessages[0].metadata.harnessFallback, true);
-assert.equal(third.agentMessages[0].metadata.executionPath, "direct_model_api_fallback");
-assert.match(third.agentMessages[0].content, /直接 API 降级/);
+assert.equal(third.agentMessages[0].metadata.failure, true);
+assert.equal(third.agentMessages[0].metadata.failureKind, "timeout");
+assert.equal(third.agentMessages[0].metadata.harnessTimeoutKind, "overall");
+assert.equal(third.agentMessages[0].metadata.executionPath, "claude_cli_room_session");
+assert.match(third.agentMessages[0].content, /没有再次请求同一模型/);
+assert.equal(fallbackRequestCount, 0, "CLI timeout must not retry the same provider/model through direct API fallback");
 await new Promise((resolve, reject) => fallbackServer.close((error) => error ? reject(error) : resolve()));
 
 rmSync(tempRoot, { recursive: true, force: true });
-process.stdout.write("Session runtime smoke passed: persisted room session, --resume recovery, bounded CLI timeout, direct API fallback\n");
+process.stdout.write("Session runtime smoke passed: persisted room session, --resume recovery, activity-aware CLI options, no same-model timeout retry\n");
 
 function producerMessage(projectId, roomId, messageId, content, second) {
   return {

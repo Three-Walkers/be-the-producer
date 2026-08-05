@@ -17,6 +17,9 @@ export interface AgentHarnessRunInput {
   sessionScope?: AgentSessionScope;
   sessionId?: string;
   timeoutMs?: number;
+  idleTimeoutMs?: number;
+  effort?: "low" | "medium" | "high" | "max";
+  includePartialMessages?: boolean;
   abortSignal?: AbortSignal;
 }
 
@@ -30,6 +33,7 @@ export interface AgentHarnessRunResult {
   model: string;
   providerId: string;
   latencyMs: number;
+  firstOutputMs?: number;
   rawEventCount: number;
   changedPaths?: string[];
   toolOperations?: AgentHarnessToolOperation[];

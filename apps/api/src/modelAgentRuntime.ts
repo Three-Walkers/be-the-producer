@@ -1,9 +1,9 @@
 import { defaultAgentContracts, type RoutePlan, type StudioKernel } from "@game-pipeline/agent-runtime";
 import type { AgentContract, AgentId, AgentLoopControl, AgentSessionRecord, MessageType, StudioMessage, Task } from "@game-pipeline/shared-schemas";
-import { generateModelChat } from "./modelClient.js";
+import { generateModelChat, ModelRequestError, type ModelChatInput, type ModelRequestTrace } from "./modelClient.js";
 import { modelSettingsStore } from "./modelSettings.js";
 import { executableToolsForAgent, type ToolExecutionResult } from "./toolExecutor.js";
-import { ClaudeSessionResumeError, claudeCliHarness } from "./claudeCliHarness.js";
+import { ClaudeCliTimeoutError, ClaudeSessionResumeError, claudeCliHarness } from "./claudeCliHarness.js";
 import { allowedRootsForAgent, attachHarnessEvidenceToMessage, captureWorkspaceSnapshot, recordHarnessWorkspaceChanges } from "./harnessWorkspaceEvidence.js";
 import { readArtifactContentForModel, resolveProjectWorkspaceRoot, syncProjectWorkspace } from "./workspaceWriter.js";
 import { expectedHarnessOutputPaths, requiredRuntimePngPaths, taskOutputsVerified } from "./taskOutputEvidence.js";
@@ -13,6 +13,10 @@ export interface ModelAgentRunResult {
   agentMessages: StudioMessage[];
 }
 
+export interface ModelAgentRespondOptions {
+  onAgentMessage?: (message: StudioMessage) => void | Promise<void>;
+}
+
 export interface AgentTaskRunInput {
   iteration: number;
   triggerMessageId?: string;
@@ -20,21 +24,29 @@ export interface AgentTaskRunInput {
   abortSignal?: AbortSignal;
 }
 
-const defaultRoomHarnessTimeoutMs = 30_000;
-const defaultRoomFallbackTimeoutMs = 60_000;
+const defaultRoomHarnessTimeoutMs = 180_000;
+const defaultRoomHarnessIdleTimeoutMs = 90_000;
+const defaultRoomModelTimeoutMs = 180_000;
+const defaultRoomModelIdleTimeoutMs = 90_000;
 
 export class ModelAgentRuntime {
-  async respond(kernel: StudioKernel, producerMessage: StudioMessage, routePlan: RoutePlan): Promise<ModelAgentRunResult> {
+  async respond(
+    kernel: StudioKernel,
+    producerMessage: StudioMessage,
+    routePlan: RoutePlan,
+    options: ModelAgentRespondOptions = {}
+  ): Promise<ModelAgentRunResult> {
     const targets = selectTargets(producerMessage, routePlan);
     const agents = targets
       .map((agentId) => defaultAgentContracts.find((candidate) => candidate.agentId === agentId))
       .filter((agent): agent is AgentContract => Boolean(agent));
-    const agentMessages = await Promise.all(
-      agents.map((agent) => this.respondAsAgent(kernel, producerMessage, agent, routePlan))
-    );
-    for (const message of agentMessages) {
+    const agentMessages = new Array<StudioMessage>(agents.length);
+    await Promise.all(agents.map(async (agent, index) => {
+      const message = await this.respondAsAgent(kernel, producerMessage, agent, routePlan);
       kernel.recordMessage(message);
-    }
+      agentMessages[index] = message;
+      await options.onAgentMessage?.(message);
+    }));
 
     return { agentMessages };
   }
@@ -64,6 +76,10 @@ export class ModelAgentRuntime {
           systemPrompt: buildSystemPrompt(agent),
           userPrompt: buildTaskLoopPrompt(kernel, task, agent, input, prepared.context.prompt),
           maxTokens: 3000,
+          timeoutMs: 10 * 60_000,
+          idleTimeoutMs: 120_000,
+          stream: provider.protocol !== "google",
+          requestPurpose: `task_loop:${task.taskId}:${agent.agentId}`,
           ...(input.abortSignal ? { abortSignal: input.abortSignal } : {})
         });
         sessionCoordinator.commitSuccess(kernel, prepared.session, prepared.context.packet, { outputText: result.content });
@@ -90,6 +106,7 @@ export class ModelAgentRuntime {
             sessionScope: prepared.session.scope,
             contextPacketId: prepared.context.packet.packetId,
             contextHealth: prepared.context.packet.health,
+            ...modelTraceMetadata(result.trace),
             ...guarded.metadata
           },
           createdAt: new Date().toISOString()
@@ -239,26 +256,23 @@ export class ModelAgentRuntime {
             if (error instanceof ClaudeSessionResumeError) {
               const recovered = sessionCoordinator.recoverResumeFailure(kernel, prepared.session, error.message);
               prepared = sessionCoordinator.prepareContext(kernel, recovered, agent, producerMessage.roomId, undefined, producerMessage.messageId);
-              if (!isHarnessTimeoutFailure(error)) {
-                try {
-                  result = await runClaudeRoomSession(kernel, producerMessage, agent, provider, model, route?.reasons ?? [], prepared.session, prepared.context.prompt);
-                } catch (retryError) {
-                  fallbackReason = compactFailure(retryError);
-                }
-              } else {
-                fallbackReason = compactFailure(error);
+              try {
+                result = await runClaudeRoomSession(kernel, producerMessage, agent, provider, model, route?.reasons ?? [], prepared.session, prepared.context.prompt);
+              } catch (retryError) {
+                if (!isHarnessInfrastructureFailure(retryError)) throw retryError;
+                fallbackReason = compactFailure(retryError);
               }
-            } else {
+            } else if (isHarnessInfrastructureFailure(error)) {
               fallbackReason = compactFailure(error);
+            } else {
+              throw error;
             }
           }
           if (!result) {
             const fallback = await generateModelChat(provider, {
-              model,
               systemPrompt: buildClaudeRoomSystemPrompt(agent),
               userPrompt: buildRoomUserPrompt(kernel, producerMessage, route?.reasons ?? [], prepared.context.prompt),
-              maxTokens: 1800,
-              timeoutMs: roomFallbackTimeoutMs()
+              ...roomModelRequestOptions(provider, model, `room_fallback:${producerMessage.messageId}:${agent.agentId}`)
             });
             const committed = sessionCoordinator.commitSuccess(kernel, prepared.session, prepared.context.packet, { outputText: fallback.content });
             const guarded = enforceProducerGateBoundary(kernel, fallback.content);
@@ -277,6 +291,7 @@ export class ModelAgentRuntime {
               contextPacketId: prepared.context.packet.packetId,
               contextHealth: prepared.context.packet.health,
               routeReasons: route?.reasons ?? [],
+              ...modelTraceMetadata(fallback.trace),
               ...guarded.metadata
             });
           }
@@ -299,6 +314,7 @@ export class ModelAgentRuntime {
             sessionEpoch: committed.epoch,
             harnessSessionId: result.sessionId,
             harnessInvocationId: result.invocationId,
+            ...(result.firstOutputMs !== undefined ? { harnessFirstOutputMs: result.firstOutputMs } : {}),
             resumeAttempted: result.resumeAttempted,
             resumed: result.resumed,
             contextPacketId: prepared.context.packet.packetId,
@@ -308,11 +324,9 @@ export class ModelAgentRuntime {
           });
         }
         const result = await generateModelChat(provider, {
-          model,
           systemPrompt: buildSystemPrompt(agent),
           userPrompt: buildUserPrompt(kernel, producerMessage, agent, route?.reasons ?? [], prepared.context.prompt),
-          maxTokens: 1800,
-          timeoutMs: 120_000
+          ...roomModelRequestOptions(provider, model, `room_direct:${producerMessage.messageId}:${agent.agentId}`)
         });
         const committed = sessionCoordinator.commitSuccess(kernel, prepared.session, prepared.context.packet, { outputText: result.content });
         const guarded = enforceProducerGateBoundary(kernel, result.content);
@@ -329,6 +343,7 @@ export class ModelAgentRuntime {
           contextPacketId: prepared.context.packet.packetId,
           contextHealth: prepared.context.packet.health,
           routeReasons: route?.reasons ?? [],
+          ...modelTraceMetadata(result.trace),
           ...guarded.metadata
         });
       } catch (error) {
@@ -351,6 +366,7 @@ export class ModelAgentRuntime {
             contextHealth: prepared.context.packet.health,
             failureKind: failure.kind,
             routeReasons: route?.reasons ?? [],
+            ...modelFailureMetadata(error),
             failure: true
           }
         );
@@ -477,6 +493,9 @@ async function runClaudeRoomSession(
     requireToolProgress: false,
     toolMode: "conversation",
     timeoutMs: roomHarnessTimeoutMs(),
+    idleTimeoutMs: roomHarnessIdleTimeoutMs(),
+    effort: "low",
+    includePartialMessages: true,
     sessionKey: session.sessionKey,
     sessionScope: session.scope,
     ...(session.sessionId ? { sessionId: session.sessionId } : {})
@@ -503,8 +522,16 @@ function roomHarnessTimeoutMs(): number {
   return boundedTimeout(process.env.BTP_ROOM_HARNESS_TIMEOUT_MS, defaultRoomHarnessTimeoutMs);
 }
 
-function roomFallbackTimeoutMs(): number {
-  return boundedTimeout(process.env.BTP_ROOM_FALLBACK_TIMEOUT_MS, defaultRoomFallbackTimeoutMs);
+function roomHarnessIdleTimeoutMs(): number {
+  return boundedTimeout(process.env.BTP_ROOM_HARNESS_IDLE_TIMEOUT_MS, defaultRoomHarnessIdleTimeoutMs);
+}
+
+function roomModelTimeoutMs(): number {
+  return boundedTimeout(process.env.BTP_ROOM_MODEL_TIMEOUT_MS ?? process.env.BTP_ROOM_FALLBACK_TIMEOUT_MS, defaultRoomModelTimeoutMs);
+}
+
+function roomModelIdleTimeoutMs(): number {
+  return boundedTimeout(process.env.BTP_ROOM_MODEL_IDLE_TIMEOUT_MS, defaultRoomModelIdleTimeoutMs);
 }
 
 function boundedTimeout(value: string | undefined, fallback: number): number {
@@ -512,12 +539,69 @@ function boundedTimeout(value: string | undefined, fallback: number): number {
   return Number.isFinite(parsed) ? Math.max(100, Math.round(parsed)) : fallback;
 }
 
-function isHarnessTimeoutFailure(error: unknown): boolean {
-  return /执行超过|timeout|timed?\s*out/i.test(error instanceof Error ? error.message : String(error));
+function isHarnessInfrastructureFailure(error: unknown): boolean {
+  if (error instanceof ClaudeCliTimeoutError || error instanceof ModelRequestError) return false;
+  const message = error instanceof Error ? error.message : String(error);
+  return /\bENOENT\b|spawn\s+claude|command not found|not executable|unknown option|unrecognized option|invalid option/i.test(message);
 }
 
 function compactFailure(error: unknown): string {
   return (error instanceof Error ? error.message : String(error)).replace(/\s+/g, " ").trim().slice(0, 500);
+}
+
+function roomModelRequestOptions(
+  provider: ReturnType<typeof modelSettingsStore.getProviderConfig>,
+  model: string,
+  requestPurpose: string
+): Omit<ModelChatInput, "systemPrompt" | "userPrompt"> {
+  return {
+    model,
+    maxTokens: 1800,
+    timeoutMs: roomModelTimeoutMs(),
+    idleTimeoutMs: roomModelIdleTimeoutMs(),
+    queueWaitTimeoutMs: 30_000,
+    stream: provider.protocol !== "google",
+    ...(shouldDisableRoomThinking(provider, model) ? { thinkingMode: "disabled" as const } : {}),
+    requestPurpose
+  };
+}
+
+function shouldDisableRoomThinking(
+  provider: ReturnType<typeof modelSettingsStore.getProviderConfig>,
+  model: string
+): boolean {
+  return /^qwen/i.test(model) && /dashscope|\.maas\.aliyuncs\.com/i.test(`${provider.providerId} ${provider.baseUrl}`);
+}
+
+function modelTraceMetadata(trace: ModelRequestTrace): Record<string, unknown> {
+  return {
+    modelOperationId: trace.operationId,
+    modelStreaming: trace.streaming,
+    ...(trace.thinkingMode ? { modelThinkingMode: trace.thinkingMode } : {}),
+    ...(trace.providerRequestId ? { providerRequestId: trace.providerRequestId } : {}),
+    ...(trace.responseId ? { modelResponseId: trace.responseId } : {}),
+    ...(trace.headersMs !== undefined ? { modelHeadersMs: trace.headersMs } : {}),
+    ...(trace.firstChunkMs !== undefined ? { modelFirstChunkMs: trace.firstChunkMs } : {}),
+    ...(trace.totalMs !== undefined ? { modelTotalMs: trace.totalMs } : {}),
+    ...(trace.finishReason ? { modelFinishReason: trace.finishReason } : {}),
+    ...(trace.usage ? { modelUsage: trace.usage } : {})
+  };
+}
+
+function modelFailureMetadata(error: unknown): Record<string, unknown> {
+  if (error instanceof ModelRequestError) {
+    return {
+      ...modelTraceMetadata(error.trace),
+      modelRequestFailureKind: error.kind
+    };
+  }
+  if (error instanceof ClaudeCliTimeoutError) {
+    return {
+      harnessTimeoutKind: error.kind,
+      harnessTimeoutMs: error.timeoutMs
+    };
+  }
+  return {};
 }
 
 function buildClaudeRoomSystemPrompt(agent: AgentContract): string {
@@ -551,7 +635,13 @@ function createTaskFailureMessage(
   generatedBy = "agent_loop"
 ): StudioMessage {
   const errorMessage = error instanceof Error ? error.message : String(error);
-  const failureKind = /没有产生工具写入/.test(errorMessage) ? "harness_timeout_no_progress" : "harness_execution_error";
+  const failureKind = error instanceof ModelRequestError
+    ? error.kind
+    : error instanceof ClaudeCliTimeoutError
+      ? `harness_timeout_${error.kind}`
+      : /没有产生工具写入/.test(errorMessage)
+        ? "harness_timeout_no_progress"
+        : "harness_execution_error";
   return {
     messageId: `msg_${agent.agentId}_harness_error_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
     projectId: kernel.project.projectId,
@@ -574,6 +664,7 @@ function createTaskFailureMessage(
       sessionScope: session.scope,
       sessionEpoch: session.epoch,
       failureKind,
+      ...modelFailureMetadata(error),
       failure: true
     },
     createdAt: new Date().toISOString()
@@ -582,13 +673,17 @@ function createTaskFailureMessage(
 
 function describeModelReplyFailure(error: unknown): { kind: "timeout" | "cancelled" | "configuration_or_provider"; userMessage: string } {
   const message = error instanceof Error ? error.message : String(error);
-  if (/超时|超过\s*\d+\s*秒/i.test(message)) {
+  if (
+    error instanceof ClaudeCliTimeoutError
+    || (error instanceof ModelRequestError && ["timeout_overall", "timeout_idle"].includes(error.kind))
+    || /超时|超过\s*\d+\s*(秒|分钟)|没有输出活动/i.test(message)
+  ) {
     return {
       kind: "timeout",
-      userMessage: `${message} 这不代表 API Key 无效；可以重试消息，系统不会把本次超时误判为角色配置错误。`
+      userMessage: `${message} 本次调用没有再次请求同一模型，也不代表 API Key 无效；可以安全重试消息。`
     };
   }
-  if (/暂停|切换|取消|终止/i.test(message)) {
+  if ((error instanceof ModelRequestError && error.kind === "cancelled") || /暂停|切换|取消/i.test(message)) {
     return {
       kind: "cancelled",
       userMessage: message

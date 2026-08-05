@@ -29,6 +29,20 @@ export class ClaudeSessionResumeError extends Error {
   }
 }
 
+export type ClaudeCliTimeoutKind = "overall" | "idle" | "initial_progress";
+
+export class ClaudeCliTimeoutError extends Error {
+  readonly kind: ClaudeCliTimeoutKind;
+  readonly timeoutMs: number;
+
+  constructor(kind: ClaudeCliTimeoutKind, timeoutMs: number, message: string) {
+    super(message);
+    this.name = "ClaudeCliTimeoutError";
+    this.kind = kind;
+    this.timeoutMs = timeoutMs;
+  }
+}
+
 export class ClaudeCliHarness implements AgentHarness {
   readonly harnessId = "claude-cli" as const;
 
@@ -92,6 +106,12 @@ export class ClaudeCliHarness implements AgentHarness {
       "--append-system-prompt",
       input.systemPrompt
     ];
+    if (input.includePartialMessages) {
+      args.push("--include-partial-messages");
+    }
+    if (input.effort) {
+      args.push("--effort", input.effort);
+    }
     if (input.sessionId) {
       args.push("--resume", input.sessionId);
     }
@@ -104,6 +124,7 @@ export class ClaudeCliHarness implements AgentHarness {
         env: claudeEnvironment(input, configDir),
         stdin: input.userPrompt,
         timeoutMs: input.timeoutMs ?? this.options.timeoutMs ?? defaultTimeoutMs,
+        ...(input.idleTimeoutMs ? { idleTimeoutMs: input.idleTimeoutMs } : {}),
         ...(input.requireToolProgress === false
           ? {}
           : {
@@ -152,6 +173,7 @@ export class ClaudeCliHarness implements AgentHarness {
       model: input.model,
       providerId: input.provider.providerId,
       latencyMs: Date.now() - startedAt,
+      ...(result.firstOutputMs !== undefined ? { firstOutputMs: result.firstOutputMs } : {}),
       rawEventCount: parsed.eventCount,
       changedPaths,
       toolOperations,
@@ -339,10 +361,11 @@ function safeSessionName(value: string): string {
 }
 
 function isRecoverableResumeFailure(error: unknown): boolean {
+  if (error instanceof ClaudeCliTimeoutError) return false;
   const message = error instanceof Error ? error.message : String(error);
   if (/暂停|取消|abort/i.test(message)) return false;
   if (/API key|认证|unauthorized|forbidden|余额|rate.?limit/i.test(message)) return false;
-  return /resume|session|conversation|退出异常|没有返回可读取内容|没有产生工具写入|执行超过/i.test(message);
+  return /(?:resume|session|conversation).{0,100}(?:not found|does not exist|cannot be resumed|invalid|expired)|(?:找不到|不存在|失效|无法恢复).{0,40}(?:会话|session)|(?:会话|session).{0,40}(?:找不到|不存在|失效|无法恢复)/i.test(message);
 }
 
 function parseStreamJson(stdout: string): { content: string; sessionId?: string; eventCount: number } {
@@ -412,6 +435,7 @@ interface ProcessOptions {
   env: NodeJS.ProcessEnv;
   stdin?: string;
   timeoutMs: number;
+  idleTimeoutMs?: number;
   abortSignal?: AbortSignal;
   progress?: {
     operationLogPath: string;
@@ -429,8 +453,9 @@ function runProcess(
   command: string,
   args: string[],
   options: ProcessOptions
-): Promise<{ stdout: string; stderr: string; terminationReason?: ProcessTerminationReason }> {
+): Promise<{ stdout: string; stderr: string; terminationReason?: ProcessTerminationReason; firstOutputMs?: number }> {
   return new Promise((resolve, reject) => {
+    const startedAt = Date.now();
     const child = spawn(command, args, {
       cwd: options.cwd,
       env: options.env,
@@ -444,7 +469,9 @@ function runProcess(
     let lastProgressSignature = "";
     let lastProgressAt = 0;
     let progressDetected = false;
+    let firstOutputMs: number | undefined;
     let timeout: NodeJS.Timeout;
+    let idleTimeout: NodeJS.Timeout | undefined;
     let initialProgressTimeout: NodeJS.Timeout | undefined;
     let progressPoll: NodeJS.Timeout | undefined;
     const finish = (callback: () => void): void => {
@@ -453,6 +480,9 @@ function runProcess(
       }
       settled = true;
       clearTimeout(timeout);
+      if (idleTimeout) {
+        clearTimeout(idleTimeout);
+      }
       if (initialProgressTimeout) {
         clearTimeout(initialProgressTimeout);
       }
@@ -481,24 +511,40 @@ function runProcess(
       requestedTermination = reason;
       terminate();
     };
-    timeout = setTimeout(() => {
+    const requestTimeout = (kind: ClaudeCliTimeoutKind, timeoutMs: number): void => {
+      if (requestedTermination || requestedError || settled) {
+        return;
+      }
       if (hasRecordedProgress(options.progress?.operationLogPath)) {
         requestProgressTermination("timeout_with_progress");
         return;
       }
-      requestedError = new Error(`Claude CLI 执行超过 ${formatTimeout(options.timeoutMs)} 且没有产生工具写入，已终止。`);
+      const completionDetail = options.progress ? "且没有产生工具写入" : "且未完成回复";
+      const detail = kind === "idle"
+        ? `Claude CLI 连续 ${formatTimeout(timeoutMs)} 没有输出活动，已终止。`
+        : kind === "initial_progress"
+          ? `Claude CLI 在 ${formatTimeout(timeoutMs)} 内没有产生工具写入，已停止本轮。`
+          : `Claude CLI 执行超过 ${formatTimeout(timeoutMs)}（总时限）${completionDetail}，已终止。`;
+      requestedError = new ClaudeCliTimeoutError(kind, timeoutMs, detail);
       terminate();
+    };
+    const resetIdleTimeout = (): void => {
+      const idleTimeoutMs = options.idleTimeoutMs;
+      if (!idleTimeoutMs || settled) return;
+      if (idleTimeout) clearTimeout(idleTimeout);
+      idleTimeout = setTimeout(() => requestTimeout("idle", idleTimeoutMs), idleTimeoutMs);
+    };
+    timeout = setTimeout(() => {
+      requestTimeout("overall", options.timeoutMs);
     }, options.timeoutMs);
+    resetIdleTimeout();
     const progress = options.progress;
     if (progress) {
       initialProgressTimeout = setTimeout(() => {
         if (progressDetected || hasRecordedProgress(progress.operationLogPath)) {
           return;
         }
-        requestedError = new Error(
-          `Claude CLI 在 ${Math.round(progress.initialProgressTimeoutMs / 60_000)} 分钟内没有产生工具写入，已停止本轮。`
-        );
-        terminate();
+        requestTimeout("initial_progress", progress.initialProgressTimeoutMs);
       }, progress.initialProgressTimeoutMs);
       progressPoll = setInterval(() => {
         const signature = progressSignature(progress.operationLogPath);
@@ -506,6 +552,7 @@ function runProcess(
           lastProgressSignature = signature;
           lastProgressAt = Date.now();
           progressDetected = true;
+          resetIdleTimeout();
           if (initialProgressTimeout) {
             clearTimeout(initialProgressTimeout);
             initialProgressTimeout = undefined;
@@ -530,10 +577,14 @@ function runProcess(
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => {
+      firstOutputMs ??= Date.now() - startedAt;
       stdout += chunk;
+      resetIdleTimeout();
     });
     child.stderr.on("data", (chunk: string) => {
+      firstOutputMs ??= Date.now() - startedAt;
       stderr += chunk;
+      resetIdleTimeout();
     });
     child.once("error", (error) => finish(() => reject(error)));
     child.once("close", (code, signal) => {
@@ -543,15 +594,15 @@ function runProcess(
           return;
         }
         if (requestedTermination) {
-          resolve({ stdout, stderr, terminationReason: requestedTermination });
+          resolve({ stdout, stderr, terminationReason: requestedTermination, ...(firstOutputMs !== undefined ? { firstOutputMs } : {}) });
           return;
         }
         if (code === 0) {
-          resolve({ stdout, stderr });
+          resolve({ stdout, stderr, ...(firstOutputMs !== undefined ? { firstOutputMs } : {}) });
           return;
         }
         if (hasRecordedProgress(options.progress?.operationLogPath)) {
-          resolve({ stdout, stderr, terminationReason: "process_exit_with_progress" });
+          resolve({ stdout, stderr, terminationReason: "process_exit_with_progress", ...(firstOutputMs !== undefined ? { firstOutputMs } : {}) });
           return;
         }
         reject(new Error(`Claude CLI 退出异常（code=${code ?? "null"}, signal=${signal ?? "none"}）：${compactProcessError(stderr || stdout)}`));
