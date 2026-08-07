@@ -9,6 +9,7 @@ const state = {
   startingProjectIds: new Set(),
   deletingProjectIds: new Set(),
   messages: [],
+  agentActivities: [],
   taskBoard: null,
   artifacts: [],
   workspace: null,
@@ -888,10 +889,11 @@ function buildPresetMessage(presetId, preset) {
 async function refreshProject() {
   ensureProject();
   const projectId = state.projectId;
-  const [project, rooms, messages, taskBoard, artifacts, workspace, agentLoop] = await Promise.all([
+  const [project, rooms, messages, activities, taskBoard, artifacts, workspace, agentLoop] = await Promise.all([
     request(`/projects/${projectId}`),
     request(`/projects/${projectId}/rooms`),
     request(`/projects/${projectId}/messages`),
+    request(`/projects/${projectId}/activities`),
     request(`/projects/${projectId}/task-board`),
     request(`/projects/${projectId}/artifacts`),
     request(`/projects/${projectId}/workspace-tree`),
@@ -905,6 +907,7 @@ async function refreshProject() {
   state.project = project.project;
   state.rooms = rooms.rooms;
   state.messages = messages.messages;
+  state.agentActivities = activities.activities;
   state.taskBoard = taskBoard.taskBoard;
   state.artifacts = artifacts.artifacts;
   state.workspace = workspace;
@@ -925,6 +928,7 @@ async function loadProject(projectId) {
   state.projectId = projectId;
   state.activeRoomKind = "studio-main";
   state.pendingAgentResponses = [];
+  state.agentActivities = [];
   await refreshProject();
 }
 
@@ -1761,13 +1765,20 @@ async function updateRoomMembership(roomKind, agentId, action) {
 function renderMessages() {
   const activeRoom = state.rooms.find((room) => room.kind === state.activeRoomKind);
   const messages = activeRoom ? state.messages.filter((message) => message.roomId === activeRoom.roomId) : state.messages;
-  const pendingResponses = activeRoom
+  const activities = activeRoom
+    ? state.agentActivities.filter((activity) => activity.roomId === activeRoom.roomId)
+    : state.agentActivities;
+  const localPendingResponses = activeRoom
     ? state.pendingAgentResponses.filter((indicator) => indicator.roomId === activeRoom.roomId)
     : state.pendingAgentResponses;
+  const unresolvedPendingResponses = localPendingResponses.filter((indicator) => !messages.some((message) =>
+    message.senderType === "agent" && new Date(message.createdAt).getTime() >= new Date(indicator.createdAt).getTime()
+  ));
+  const pendingResponses = activities.length > 0 ? [] : unresolvedPendingResponses;
   const list = $("#message-list");
   const scrollContainer = list.closest(".chat-panel");
   const shouldStickToBottom = scrollContainer ? isNearScrollBottom(scrollContainer) : true;
-  if (!messages.length && !pendingResponses.length) {
+  if (!messages.length && !pendingResponses.length && !activities.length) {
     list.className = "message-list empty-state";
     list.textContent = "当前房间还没有消息。";
     return;
@@ -1776,11 +1787,16 @@ function renderMessages() {
   list.className = "message-list";
   list.innerHTML = [
     ...messages.map((message) => ({ type: "message", message })),
+    ...activities.map((activity) => ({ type: "activity", activity })),
     ...pendingResponses.map((indicator) => ({ type: "typing", indicator }))
   ]
+    .sort((left, right) => new Date(left.message?.createdAt ?? left.activity?.startedAt ?? left.indicator?.createdAt ?? 0) - new Date(right.message?.createdAt ?? right.activity?.startedAt ?? right.indicator?.createdAt ?? 0))
     .map((item) => {
       if (item.type === "typing") {
         return renderTypingIndicator(item.indicator);
+      }
+      if (item.type === "activity") {
+        return renderAgentActivity(item.activity);
       }
 
       const { message } = item;
@@ -1797,6 +1813,7 @@ function renderMessages() {
             <span>${new Date(message.createdAt).toLocaleTimeString()}</span>
           </div>
           <div class="message-content">${renderMessageContent(message.content)}</div>
+          ${renderMessageActivityTimeline(message)}
           ${renderClaimVerifications(message)}
         </div>
       </article>`;
@@ -1812,6 +1829,61 @@ function renderMessages() {
       scrollContainer.scrollTop = scrollContainer.scrollHeight;
     });
   }
+}
+
+function renderAgentActivity(activity) {
+  const sender = agentName(activity.agentId);
+  const progress = Math.max(0, Math.min(100, Number(activity.progressPercent) || 0));
+  const steps = Array.isArray(activity.steps) ? activity.steps.slice(-5) : [];
+  const kindLabel = activity.kind === "task_execution" ? "产物执行中" : "思考与回答中";
+  return `<article class="message agent message-activity" data-agent-activity="${escapeHtml(activity.activityId)}">
+    ${avatarMarkup(activity.agentId, sender)}
+    <div class="message-body">
+      <div class="message-meta">
+        <span>${escapeHtml(sender)} · ${escapeHtml(kindLabel)}</span>
+        <span>${new Date(activity.updatedAt).toLocaleTimeString()}</span>
+      </div>
+      <div class="agent-activity-heading">
+        <strong>${escapeHtml(activity.label)}</strong>
+        <span>${progress}%</span>
+      </div>
+      <div class="agent-activity-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${progress}">
+        <span style="width:${progress}%"></span>
+      </div>
+      <div class="agent-activity-steps">
+        ${steps.map((step) => renderActivityStep(step, true)).join("")}
+      </div>
+    </div>
+  </article>`;
+}
+
+function renderMessageActivityTimeline(message) {
+  const timeline = Array.isArray(message.metadata?.activityTimeline) ? message.metadata.activityTimeline : [];
+  if (!timeline.length) return "";
+  const title = message.metadata?.activityKind === "task_execution" ? "产物执行进度" : "思考与回答过程";
+  return `<details class="message-activity-timeline" open>
+    <summary>${escapeHtml(title)}<span>${timeline.length} 个阶段</span></summary>
+    <div class="message-activity-timeline-steps">
+      ${timeline.map((step) => renderActivityStep(step, false)).join("")}
+    </div>
+  </details>`;
+}
+
+function renderActivityStep(step, compact) {
+  const status = ["active", "completed", "failed"].includes(step.status) ? step.status : "active";
+  const detail = typeof step.detail === "string" && step.detail.trim() ? renderActivityDetail(step.detail.trim()) : "";
+  return `<div class="agent-activity-step activity-step-${escapeHtml(status)} ${compact ? "activity-step-compact" : ""}">
+    <span class="agent-activity-step-marker" aria-hidden="true"></span>
+    <div>
+      <span>${escapeHtml(step.label ?? "处理中")}</span>
+      ${detail ? `<small>${detail}</small>` : ""}
+    </div>
+  </div>`;
+}
+
+function renderActivityDetail(detail) {
+  const candidate = normalizeWorkspacePathCandidate(detail);
+  return candidate ? workspacePathLink(candidate.path, candidate.label) : escapeHtml(detail);
 }
 
 function isNearScrollBottom(element) {

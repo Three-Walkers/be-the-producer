@@ -1241,6 +1241,134 @@ textarea {
   color: var(--muted);
 }
 
+.message.message-activity .message-body {
+  border-style: dashed;
+  border-color: #a9cbbf;
+  background: #f4faf7;
+}
+
+.agent-activity-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+  font-size: 13px;
+}
+
+.agent-activity-heading strong {
+  min-width: 0;
+  font-weight: 750;
+}
+
+.agent-activity-heading span {
+  flex: 0 0 auto;
+  color: var(--accent-strong);
+  font-variant-numeric: tabular-nums;
+}
+
+.agent-activity-progress {
+  height: 5px;
+  overflow: hidden;
+  background: #e3ebe7;
+}
+
+.agent-activity-progress > span {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  transition: width 180ms ease;
+}
+
+.agent-activity-steps,
+.message-activity-timeline-steps {
+  display: grid;
+  gap: 5px;
+}
+
+.agent-activity-steps {
+  margin-top: 9px;
+}
+
+.agent-activity-step {
+  display: grid;
+  grid-template-columns: 10px minmax(0, 1fr);
+  gap: 7px;
+  align-items: start;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.agent-activity-step-marker {
+  width: 7px;
+  height: 7px;
+  margin-top: 5px;
+  border: 1px solid #8eaaa0;
+  border-radius: 50%;
+  background: var(--surface);
+}
+
+.activity-step-completed .agent-activity-step-marker {
+  border-color: var(--accent);
+  background: var(--accent);
+}
+
+.activity-step-active .agent-activity-step-marker {
+  border-color: var(--accent);
+  background: var(--accent);
+  box-shadow: 0 0 0 3px rgba(46, 135, 108, 0.14);
+}
+
+.activity-step-failed .agent-activity-step-marker {
+  border-color: var(--danger);
+  background: var(--danger);
+}
+
+.agent-activity-step div {
+  min-width: 0;
+}
+
+.agent-activity-step small {
+  display: block;
+  margin-top: 1px;
+  overflow-wrap: anywhere;
+  color: var(--muted);
+}
+
+.activity-step-compact:not(:last-child) {
+  opacity: 0.68;
+}
+
+.message-activity-timeline {
+  margin-top: 10px;
+  border-top: 1px solid var(--line);
+  padding-top: 8px;
+}
+
+.message-activity-timeline summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  cursor: pointer;
+  color: var(--accent-strong);
+  font-size: 12px;
+  font-weight: 750;
+  list-style-position: inside;
+}
+
+.message-activity-timeline summary span {
+  color: var(--muted);
+  font-weight: 500;
+}
+
+.message-activity-timeline-steps {
+  margin-top: 8px;
+  border-left: 1px solid #c7d9d2;
+  padding-left: 9px;
+}
+
 .message-body {
   min-width: 0;
   border: 1px solid var(--line);
