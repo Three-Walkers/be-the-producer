@@ -1,6 +1,19 @@
 import type { AgentContract, AgentHarnessId, AgentLoopControl, AgentSessionScope } from "@game-pipeline/shared-schemas";
 import type { ModelProviderConfig } from "./modelSettings.js";
 
+export type AgentHarnessProgressType = "started" | "model_output" | "tool_started" | "tool_completed" | "completed" | "failed";
+
+export interface AgentHarnessProgressEvent {
+  type: AgentHarnessProgressType;
+  invocationId: string;
+  createdAt: string;
+  resumed?: boolean;
+  toolName?: string;
+  path?: string;
+  progressPercent?: number;
+  detail?: string;
+}
+
 export interface AgentHarnessRunInput {
   projectId: string;
   projectRoot: string;
@@ -21,6 +34,7 @@ export interface AgentHarnessRunInput {
   effort?: "low" | "medium" | "high" | "max";
   includePartialMessages?: boolean;
   abortSignal?: AbortSignal;
+  onProgress?: (event: AgentHarnessProgressEvent) => void;
 }
 
 export interface AgentHarnessRunResult {

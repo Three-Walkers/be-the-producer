@@ -49,6 +49,7 @@ const baseUrl = `http://127.0.0.1:${address.port}/v1`;
 
 const { generateModelChat, ModelRequestError } = await import("../apps/api/dist/modelClient.js");
 
+const anthropicActivities = [];
 const anthropic = await generateModelChat({
   providerId: "dashscope-anthropic-qwen",
   label: "test-anthropic",
@@ -64,7 +65,8 @@ const anthropic = await generateModelChat({
   thinkingMode: "disabled",
   timeoutMs: 3_000,
   idleTimeoutMs: 1_000,
-  requestPurpose: "stream-test"
+  requestPurpose: "stream-test",
+  onActivity: (activity) => anthropicActivities.push(activity)
 });
 
 assert.equal(anthropic.content, "流式回复");
@@ -75,6 +77,11 @@ assert.ok((anthropic.trace.firstChunkMs ?? -1) >= 0);
 assert.equal(requests[0].body.stream, true);
 assert.deepEqual(requests[0].body.thinking, { type: "disabled" });
 assert.equal(requests[0].headers["x-btp-operation-id"], anthropic.trace.operationId);
+assert.deepEqual(
+  anthropicActivities.map((activity) => activity.type),
+  ["request_started", "response_headers", "first_output", "response_completed"]
+);
+assert.equal(anthropicActivities.every((activity) => activity.operationId === anthropic.trace.operationId), true);
 
 const openai = await generateModelChat({
   providerId: "dashscope",
@@ -100,6 +107,7 @@ assert.equal(requests[1].body.enable_thinking, false);
 assert.equal(requests[1].body.stream, true);
 assert.equal(requests[1].headers["x-dashscope-wait-timeout"], "30");
 
+const timeoutActivities = [];
 await assert.rejects(
   generateModelChat({
     providerId: "dashscope-anthropic-qwen",
@@ -115,10 +123,13 @@ await assert.rejects(
     stream: true,
     thinkingMode: "disabled",
     timeoutMs: 3_000,
-    idleTimeoutMs: 1_000
+    idleTimeoutMs: 1_000,
+    onActivity: (activity) => timeoutActivities.push(activity)
   }),
   (error) => error instanceof ModelRequestError && error.kind === "timeout_idle" && error.trace.totalMs >= 1_000
 );
+assert.equal(timeoutActivities.at(-1)?.type, "request_failed");
+assert.equal(timeoutActivities.at(-1)?.failureKind, "timeout_idle");
 
 await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
 process.stdout.write("Model client streaming smoke passed: thinking control, SSE trace, queue header, idle timeout\n");

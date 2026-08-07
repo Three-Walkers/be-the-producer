@@ -10,6 +10,23 @@ export type ModelRequestFailureKind =
   | "network"
   | "invalid_response";
 
+export type ModelRequestActivityType =
+  | "request_started"
+  | "response_headers"
+  | "first_output"
+  | "response_completed"
+  | "request_failed";
+
+export interface ModelRequestActivity {
+  type: ModelRequestActivityType;
+  operationId: string;
+  providerId: string;
+  model: string;
+  createdAt: string;
+  providerRequestId?: string;
+  failureKind?: ModelRequestFailureKind;
+}
+
 export interface ModelChatInput {
   systemPrompt: string;
   userPrompt: string;
@@ -23,6 +40,7 @@ export interface ModelChatInput {
   thinkingBudgetTokens?: number;
   requestPurpose?: string;
   abortSignal?: AbortSignal;
+  onActivity?: (activity: ModelRequestActivity) => void;
 }
 
 export interface ModelRequestTrace {
@@ -110,6 +128,7 @@ export async function generateModelChat(provider: ModelProviderConfig, input: Mo
     inputChars: input.systemPrompt.length + input.userPrompt.length,
     startedAt: new Date(startedAtMs).toISOString()
   };
+  emitModelActivity(input, trace, "request_started");
   const controller = new AbortController();
   let abortReason: "external" | "overall" | "idle" | undefined;
   let overallTimer: NodeJS.Timeout | undefined;
@@ -134,6 +153,7 @@ export async function generateModelChat(provider: ModelProviderConfig, input: Mo
     trace.headersMs = Date.now() - startedAtMs;
     trace.httpStatus = response.status;
     trace.providerRequestId = readProviderRequestId(response);
+    emitModelActivity(input, trace, "response_headers");
     resetIdleTimer();
 
     if (!response.ok) {
@@ -144,17 +164,23 @@ export async function generateModelChat(provider: ModelProviderConfig, input: Mo
     let parsed: ParsedModelResponse;
     if (input.stream === true && response.headers.get("content-type")?.toLowerCase().includes("text/event-stream")) {
       parsed = await readStreamingResponse(response, provider.protocol, () => {
-        trace.firstChunkMs ??= Date.now() - startedAtMs;
+        if (trace.firstChunkMs === undefined) {
+          trace.firstChunkMs = Date.now() - startedAtMs;
+          emitModelActivity(input, trace, "first_output");
+        }
         resetIdleTimer();
       });
     } else {
       const body = await response.text();
+      trace.firstChunkMs ??= Date.now() - startedAtMs;
+      emitModelActivity(input, trace, "first_output");
       parsed = parseModelResponse(provider.protocol, body);
     }
     trace.responseId = parsed.responseId;
     trace.finishReason = parsed.finishReason;
     trace.usage = parsed.usage;
     finishTrace(trace, startedAtMs);
+    emitModelActivity(input, trace, "response_completed");
     return {
       content: parsed.content,
       providerId: provider.providerId,
@@ -164,50 +190,82 @@ export async function generateModelChat(provider: ModelProviderConfig, input: Mo
     };
   } catch (error) {
     if (error instanceof ModelRequestError) {
+      emitModelActivity(input, error.trace, "request_failed", error.kind);
       throw error;
     }
     if (abortReason === "overall") {
-      throw new ModelRequestError(
+      const requestError = new ModelRequestError(
         "timeout_overall",
         `模型请求总耗时超过 ${formatSeconds(timeoutMs)}，已终止。`,
         finishTrace(trace, startedAtMs, "timeout_overall"),
         { cause: error }
       );
+      emitModelActivity(input, requestError.trace, "request_failed", requestError.kind);
+      throw requestError;
     }
     if (abortReason === "idle") {
-      throw new ModelRequestError(
+      const requestError = new ModelRequestError(
         "timeout_idle",
         `模型请求连续 ${formatSeconds(idleTimeoutMs ?? timeoutMs)} 未收到输出，已终止。`,
         finishTrace(trace, startedAtMs, "timeout_idle"),
         { cause: error }
       );
+      emitModelActivity(input, requestError.trace, "request_failed", requestError.kind);
+      throw requestError;
     }
     if (abortReason === "external") {
-      throw new ModelRequestError(
+      const requestError = new ModelRequestError(
         "cancelled",
         "模型请求因项目暂停、项目切换或任务取消而终止。",
         finishTrace(trace, startedAtMs, "cancelled"),
         { cause: error }
       );
+      emitModelActivity(input, requestError.trace, "request_failed", requestError.kind);
+      throw requestError;
     }
     if (error instanceof SyntaxError || /没有可读取的文本内容|流式响应正文为空/.test(error instanceof Error ? error.message : String(error))) {
-      throw new ModelRequestError(
+      const requestError = new ModelRequestError(
         "invalid_response",
         error instanceof Error ? error.message : String(error),
         finishTrace(trace, startedAtMs, "invalid_response"),
         { cause: error }
       );
+      emitModelActivity(input, requestError.trace, "request_failed", requestError.kind);
+      throw requestError;
     }
-    throw new ModelRequestError(
+    const requestError = new ModelRequestError(
       "network",
       error instanceof Error ? error.message : String(error),
       finishTrace(trace, startedAtMs, "network"),
       { cause: error }
     );
+    emitModelActivity(input, requestError.trace, "request_failed", requestError.kind);
+    throw requestError;
   } finally {
     if (overallTimer) clearTimeout(overallTimer);
     if (idleTimer) clearTimeout(idleTimer);
     input.abortSignal?.removeEventListener("abort", externalAbort);
+  }
+}
+
+function emitModelActivity(
+  input: ModelChatInput,
+  trace: ModelRequestTrace,
+  type: ModelRequestActivityType,
+  failureKind?: ModelRequestFailureKind
+): void {
+  try {
+    input.onActivity?.({
+      type,
+      operationId: trace.operationId,
+      providerId: trace.providerId,
+      model: trace.model,
+      createdAt: new Date().toISOString(),
+      ...(trace.providerRequestId ? { providerRequestId: trace.providerRequestId } : {}),
+      ...(failureKind ? { failureKind } : {})
+    });
+  } catch {
+    // UI telemetry must never fail the model request.
   }
 }
 

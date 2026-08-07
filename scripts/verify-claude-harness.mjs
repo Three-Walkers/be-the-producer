@@ -124,6 +124,7 @@ const provider = {
   apiKey: "test-only"
 };
 const before = captureWorkspaceSnapshot(projectRoot);
+const harnessProgress = [];
 const result = await harness.run({
   projectId: kernel.project.projectId,
   projectRoot,
@@ -131,7 +132,8 @@ const result = await harness.run({
   provider,
   model: "qwen-test",
   systemPrompt: "test",
-  userPrompt: "write the proof"
+  userPrompt: "write the proof",
+  onProgress: (event) => harnessProgress.push(event)
 });
 assert.equal(result.sessionId, "11111111-1111-4111-8111-111111111111");
 const after = captureWorkspaceSnapshot(projectRoot);
@@ -141,6 +143,7 @@ assert.ok(evidence.changedPaths.includes("docs/design/harness-proof.md"));
 assert.ok(evidence.toolExecutions.some((tool) => tool.status === "completed"));
 assert.equal(kernel.listArtifactLedger().find((entry) => entry.artifactId === "artifact_harness_proof")?.status, "verified");
 assert.ok(kernel.listArtifacts().find((artifact) => artifact.artifactId === "artifact_harness_proof")?.metadata.toolExecutedAt);
+assert.deepEqual(harnessProgress.map((event) => event.type), ["started", "model_output", "completed"]);
 
 const concurrentBefore = captureWorkspaceSnapshot(projectRoot);
 writeFileSync(join(projectRoot, "docs/design/harness-proof.md"), "# Harness Proof\n\nOnly the design Agent changed this file.\n", "utf8");
@@ -207,6 +210,7 @@ await assert.rejects(
   (error) => error instanceof ClaudeSessionResumeError && error.sessionId === result.sessionId
 );
 
+const partialProgress = [];
 const partialResult = await harness.run({
   projectId: kernel.project.projectId,
   projectRoot,
@@ -215,11 +219,13 @@ const partialResult = await harness.run({
   model: "qwen-test",
   systemPrompt: "test",
   userPrompt: "PARTIAL_PROGRESS",
-  expectedPaths: ["docs/design/harness-proof.md"]
+  expectedPaths: ["docs/design/harness-proof.md"],
+  onProgress: (event) => partialProgress.push(event)
 });
 assert.equal(partialResult.terminationReason, "expected_outputs_materialized");
 assert.deepEqual(partialResult.changedPaths, ["docs/design/harness-proof.md"]);
 assert.match(partialResult.content, /工具写入已完成/);
+assert.ok(partialProgress.some((event) => event.type === "tool_completed" && event.path === "docs/design/harness-proof.md"));
 
 await assert.rejects(
   harness.run({

@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync } from "node:
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AgentContract, AgentLoopControl } from "@game-pipeline/shared-schemas";
-import type { AgentHarness, AgentHarnessRunInput, AgentHarnessRunResult, AgentHarnessStatus, AgentHarnessToolOperation } from "./agentHarness.js";
+import type { AgentHarness, AgentHarnessProgressEvent, AgentHarnessRunInput, AgentHarnessRunResult, AgentHarnessStatus, AgentHarnessToolOperation } from "./agentHarness.js";
 import { cocosEngineSettingsStore } from "./cocosEngineSettings.js";
 
 const defaultTimeoutMs = 20 * 60 * 1000;
@@ -85,6 +85,12 @@ export class ClaudeCliHarness implements AgentHarness {
     const controlPath = join(configDir, `control-${invocationId}.json`);
     const operationLogPath = join(configDir, `operations-${invocationId}.jsonl`);
     mkdirSync(configDir, { recursive: true, mode: 0o700 });
+    emitHarnessProgress(input, {
+      type: "started",
+      invocationId,
+      createdAt: new Date().toISOString(),
+      resumed: Boolean(input.sessionId)
+    });
 
     const args = [
       "--print",
@@ -117,6 +123,7 @@ export class ClaudeCliHarness implements AgentHarness {
     }
 
     const startedAt = Date.now();
+    let reportedToolProgressCount = 0;
     let result: Awaited<ReturnType<typeof runProcess>>;
     try {
       result = await runProcess(resolveClaudeExecutable(), args, {
@@ -125,6 +132,13 @@ export class ClaudeCliHarness implements AgentHarness {
         stdin: input.userPrompt,
         timeoutMs: input.timeoutMs ?? this.options.timeoutMs ?? defaultTimeoutMs,
         ...(input.idleTimeoutMs ? { idleTimeoutMs: input.idleTimeoutMs } : {}),
+        onOutputActivity: () => {
+          emitHarnessProgress(input, {
+            type: "model_output",
+            invocationId,
+            createdAt: new Date().toISOString()
+          });
+        },
         ...(input.requireToolProgress === false
           ? {}
           : {
@@ -134,12 +148,33 @@ export class ClaudeCliHarness implements AgentHarness {
                 expectedPaths: input.expectedPaths ?? [],
                 initialProgressTimeoutMs: this.options.initialProgressTimeoutMs ?? defaultInitialProgressTimeoutMs,
                 idleAfterProgressMs: this.options.idleAfterProgressMs ?? defaultIdleAfterProgressMs,
-                settleAfterExpectedOutputsMs: this.options.settleAfterExpectedOutputsMs ?? defaultSettleAfterExpectedOutputsMs
+                settleAfterExpectedOutputsMs: this.options.settleAfterExpectedOutputsMs ?? defaultSettleAfterExpectedOutputsMs,
+                onOperation: (operation) => {
+                  reportedToolProgressCount += 1;
+                  const expectedCount = input.expectedPaths?.length ?? 0;
+                  const progressPercent = expectedCount > 0
+                    ? Math.min(84, Math.round(48 + (Math.min(reportedToolProgressCount, expectedCount) / expectedCount) * 36))
+                    : Math.min(84, 48 + reportedToolProgressCount * 7);
+                  emitHarnessProgress(input, {
+                    type: "tool_completed",
+                    invocationId,
+                    createdAt: operation.recordedAt ?? new Date().toISOString(),
+                    toolName: operation.toolName,
+                    path: operation.path,
+                    progressPercent
+                  });
+                }
               }
             }),
         ...(input.abortSignal ? { abortSignal: input.abortSignal } : {})
       });
     } catch (error) {
+      emitHarnessProgress(input, {
+        type: "failed",
+        invocationId,
+        createdAt: new Date().toISOString(),
+        detail: error instanceof Error ? error.message : String(error)
+      });
       if (input.sessionId && isRecoverableResumeFailure(error)) {
         const detail = error instanceof Error ? error.message : String(error);
         throw new ClaudeSessionResumeError(input.sessionId, `Claude CLI --resume ${input.sessionId} 失败：${detail}`, {
@@ -154,6 +189,12 @@ export class ClaudeCliHarness implements AgentHarness {
     const changedPaths = [...new Set(toolOperations.map((operation) => operation.path))];
     if (!parsed.content.trim() && !result.terminationReason) {
       const error = new Error(`Claude CLI 没有返回可读取内容。${compactProcessError(result.stderr)}`);
+      emitHarnessProgress(input, {
+        type: "failed",
+        invocationId,
+        createdAt: new Date().toISOString(),
+        detail: error.message
+      });
       if (input.sessionId) {
         throw new ClaudeSessionResumeError(input.sessionId, `Claude CLI --resume ${input.sessionId} 失败：${error.message}`, {
           cause: error
@@ -162,6 +203,12 @@ export class ClaudeCliHarness implements AgentHarness {
       throw error;
     }
     const content = parsed.content.trim() || `Claude CLI 已通过工具写入 ${changedPaths.length} 个文件，调度器已收束本轮并保留产物证据。`;
+    emitHarnessProgress(input, {
+      type: "completed",
+      invocationId,
+      createdAt: new Date().toISOString(),
+      ...(changedPaths.length > 0 ? { detail: `已记录 ${changedPaths.length} 个文件操作` } : {})
+    });
 
     return {
       harnessId: this.harnessId,
@@ -180,6 +227,14 @@ export class ClaudeCliHarness implements AgentHarness {
       ...(loopControl ? { loopControl } : {}),
       ...(result.terminationReason ? { terminationReason: result.terminationReason } : {})
     };
+  }
+}
+
+function emitHarnessProgress(input: AgentHarnessRunInput, event: AgentHarnessProgressEvent): void {
+  try {
+    input.onProgress?.(event);
+  } catch {
+    // Progress telemetry is observational and must not interrupt the Harness.
   }
 }
 
@@ -269,27 +324,7 @@ function readToolOperations(operationLogPath: string): AgentHarnessToolOperation
     return [];
   }
   try {
-    const operations = readFileSync(operationLogPath, "utf8")
-      .split(/\r?\n/)
-      .filter(Boolean)
-      .flatMap((line) => {
-        try {
-          const parsed = JSON.parse(line) as Record<string, unknown>;
-          if (typeof parsed.path !== "string" || !parsed.path.trim() || typeof parsed.toolName !== "string") {
-            return [];
-          }
-          return [{
-            toolName: parsed.toolName,
-            path: parsed.path.trim(),
-            ...(typeof parsed.hash === "string" ? { hash: parsed.hash } : {}),
-            ...(typeof parsed.sizeBytes === "number" ? { sizeBytes: parsed.sizeBytes } : {}),
-            ...(typeof parsed.recordedAt === "string" ? { recordedAt: parsed.recordedAt } : {})
-          } satisfies AgentHarnessToolOperation];
-        } catch {
-          return [];
-        }
-      });
-    return operations;
+    return parseToolOperations(operationLogPath);
   } finally {
     try {
       unlinkSync(operationLogPath);
@@ -297,6 +332,30 @@ function readToolOperations(operationLogPath: string): AgentHarnessToolOperation
       // The operation trace is consumed once by the parent Harness process.
     }
   }
+}
+
+function parseToolOperations(operationLogPath: string): AgentHarnessToolOperation[] {
+  if (!existsSync(operationLogPath)) return [];
+  return readFileSync(operationLogPath, "utf8")
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .flatMap((line) => {
+      try {
+        const parsed = JSON.parse(line) as Record<string, unknown>;
+        if (typeof parsed.path !== "string" || !parsed.path.trim() || typeof parsed.toolName !== "string") {
+          return [];
+        }
+        return [{
+          toolName: parsed.toolName,
+          path: parsed.path.trim(),
+          ...(typeof parsed.hash === "string" ? { hash: parsed.hash } : {}),
+          ...(typeof parsed.sizeBytes === "number" ? { sizeBytes: parsed.sizeBytes } : {}),
+          ...(typeof parsed.recordedAt === "string" ? { recordedAt: parsed.recordedAt } : {})
+        } satisfies AgentHarnessToolOperation];
+      } catch {
+        return [];
+      }
+    });
 }
 
 function readLoopControl(controlPath: string): AgentLoopControl | undefined {
@@ -437,6 +496,7 @@ interface ProcessOptions {
   timeoutMs: number;
   idleTimeoutMs?: number;
   abortSignal?: AbortSignal;
+  onOutputActivity?: () => void;
   progress?: {
     operationLogPath: string;
     projectRoot: string;
@@ -444,6 +504,7 @@ interface ProcessOptions {
     initialProgressTimeoutMs: number;
     idleAfterProgressMs: number;
     settleAfterExpectedOutputsMs: number;
+    onOperation?: (operation: AgentHarnessToolOperation) => void;
   };
 }
 
@@ -470,6 +531,8 @@ function runProcess(
     let lastProgressAt = 0;
     let progressDetected = false;
     let firstOutputMs: number | undefined;
+    let outputActivityReported = false;
+    let reportedOperationCount = 0;
     let timeout: NodeJS.Timeout;
     let idleTimeout: NodeJS.Timeout | undefined;
     let initialProgressTimeout: NodeJS.Timeout | undefined;
@@ -557,6 +620,11 @@ function runProcess(
             clearTimeout(initialProgressTimeout);
             initialProgressTimeout = undefined;
           }
+          const operations = parseToolOperations(progress.operationLogPath);
+          for (const operation of operations.slice(reportedOperationCount)) {
+            progress.onOperation?.(operation);
+          }
+          reportedOperationCount = operations.length;
         }
         if (!progressDetected || lastProgressAt === 0) {
           return;
@@ -578,11 +646,19 @@ function runProcess(
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => {
       firstOutputMs ??= Date.now() - startedAt;
+      if (!outputActivityReported) {
+        outputActivityReported = true;
+        options.onOutputActivity?.();
+      }
       stdout += chunk;
       resetIdleTimeout();
     });
     child.stderr.on("data", (chunk: string) => {
       firstOutputMs ??= Date.now() - startedAt;
+      if (!outputActivityReported) {
+        outputActivityReported = true;
+        options.onOutputActivity?.();
+      }
       stderr += chunk;
       resetIdleTimeout();
     });
