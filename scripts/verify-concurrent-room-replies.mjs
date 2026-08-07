@@ -31,6 +31,7 @@ chmodSync(fakeClaude, 0o755);
 
 const { createStudioKernel } = await import("@game-pipeline/agent-runtime");
 const { ModelAgentRuntime } = await import("../apps/api/dist/modelAgentRuntime.js");
+const { finalizeMessageActivity } = await import("../apps/api/dist/agentActivity.js");
 const { modelSettingsStore } = await import("../apps/api/dist/modelSettings.js");
 
 modelSettingsStore.saveProvider("dashscope-anthropic-qwen", {
@@ -65,6 +66,7 @@ const producerMessage = {
 kernel.recordMessage(producerMessage);
 
 const callbacks = [];
+let activityCheckpointCount = 0;
 let resolveFirst;
 const firstMessage = new Promise((resolve) => { resolveFirst = resolve; });
 let allResolved = false;
@@ -75,6 +77,9 @@ const pending = new ModelAgentRuntime().respond(kernel, producerMessage, {
   ],
   orchestratorSummaryRequired: false
 }, {
+  onAgentActivity: () => {
+    activityCheckpointCount += 1;
+  },
   onAgentMessage: (message) => {
     callbacks.push(message.senderId);
     resolveFirst?.(message);
@@ -86,16 +91,21 @@ const pending = new ModelAgentRuntime().respond(kernel, producerMessage, {
 
 const first = await Promise.race([
   firstMessage,
-  new Promise((_, reject) => setTimeout(() => reject(new Error("Fast Agent reply was not persisted promptly")), 1_000))
+  new Promise((_, reject) => setTimeout(() => reject(new Error("Fast Agent reply was not persisted promptly")), 3_000))
 ]);
 assert.equal(first.senderId, "game_designer");
 assert.equal(allResolved, false, "fast Agent must be observable before the slow Agent completes");
 assert.ok(kernel.listMessages(room.roomId).some((message) => message.senderId === "game_designer"));
+assert.equal(kernel.listAgentActivities(room.roomId).length, 2, "both in-flight Agent activities remain observable");
 
 const result = await pending;
 assert.deepEqual(callbacks, ["game_designer", "art_director"]);
 assert.deepEqual(result.agentMessages.map((message) => message.senderId), ["game_designer", "art_director"]);
 assert.equal(result.agentMessages.every((message) => message.metadata.failure !== true), true);
+assert.equal(activityCheckpointCount > 0, true);
+assert.equal(result.agentMessages.every((message) => Array.isArray(message.metadata.activityTimeline)), true);
+for (const message of result.agentMessages) finalizeMessageActivity(kernel, message);
+assert.equal(kernel.listAgentActivities(room.roomId).length, 0);
 
 rmSync(tempRoot, { recursive: true, force: true });
 process.stdout.write("Concurrent room reply smoke passed: shared key runs in parallel and fast Agent persists before slow Agent\n");

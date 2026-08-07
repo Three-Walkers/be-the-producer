@@ -11,6 +11,7 @@ import { finalizeTaskSessionProtocol, ModelAgentRuntime } from "./modelAgentRunt
 import { executeAgentToolRequests, type ToolExecutionResult } from "./toolExecutor.js";
 import { taskOutputsVerified } from "./taskOutputEvidence.js";
 import { resumeQaTasksAfterVerifiedRepairs } from "./qaRepairFlow.js";
+import { finalizeMessageActivity, recordServerToolActivity } from "./agentActivity.js";
 
 export interface AgentLoopWakeOptions {
   reason: string;
@@ -98,6 +99,9 @@ export class AgentLoopService {
         updatedAt: now
       });
     }
+    for (const activity of kernel.listAgentActivities()) {
+      kernel.removeAgentActivity(activity.activityId);
+    }
     const state = kernel.updateAgentLoop({
       status: "paused",
       activeAgentIds: [],
@@ -174,14 +178,19 @@ export class AgentLoopService {
         }
         this.dependencies.checkpoint(kernel);
 
-        const messages = await Promise.all(
-          candidates.map((task) =>
-            this.dependencies.modelRuntime.respondToTask(kernel, task, {
+        const messages = new Array<StudioMessage>(candidates.length);
+        await Promise.all(
+          candidates.map(async (task, index) => {
+            const message = await this.dependencies.modelRuntime.respondToTask(kernel, task, {
               iteration,
               abortSignal: active.abortController.signal,
+              onAgentActivity: () => this.dependencies.checkpoint(kernel),
               ...(options.triggerMessageId ? { triggerMessageId: options.triggerMessageId } : {})
-            })
-          )
+            });
+            messages[index] = message;
+            kernel.recordMessage(message);
+            this.dependencies.checkpoint(kernel);
+          })
         );
 
         const current = this.activeRuns.get(projectId);
@@ -189,10 +198,15 @@ export class AgentLoopService {
           return;
         }
 
+        await executeAgentToolRequests(kernel, messages, {
+          onActivity: (message, event) => {
+            recordServerToolActivity(kernel, message, event);
+            this.dependencies.checkpoint(kernel);
+          }
+        });
         for (const message of messages) {
-          kernel.recordMessage(message);
+          finalizeMessageActivity(kernel, message);
         }
-        await executeAgentToolRequests(kernel, messages);
         this.dependencies.checkpoint(kernel);
 
         for (let index = 0; index < candidates.length; index += 1) {

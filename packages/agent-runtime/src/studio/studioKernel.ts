@@ -1,4 +1,5 @@
 import type {
+  AgentActivity,
   AgentLoopAgentState,
   AgentLoopState,
   AgentId,
@@ -32,6 +33,7 @@ import { TaskBoardBuilder } from "../tasks/taskBoard.js";
 export interface StudioKernelState {
   project: Project;
   agentLoop: AgentLoopState;
+  agentActivities: AgentActivity[];
   rooms: Room[];
   messages: StudioMessage[];
   tasks: Task[];
@@ -45,11 +47,12 @@ export interface StudioKernelState {
   handoffCapsules: SessionHandoffCapsule[];
 }
 
-export interface StudioKernelSnapshot extends Omit<StudioKernelState, "agentSessions" | "contextPackets" | "handoffCapsules"> {
+export interface StudioKernelSnapshot extends Omit<StudioKernelState, "agentActivities" | "agentSessions" | "contextPackets" | "handoffCapsules"> {
   version: 1;
   savedAt: string;
   memoryRecords: MemoryRecord[];
   auditEvents: AuditEvent[];
+  agentActivities?: AgentActivity[];
   agentSessions?: AgentSessionRecord[];
   contextPackets?: ContextPacket[];
   handoffCapsules?: SessionHandoffCapsule[];
@@ -87,6 +90,7 @@ export class StudioKernel {
     this.state = {
       project,
       agentLoop: restoredState.agentLoop ?? createInitialAgentLoopState(project),
+      agentActivities: restoredState.agentActivities ?? [],
       rooms: restoredState.rooms ?? createDefaultRooms(project.projectId),
       messages: restoredState.messages ?? [],
       tasks: restoredState.tasks ?? [],
@@ -819,6 +823,30 @@ export class StudioKernel {
     return [...this.state.messages];
   }
 
+  listAgentActivities(roomId?: string): AgentActivity[] {
+    return this.state.agentActivities
+      .filter((activity) => !roomId || activity.roomId === roomId)
+      .map(cloneAgentActivity);
+  }
+
+  upsertAgentActivity(activity: AgentActivity): AgentActivity {
+    const index = this.state.agentActivities.findIndex((candidate) => candidate.activityId === activity.activityId);
+    const next = cloneAgentActivity(activity);
+    if (index >= 0) {
+      this.state.agentActivities[index] = next;
+    } else {
+      this.state.agentActivities.push(next);
+    }
+    return cloneAgentActivity(next);
+  }
+
+  removeAgentActivity(activityId: string): boolean {
+    const index = this.state.agentActivities.findIndex((activity) => activity.activityId === activityId);
+    if (index < 0) return false;
+    this.state.agentActivities.splice(index, 1);
+    return true;
+  }
+
   listAuditEvents(): AuditEvent[] {
     return this.auditLog.list(this.state.project.projectId);
   }
@@ -829,6 +857,7 @@ export class StudioKernel {
       savedAt,
       project: this.state.project,
       agentLoop: this.state.agentLoop,
+      agentActivities: this.state.agentActivities,
       rooms: this.state.rooms,
       messages: this.state.messages,
       tasks: this.state.tasks,
@@ -983,6 +1012,7 @@ export function createRestartedStudioKernel(project: Project): StudioKernel {
 export function createStudioKernelFromSnapshot(snapshot: StudioKernelSnapshot): StudioKernel {
   return new StudioKernel(snapshot.project, {
     agentLoop: snapshot.agentLoop,
+    agentActivities: snapshot.agentActivities ?? [],
     rooms: snapshot.rooms,
     messages: snapshot.messages,
     tasks: snapshot.tasks,
@@ -1030,6 +1060,13 @@ function cloneRoom(room: Room): Room {
     ...room,
     participants: [...room.participants],
     routingPolicy: { ...room.routingPolicy }
+  };
+}
+
+function cloneAgentActivity(activity: AgentActivity): AgentActivity {
+  return {
+    ...activity,
+    steps: activity.steps.map((step) => ({ ...step }))
   };
 }
 

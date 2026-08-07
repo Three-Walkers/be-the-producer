@@ -287,6 +287,11 @@ export async function handleRequest(request: IncomingMessage, response: ServerRe
       return;
     }
 
+    if (request.method === "GET" && resource === "activities") {
+      sendJson(response, 200, { activities: kernel.listAgentActivities() });
+      return;
+    }
+
     if (request.method === "POST" && resource === "messages") {
       const input = await readJson<PostMessageInput>(request);
       if (!input.content) {

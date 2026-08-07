@@ -155,6 +155,37 @@ export interface AgentLoopControl {
   handoffAgentIds: AgentId[];
 }
 
+export type AgentActivityKind = "room_response" | "task_execution";
+export type AgentActivityStatus = "thinking" | "working" | "tool_call" | "finalizing" | "failed";
+export type AgentActivityStepStatus = "active" | "completed" | "failed";
+
+export interface AgentActivityStep {
+  stepId: string;
+  phase: string;
+  label: string;
+  detail?: string;
+  status: AgentActivityStepStatus;
+  progressPercent: number;
+  createdAt: string;
+}
+
+export interface AgentActivity {
+  activityId: string;
+  projectId: ProjectId;
+  roomId: RoomId;
+  agentId: AgentId;
+  kind: AgentActivityKind;
+  status: AgentActivityStatus;
+  label: string;
+  detail?: string;
+  progressPercent: number;
+  taskId?: TaskId;
+  triggerMessageId?: MessageId;
+  steps: AgentActivityStep[];
+  startedAt: string;
+  updatedAt: string;
+}
+
 export type StageId =
   | "concept_discussion"
   | "concept_review"

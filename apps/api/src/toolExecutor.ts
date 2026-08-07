@@ -59,6 +59,17 @@ export interface ToolExecutionResult {
   details?: Record<string, unknown>;
 }
 
+export interface ToolExecutionActivityEvent {
+  type: "started" | "completed" | "failed";
+  toolName: ExecutableToolName;
+  path?: string;
+  progressPercent?: number;
+}
+
+export interface ToolExecutionOptions {
+  onActivity?: (message: StudioMessage, event: ToolExecutionActivityEvent) => void;
+}
+
 const artifactTypes: Artifact["type"][] = [
   "gdd",
   "art_bible",
@@ -109,7 +120,11 @@ export function executableToolsForAgent(agent: AgentContract): ExecutableToolNam
   return tools;
 }
 
-export async function executeAgentToolRequests(kernel: StudioKernel, messages: StudioMessage[]): Promise<ToolExecutionResult[]> {
+export async function executeAgentToolRequests(
+  kernel: StudioKernel,
+  messages: StudioMessage[],
+  options: ToolExecutionOptions = {}
+): Promise<ToolExecutionResult[]> {
   const results: ToolExecutionResult[] = [];
   for (const message of messages) {
     if (message.senderType !== "agent") {
@@ -128,8 +143,23 @@ export async function executeAgentToolRequests(kernel: StudioKernel, messages: S
 
     const messageResults: ToolExecutionResult[] = [];
     const artifactIds = new Set(message.relatedArtifactIds);
-    for (const request of extracted.requests) {
+    for (let index = 0; index < extracted.requests.length; index += 1) {
+      const request = extracted.requests[index];
+      if (!request) continue;
+      const total = extracted.requests.length;
+      emitToolActivity(options, message, {
+        type: "started",
+        toolName: request.toolName,
+        path: request.path,
+        progressPercent: Math.round(84 + (index / total) * 12)
+      });
       const result = await executeToolRequest(kernel, message, agent, request);
+      emitToolActivity(options, message, {
+        type: result.status === "completed" ? "completed" : "failed",
+        toolName: result.toolName,
+        ...(result.path ? { path: result.path } : {}),
+        progressPercent: Math.round(84 + ((index + 1) / total) * 12)
+      });
       messageResults.push(result);
       results.push(result);
       if (result.artifactId) {
@@ -148,6 +178,14 @@ export async function executeAgentToolRequests(kernel: StudioKernel, messages: S
   }
 
   return results;
+}
+
+function emitToolActivity(options: ToolExecutionOptions, message: StudioMessage, event: ToolExecutionActivityEvent): void {
+  try {
+    options.onActivity?.(message, event);
+  } catch {
+    // Progress telemetry must not change the result of the tool invocation.
+  }
 }
 
 async function executeToolRequest(kernel: StudioKernel, message: StudioMessage, agent: AgentContract, request: ToolRequest): Promise<ToolExecutionResult> {

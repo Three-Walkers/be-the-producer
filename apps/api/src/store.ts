@@ -6,6 +6,7 @@ import { verifyProjectClaims } from "./claimVerifier.js";
 import { reconcileClaimRepairs } from "./claimRepair.js";
 import { migrateLegacyClaimRepairStorm } from "./claimRepairMigration.js";
 import { AgentLoopService } from "./agentLoop.js";
+import { finalizeMessageActivity, recordServerToolActivity } from "./agentActivity.js";
 import { ModelAgentRuntime } from "./modelAgentRuntime.js";
 import { ProjectPersistenceStore, type ProjectSummary } from "./projectPersistence.js";
 import { reconcileQaPlaytestResults } from "./qaResultIngestion.js";
@@ -57,6 +58,9 @@ export class StudioProjectStore {
     for (const persistedKernel of this.persistence.loadAll()) {
       const migration = migrateLegacyClaimRepairStorm(persistedKernel);
       const kernel = migration.kernel;
+      for (const activity of kernel.listAgentActivities()) {
+        kernel.removeAgentActivity(activity.activityId);
+      }
       const runtimeAssetTaskReopened = migrateRuntimeAssetPipeline(kernel);
       this.projects.set(kernel.project.projectId, kernel);
       this.checkpointKernel(kernel);
@@ -319,15 +323,32 @@ export class StudioProjectStore {
       ...(options.bootstrapProjectState === undefined ? {} : { bootstrapProjectState: options.bootstrapProjectState })
     };
     const result = this.runtime.handleProducerMessage(kernel, message, runtimeOptions);
+    let modelMessagesHandled = false;
     if (options.modelReplies && result.agentMessages.length === 0) {
       const modelResult = await this.modelRuntime.respond(kernel, message, result.routePlan, {
-        onAgentMessage: () => {
+        onAgentActivity: () => {
+          this.checkpointKernel(kernel);
+        },
+        onAgentMessage: async (agentMessage) => {
+          await executeAgentToolRequests(kernel, [agentMessage], {
+            onActivity: (toolMessage, event) => {
+              recordServerToolActivity(kernel, toolMessage, event);
+              this.checkpointKernel(kernel);
+            }
+          });
+          finalizeMessageActivity(kernel, agentMessage);
           this.checkpointKernel(kernel);
         }
       });
       result.agentMessages.push(...modelResult.agentMessages);
+      modelMessagesHandled = true;
     }
-    await executeAgentToolRequests(kernel, result.agentMessages);
+    if (!modelMessagesHandled) {
+      await executeAgentToolRequests(kernel, result.agentMessages);
+      for (const agentMessage of result.agentMessages) {
+        finalizeMessageActivity(kernel, agentMessage);
+      }
+    }
     const workspace = this.checkpointKernel(kernel);
     this.agentLoop.start(projectId, {
       reason: `制作人消息唤醒 Agent Loop：${message.messageId}`,

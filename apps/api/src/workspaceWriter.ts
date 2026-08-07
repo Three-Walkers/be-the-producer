@@ -68,6 +68,7 @@ export function syncProjectWorkspace(kernel: StudioKernel, workspaceRoot = defau
   const filesWritten: string[] = [];
   const taskBoard = kernel.buildTaskBoard();
   const messages = kernel.listMessages();
+  const activities = kernel.listAgentActivities();
   const tasks = kernel.listTasks();
   const artifacts = kernel.listArtifacts();
   const claimRepairs = kernel.listClaimRepairs();
@@ -82,6 +83,7 @@ export function syncProjectWorkspace(kernel: StudioKernel, workspaceRoot = defau
   writeJson(projectRoot, "shared/task-board/current-status.json", taskBoard, filesWritten);
   writeJson(projectRoot, "shared/tasks/tasks.json", tasks, filesWritten);
   writeJson(projectRoot, "shared/chat/messages.json", messages, filesWritten);
+  writeJson(projectRoot, "shared/chat/activities.json", activities, filesWritten);
   writeJsonLines(projectRoot, "shared/memory/project-memory.jsonl", memory, filesWritten);
   writeText(projectRoot, "README.md", renderProjectReadme(kernel, taskBoard.total, artifacts.length, memory.length, claimRepairs.length), filesWritten);
 
