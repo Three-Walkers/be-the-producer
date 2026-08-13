@@ -46,6 +46,13 @@ for (const artifact of [
     sourceTaskId: "task_stage_1_design_clarification"
   },
   {
+    artifactId: "artifact_game_contract_draft",
+    type: "game_contract",
+    path: "agents/design/contracts/game-contract.json",
+    ownerAgentId: "game_designer",
+    sourceTaskId: "task_stage_1_design_clarification"
+  },
+  {
     artifactId: "artifact_art_bible_baseline_draft",
     type: "art_bible",
     path: "agents/art/art-bible.md",
@@ -66,6 +73,10 @@ for (const artifact of [
   });
 }
 syncProjectWorkspace(kernel);
+for (const artifactId of ["artifact_gdd_baseline_draft", "artifact_game_contract_draft", "artifact_art_bible_baseline_draft"]) {
+  const ledger = kernel.listArtifactLedger().find((candidate) => candidate.artifactId === artifactId);
+  assert.equal(ledger?.status, "pending", `${artifactId} 的工作区占位文件不得成为已验证证据`);
+}
 
 let activeCalls = 0;
 let maximumConcurrency = 0;
@@ -101,26 +112,28 @@ const fakeModelRuntime = {
       };
     }
 
-    const artifactId = task.outputArtifacts[0];
-    const artifact = currentKernel.listArtifacts().find((candidate) => candidate.artifactId === artifactId);
-    assert.ok(artifact, `missing fixture artifact for ${task.taskId}`);
     const title = task.ownerAgentId === "game_designer" ? "GDD Baseline" : "Art Bible Baseline";
+    const toolRequests = task.outputArtifacts.map((artifactId) => {
+      const artifact = currentKernel.listArtifacts().find((candidate) => candidate.artifactId === artifactId);
+      assert.ok(artifact, `missing fixture artifact for ${task.taskId}`);
+      return {
+        tool: "write_artifact",
+        path: artifact.path,
+        artifactId,
+        artifactType: artifact.type,
+        taskId: task.taskId,
+        content: artifact.type === "game_contract"
+          ? `${JSON.stringify(gameContractFixture(), null, 2)}\n`
+          : `# ${title}\n\n由 ${task.ownerAgentId} 在 Agent Loop 第 ${input.iteration} 轮生成。`
+      };
+    });
     const payload = {
       loopControl: {
         status: "ready_for_review",
         reason: "基线内容已通过服务端工具提交，等待制作人评审。",
         handoffAgentIds: []
       },
-      toolRequests: [
-        {
-          tool: "write_artifact",
-          path: artifact.path,
-          artifactId,
-          artifactType: artifact.type,
-          taskId: task.taskId,
-          content: `# ${title}\n\n由 ${task.ownerAgentId} 在 Agent Loop 第 ${input.iteration} 轮生成。`
-        }
-      ]
+      toolRequests
     };
     return {
       messageId: `msg_${task.ownerAgentId}_${modelCallCount}`,
@@ -162,14 +175,19 @@ assert.equal(kernel.findTask("task_stage_1_art_direction")?.status, "review");
 assert.equal(kernel.getAgentLoopState().status, "waiting_for_producer");
 assert.match(kernel.getAgentLoopState().waitingReason ?? "", /评审/);
 
-for (const artifactId of ["artifact_gdd_baseline_draft", "artifact_art_bible_baseline_draft"]) {
+for (const artifactId of ["artifact_gdd_baseline_draft", "artifact_game_contract_draft", "artifact_art_bible_baseline_draft"]) {
   const artifact = kernel.listArtifacts().find((candidate) => candidate.artifactId === artifactId);
   const ledger = kernel.listArtifactLedger().find((candidate) => candidate.artifactId === artifactId);
   assert.ok(artifact?.metadata.toolExecutedAt, `${artifactId} 缺少工具执行证据`);
   assert.equal(ledger?.status, "verified", `${artifactId} 未通过 Artifact Ledger 验证`);
   const absolutePath = join(process.env.STUDIO_WORKSPACE_ROOT, projectId, artifact.path);
   assert.ok(existsSync(absolutePath), `${artifact.path} 未实际写入`);
-  assert.match(readFileSync(absolutePath, "utf8"), /Baseline/);
+  const materialized = readFileSync(absolutePath, "utf8");
+  if (artifact?.type === "game_contract") {
+    assert.equal(JSON.parse(materialized).kind, "game_contract");
+  } else {
+    assert.match(materialized, /Baseline/);
+  }
 }
 
 const restored = createStudioKernelFromSnapshot(kernel.toSnapshot());
@@ -226,29 +244,49 @@ assert.equal(kernel.findTask("task_harness_no_progress")?.status, "blocked");
 assert.match(kernel.findTask("task_harness_no_progress")?.blockers.join("；") ?? "", /连续失败 2 次/);
 forcedFailureKind = undefined;
 
+addDirectToolFixture({
+  taskId: "task_smoke_asset_tool",
+  ownerAgentId: "asset_production",
+  artifactId: "artifact_smoke_ball",
+  artifactType: "asset",
+  path: "assets/art/smoke-ball.svg"
+});
+addDirectToolFixture({
+  taskId: "task_smoke_code_tool",
+  ownerAgentId: "gameplay_programmer",
+  artifactId: "artifact_smoke_controller",
+  artifactType: "source_code",
+  path: "assets/scripts/SmokeController.ts"
+});
+
 const toolMessages = [
-  createToolMessage("asset_production", {
+  createToolMessage("asset_production", "task_smoke_asset_tool", {
     loopControl: { status: "continue", reason: "继续生成配套资产。", handoffAgentIds: [] },
     toolRequests: [
       {
         tool: "generate_image",
+        taskId: "task_smoke_asset_tool",
+        artifactId: "artifact_smoke_ball",
         path: "assets/art/smoke-ball.svg",
         artifactType: "asset",
         content: '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"><circle cx="32" cy="32" r="24" fill="#54b895"/></svg>'
       }
     ]
   }),
-  createToolMessage("gameplay_programmer", {
+  createToolMessage("gameplay_programmer", "task_smoke_code_tool", {
     loopControl: { status: "continue", reason: "代码已写入并完成语法检查。", handoffAgentIds: [] },
     toolRequests: [
       {
         tool: "write_code",
+        taskId: "task_smoke_code_tool",
+        artifactId: "artifact_smoke_controller",
         path: "assets/scripts/SmokeController.ts",
         artifactType: "source_code",
         content: "export class SmokeController { private score = 0; addScore(): number { return ++this.score; } }"
       },
       {
         tool: "run_typecheck",
+        taskId: "task_smoke_code_tool",
         path: "assets/scripts/SmokeController.ts"
       }
     ]
@@ -263,7 +301,7 @@ assert.ok(existsSync(join(process.env.STUDIO_WORKSPACE_ROOT, projectId, "assets/
 rmSync(tempRoot, { recursive: true, force: true });
 process.stdout.write(`Agent Loop smoke passed: concurrency=${maximumConcurrency}, modelCalls=${modelCallCount}\n`);
 
-function createToolMessage(agentId, payload) {
+function createToolMessage(agentId, taskId, payload) {
   return {
     messageId: `msg_tool_${agentId}`,
     projectId,
@@ -273,10 +311,119 @@ function createToolMessage(agentId, payload) {
     messageType: "progress_update",
     content: `执行工具。\n\n\`\`\`json\n${JSON.stringify(payload)}\n\`\`\``,
     mentions: [],
-    relatedTaskIds: [],
+    relatedTaskIds: [taskId],
     relatedArtifactIds: [],
     metadata: {},
     createdAt: new Date().toISOString()
+  };
+}
+
+function addDirectToolFixture({ taskId, ownerAgentId, artifactId, artifactType, path }) {
+  const createdAt = new Date().toISOString();
+  kernel.addTask({
+    taskId,
+    projectId,
+    stageId: kernel.project.currentStage,
+    roomId: kernel.getRoom(ownerAgentId === "asset_production" ? "art-room" : "engineering-room").roomId,
+    parentTaskId: "task_group_stage_1",
+    taskLevel: "task",
+    title: `验证 ${ownerAgentId} 直接工具执行`,
+    description: "为工具授权回归提供真实的 owned task 与声明式输出产物。",
+    ownerAgentId,
+    participantAgentIds: [],
+    status: "doing",
+    priority: 150,
+    sortOrder: 6,
+    progressPercent: 0,
+    blockers: [],
+    inputArtifacts: [],
+    outputArtifacts: [artifactId],
+    acceptanceCriteria: ["只能在任务声明的产物路径执行工具"],
+    createdAt,
+    updatedAt: createdAt
+  });
+  kernel.addArtifact({
+    artifactId,
+    projectId,
+    type: artifactType,
+    path,
+    ownerAgentId,
+    stageId: kernel.project.currentStage,
+    status: "draft",
+    version: 1,
+    sourceTaskId: taskId,
+    sourceDecisionIds: [],
+    metadata: { generatedBy: "agent_loop_direct_tool_fixture" },
+    createdAt,
+    updatedAt: createdAt
+  });
+}
+
+function gameContractFixture() {
+  return {
+    schemaVersion: "1.0.0",
+    kind: "game_contract",
+    identity: {
+      contractId: "agent_loop_smoke.contract",
+      gameId: "agent_loop_smoke",
+      title: "Agent Loop Smoke",
+      slug: "agent-loop-smoke",
+      summary: "Contract fixture used to prove that design outputs are validated before review.",
+      revision: 1,
+      releaseVersion: "0.1.0"
+    },
+    genre: {
+      primary: "interaction_test",
+      tags: ["interaction_test"],
+      perspective: "2d",
+      playerMode: "single_player"
+    },
+    coreLoop: {
+      summary: "Start the session, perform the primary action, and reach the objective.",
+      steps: [{
+        stepId: "primary_loop",
+        label: "Primary loop",
+        description: "Exercise the public input and progress signal.",
+        actionIds: ["primary_action"],
+        stateIds: ["playing"],
+        emits: ["progress"]
+      }],
+      successConditions: [{ signalId: "progress", operator: "gte", value: 1 }],
+      failureConditions: []
+    },
+    stateModel: {
+      lifecycle: "finite",
+      initialState: "ready",
+      states: [
+        { stateId: "ready", label: "Ready", kind: "boot", terminal: false, description: "Waiting to start." },
+        { stateId: "playing", label: "Playing", kind: "active", terminal: false, description: "Main loop." },
+        { stateId: "won", label: "Won", kind: "success", terminal: true, description: "Objective reached." }
+      ],
+      transitions: [
+        { transitionId: "start", from: "ready", to: "playing", trigger: { type: "system", ref: "start" }, guards: [], emits: [] },
+        { transitionId: "win", from: "playing", to: "won", trigger: { type: "signal", ref: "progress" }, guards: [{ signalId: "progress", operator: "gte", value: 1 }], emits: [] }
+      ]
+    },
+    inputModel: {
+      actions: [{
+        actionId: "primary_action",
+        label: "Primary action",
+        description: "The fixture's primary input.",
+        bindings: [{ device: "touch", control: "gameplay_area", gesture: "tap" }],
+        enabledInStates: ["playing"]
+      }],
+      simultaneousTouchPoints: 1
+    },
+    runtimeSignals: {
+      signals: [{
+        signalId: "progress",
+        label: "Progress",
+        description: "Public objective progress.",
+        valueType: "integer",
+        visibility: "public",
+        initialValue: 0
+      }]
+    }
   };
 }
 

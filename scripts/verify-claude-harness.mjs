@@ -17,6 +17,10 @@ if (args.includes("--version")) {
   process.stdout.write("9.9.9-test\\n");
   process.exit(0);
 }
+if (process.env.TEST_SECRET_SHOULD_NOT_LEAK) {
+  process.stderr.write("TEST_SECRET_SHOULD_NOT_LEAK leaked into Claude environment.\\n");
+  process.exit(91);
+}
 let prompt = "";
 for await (const chunk of process.stdin) prompt += chunk;
 if (prompt.includes("ABORT_TEST")) {
@@ -38,7 +42,7 @@ if (prompt.includes("PARTIAL_PROGRESS")) {
   const content = "# Partial Harness Proof\\n\\nThe tool write completed before the CLI stopped.\\n";
   writeFileSync(target, content);
   mkdirSync(dirname(operationLogPath), { recursive: true });
-  writeFileSync(operationLogPath, JSON.stringify({ toolName: "write_artifact", path: "docs/design/harness-proof.md", hash: "test", sizeBytes: content.length, recordedAt: new Date().toISOString() }) + "\\n");
+  writeFileSync(operationLogPath, JSON.stringify({ toolName: "write_artifact", path: "docs/design/harness-proof.md", status: "completed", hash: "test", sizeBytes: content.length, recordedAt: new Date().toISOString() }) + "\\n");
   process.stdout.write(JSON.stringify({type:"assistant", message:{content:[{type:"text", text:"工具写入已完成，正在继续检查。"}]}}) + "\\n");
   await new Promise((resolve) => setTimeout(resolve, 5000));
 }
@@ -57,10 +61,12 @@ process.stdout.write(JSON.stringify({type:"result", result:"已实际写入任�
 );
 chmodSync(fakeClaude, 0o755);
 process.env.CLAUDE_CLI_PATH = fakeClaude;
+process.env.TEST_SECRET_SHOULD_NOT_LEAK = "super-secret";
 
 const { ClaudeCliHarness, ClaudeSessionResumeError } = await import("../apps/api/dist/claudeCliHarness.js");
 const { captureWorkspaceSnapshot, recordHarnessWorkspaceChanges } = await import("../apps/api/dist/harnessWorkspaceEvidence.js");
 const { createStudioKernel, defaultAgentContracts } = await import("@game-pipeline/agent-runtime");
+const { createTaskHarnessAuthorization } = await import("../apps/api/dist/toolAuthorization.js");
 
 const harness = new ClaudeCliHarness({
   timeoutMs: 600,
@@ -123,6 +129,10 @@ const provider = {
   defaultModel: "qwen-test",
   apiKey: "test-only"
 };
+const authorization = createTaskHarnessAuthorization(kernel, task, agent, {
+  read: [],
+  write: ["docs/design/harness-proof.md"]
+});
 const before = captureWorkspaceSnapshot(projectRoot);
 const harnessProgress = [];
 const result = await harness.run({
@@ -133,6 +143,7 @@ const result = await harness.run({
   model: "qwen-test",
   systemPrompt: "test",
   userPrompt: "write the proof",
+  authorization,
   onProgress: (event) => harnessProgress.push(event)
 });
 assert.equal(result.sessionId, "11111111-1111-4111-8111-111111111111");
@@ -183,11 +194,20 @@ await harness.run({
   model: "qwen-test",
   systemPrompt: "test",
   userPrompt: "resume the proof",
+  authorization,
   sessionId: result.sessionId,
   sessionKey: "task:harness_test:design-room:task_harness:game_designer:e0",
   sessionScope: "task_child"
 });
 const args = JSON.parse(readFileSync(join(projectRoot, ".be-the-producer/test/harness-args.json"), "utf8"));
+const toolsArg = args[args.indexOf("--tools") + 1].split(",");
+for (const unsafeBuiltin of ["Read", "Glob", "Grep", "Bash"]) {
+  assert.equal(toolsArg.includes(unsafeBuiltin), false, `Claude task tools must not expose ${unsafeBuiltin}`);
+}
+assert.ok(toolsArg.includes("mcp__btp_workspace__read_file"));
+const mcpConfigArg = JSON.parse(args[args.indexOf("--mcp-config") + 1]);
+assert.equal(mcpConfigArg.mcpServers.btp_workspace.env.BTP_TOOL_MODE, "task");
+assert.equal("BTP_ALLOWED_ROOTS" in mcpConfigArg.mcpServers.btp_workspace.env, false);
 assert.ok(args.includes("--resume"));
 assert.ok(args.includes(result.sessionId));
 assert.ok(args.includes("--name"));
@@ -202,6 +222,7 @@ await assert.rejects(
     model: "qwen-test",
     systemPrompt: "test",
     userPrompt: "RESUME_FAIL",
+    authorization,
     sessionId: result.sessionId,
     sessionKey: "task:harness_test:design-room:task_harness:game_designer:e0",
     sessionScope: "task_child",
@@ -219,6 +240,7 @@ const partialResult = await harness.run({
   model: "qwen-test",
   systemPrompt: "test",
   userPrompt: "PARTIAL_PROGRESS",
+  authorization,
   expectedPaths: ["docs/design/harness-proof.md"],
   onProgress: (event) => partialProgress.push(event)
 });
@@ -235,7 +257,8 @@ await assert.rejects(
     provider,
     model: "qwen-test",
     systemPrompt: "test",
-    userPrompt: "HANG_NO_PROGRESS"
+    userPrompt: "HANG_NO_PROGRESS",
+    authorization
   }),
   /没有产生工具写入/
 );
@@ -250,6 +273,7 @@ await assert.rejects(
     model: "qwen-test",
     systemPrompt: "test",
     userPrompt: "HANG_NO_PROGRESS",
+    authorization,
     requireToolProgress: false,
     timeoutMs: 100
   }),
@@ -266,6 +290,7 @@ const aborted = harness.run({
   model: "qwen-test",
   systemPrompt: "test",
   userPrompt: "ABORT_TEST",
+  authorization,
   abortSignal: abortController.signal
 });
 setTimeout(() => abortController.abort(), 50);
