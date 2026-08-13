@@ -5,6 +5,8 @@ import type {
   AgentId,
   AgentSessionRecord,
   Artifact,
+  ArtifactDirectoryManifest,
+  ArtifactInputProvenance,
   ArtifactLedgerEntry,
   ArtifactOperation,
   AuditEvent,
@@ -29,9 +31,19 @@ import { createDefaultRooms } from "../chat/defaultRooms.js";
 import { RoleAwareRouter, type RoutePlan } from "../chat/router.js";
 import { InMemoryProductionMemory } from "../memory/memoryStore.js";
 import { TaskBoardBuilder } from "../tasks/taskBoard.js";
+import {
+  IllegalWorkflowStageTransitionError,
+  WorkflowAggregate,
+  type WorkflowCommand,
+  type WorkflowCommandResult,
+  type WorkflowEvent,
+  type WorkflowSnapshot,
+  type WorkflowStage
+} from "../workflow/index.js";
 
 export interface StudioKernelState {
   project: Project;
+  workflow: WorkflowSnapshot;
   agentLoop: AgentLoopState;
   agentActivities: AgentActivity[];
   rooms: Room[];
@@ -47,11 +59,13 @@ export interface StudioKernelState {
   handoffCapsules: SessionHandoffCapsule[];
 }
 
-export interface StudioKernelSnapshot extends Omit<StudioKernelState, "agentActivities" | "agentSessions" | "contextPackets" | "handoffCapsules"> {
+export interface StudioKernelSnapshot extends Omit<StudioKernelState, "workflow" | "agentActivities" | "agentSessions" | "contextPackets" | "handoffCapsules"> {
   version: 1;
   savedAt: string;
   memoryRecords: MemoryRecord[];
   auditEvents: AuditEvent[];
+  /** Optional only for backwards compatibility with snapshots written before the workflow aggregate existed. */
+  workflow?: WorkflowSnapshot;
   agentActivities?: AgentActivity[];
   agentSessions?: AgentSessionRecord[];
   contextPackets?: ContextPacket[];
@@ -74,6 +88,7 @@ export class StudioKernel {
   readonly taskBoard: TaskBoardBuilder;
 
   private readonly state: StudioKernelState;
+  private readonly workflowAggregate: WorkflowAggregate;
 
   constructor(
     project: Project,
@@ -87,8 +102,22 @@ export class StudioKernel {
     this.memory = new InMemoryProductionMemory(restoredState.memoryRecords);
     this.auditLog = new InMemoryAuditLog(restoredState.auditEvents);
     this.taskBoard = new TaskBoardBuilder();
+    this.workflowAggregate = restoredState.workflow
+      ? WorkflowAggregate.fromSnapshot(restoredState.workflow)
+      : createLegacyWorkflowAggregate(project);
+    if (this.workflowAggregate.projectId !== project.projectId) {
+      throw new Error(
+        `Workflow project '${this.workflowAggregate.projectId}' does not match Studio project '${project.projectId}'.`
+      );
+    }
+    if (this.workflowAggregate.stage !== project.currentStage) {
+      throw new Error(
+        `Workflow stage '${this.workflowAggregate.stage}' does not match project stage '${project.currentStage}'.`
+      );
+    }
     this.state = {
       project,
+      workflow: this.workflowAggregate.getSnapshot(),
       agentLoop: restoredState.agentLoop ?? createInitialAgentLoopState(project),
       agentActivities: restoredState.agentActivities ?? [],
       rooms: restoredState.rooms ?? createDefaultRooms(project.projectId),
@@ -106,7 +135,7 @@ export class StudioKernel {
   }
 
   get project(): Project {
-    return this.state.project;
+    return { ...this.state.project };
   }
 
   updateProject(fields: Partial<Pick<Project, "executionStatus" | "initialIdea" | "startedAt" | "updatedAt">>): void {
@@ -233,8 +262,32 @@ export class StudioKernel {
   }
 
   setStage(stageId: StageId, updatedAt = new Date().toISOString()): void {
-    this.state.project.currentStage = stageId;
-    this.state.project.updatedAt = updatedAt;
+    if (stageId === this.workflowAggregate.stage) {
+      this.state.project.updatedAt = updatedAt;
+      return;
+    }
+
+    throw new IllegalWorkflowStageTransitionError(
+      this.workflowAggregate.stage,
+      stageId,
+      "stage transitions require an explicit Workflow command; setStage cannot advance the aggregate"
+    );
+  }
+
+  getWorkflowSnapshot(): WorkflowSnapshot {
+    return this.workflowAggregate.getSnapshot();
+  }
+
+  listWorkflowEvents(afterRevision = 0): WorkflowEvent[] {
+    return this.workflowAggregate.listEvents(afterRevision);
+  }
+
+  executeWorkflow(command: WorkflowCommand): WorkflowCommandResult {
+    const result = this.workflowAggregate.execute(command);
+    this.state.workflow = result.snapshot;
+    this.state.project.currentStage = result.snapshot.stage;
+    this.state.project.updatedAt = result.snapshot.updatedAt;
+    return result;
   }
 
   listRooms(): Room[] {
@@ -379,6 +432,14 @@ export class StudioKernel {
   }
 
   addArtifact(artifact: Artifact): void {
+    this.assertArtifactProjectAndTask(artifact);
+    if (this.state.artifacts.some((candidate) => candidate.artifactId === artifact.artifactId)) {
+      throw new Error(`Artifact id already exists: ${artifact.artifactId}.`);
+    }
+    const pathOwner = this.state.artifacts.find((candidate) => candidate.path === artifact.path);
+    if (pathOwner) {
+      throw new Error(`Artifact path ${artifact.path} is already owned by ${pathOwner.artifactId}.`);
+    }
     this.state.artifacts.push(artifact);
     const operationId = this.createArtifactOperation(artifact);
     this.state.artifactLedger.push({
@@ -414,18 +475,36 @@ export class StudioKernel {
   }
 
   upsertArtifact(artifact: Artifact): Artifact {
-    const existing = this.state.artifacts.find(
-      (candidate) => candidate.artifactId === artifact.artifactId || (candidate.ownerAgentId === artifact.ownerAgentId && candidate.path === artifact.path)
-    );
+    this.assertArtifactProjectAndTask(artifact);
+
+    const existingById = this.state.artifacts.find((candidate) => candidate.artifactId === artifact.artifactId);
+    const existingByPath = this.state.artifacts.find((candidate) => candidate.path === artifact.path);
+    if (existingById && existingByPath && existingById.artifactId !== existingByPath.artifactId) {
+      throw new Error(
+        `Artifact identity conflict: ${artifact.artifactId} and ${existingByPath.artifactId} both resolve to ${artifact.path}.`
+      );
+    }
+    if (!existingById && existingByPath) {
+      throw new Error(
+        `Artifact path ${artifact.path} is already owned by ${existingByPath.artifactId}; a second artifact identity cannot claim it.`
+      );
+    }
+
+    const existing = existingById;
     if (!existing) {
       this.addArtifact(artifact);
       this.attachArtifactToSourceTask(artifact);
       return artifact;
     }
 
+    assertArtifactIdentityInvariant(existing, artifact);
+
     const updatedAt = artifact.updatedAt ?? new Date().toISOString();
-    existing.type = artifact.type;
-    existing.path = artifact.path;
+    const materialDefinitionChanged =
+      artifact.version > existing.version ||
+      artifact.path !== existing.path ||
+      artifact.type !== existing.type ||
+      artifact.metadata.toolContent !== existing.metadata.toolContent;
     existing.status = artifact.status;
     existing.version = Math.max(existing.version, artifact.version);
     if (artifact.sourceTaskId !== undefined) {
@@ -455,9 +534,41 @@ export class StudioKernel {
         reason: "等待工作区写入并计算文件证据。"
       };
       this.state.artifactLedger.push(ledger);
+    } else if (materialDefinitionChanged) {
+      ledger.path = existing.path;
+      ledger.updatedAt = updatedAt;
+      ledger.sourceOperationId = this.createArtifactOperation(existing);
+      ledger.status = "pending";
+      ledger.reason = "产物版本或内容定义已变化，旧文件证据已失效，等待重新物化。";
+      delete ledger.hash;
+      delete ledger.sizeBytes;
+      delete ledger.materializedAt;
+      delete ledger.inputArtifacts;
+      delete ledger.directoryManifest;
+      delete existing.checksum;
     }
 
     return existing;
+  }
+
+  private assertArtifactProjectAndTask(artifact: Artifact): void {
+    if (artifact.projectId !== this.state.project.projectId) {
+      throw new Error(
+        `Artifact ${artifact.artifactId} belongs to project ${artifact.projectId}, not ${this.state.project.projectId}.`
+      );
+    }
+    if (!artifact.sourceTaskId) {
+      return;
+    }
+    const task = this.state.tasks.find((candidate) => candidate.taskId === artifact.sourceTaskId);
+    if (!task) {
+      throw new Error(`Artifact ${artifact.artifactId} references unknown source task ${artifact.sourceTaskId}.`);
+    }
+    if (task.ownerAgentId !== artifact.ownerAgentId) {
+      throw new Error(
+        `Artifact ${artifact.artifactId} owner ${artifact.ownerAgentId} does not own source task ${artifact.sourceTaskId}.`
+      );
+    }
   }
 
   recordArtifactMaterialization(
@@ -467,6 +578,7 @@ export class StudioKernel {
       hash: string;
       sizeBytes: number;
       materializedAt: string;
+      directoryManifest?: ArtifactDirectoryManifest;
     }
   ): ArtifactLedgerEntry {
     const artifact = this.state.artifacts.find((candidate) => candidate.artifactId === artifactId);
@@ -474,6 +586,7 @@ export class StudioKernel {
       throw new Error(`Artifact not found: ${artifactId}`);
     }
 
+    const inputArtifacts = this.captureArtifactInputProvenance(artifact);
     let ledger = this.state.artifactLedger.find((candidate) => candidate.artifactId === artifactId);
     if (!ledger) {
       const operationId = this.createArtifactOperation(artifact);
@@ -495,7 +608,9 @@ export class StudioKernel {
       ledger.status === "verified" &&
       ledger.hash === input.hash &&
       ledger.sizeBytes === input.sizeBytes &&
-      ledger.path === input.path;
+      ledger.path === input.path &&
+      JSON.stringify(ledger.inputArtifacts ?? []) === JSON.stringify(inputArtifacts) &&
+      JSON.stringify(ledger.directoryManifest) === JSON.stringify(input.directoryManifest);
 
     ledger.path = input.path;
     ledger.hash = input.hash;
@@ -503,7 +618,16 @@ export class StudioKernel {
     ledger.materializedAt = input.materializedAt;
     ledger.updatedAt = input.materializedAt;
     ledger.status = "verified";
-    ledger.reason = "文件已由服务端 artifact 写入工具物化并完成 hash/size 校验。";
+    ledger.inputArtifacts = inputArtifacts;
+    if (input.directoryManifest) {
+      ledger.directoryManifest = {
+        ...input.directoryManifest,
+        files: input.directoryManifest.files.map((entry) => ({ ...entry }))
+      };
+    } else {
+      delete ledger.directoryManifest;
+    }
+    ledger.reason = "当前产物版本对应的工作区文件及声明输入快照已完成 hash/size 校验。";
     artifact.checksum = input.hash;
     artifact.updatedAt = input.materializedAt;
 
@@ -523,7 +647,7 @@ export class StudioKernel {
         agentId: artifact.ownerAgentId,
         ...(artifact.sourceTaskId ? { taskId: artifact.sourceTaskId } : {}),
         eventType: "ARTIFACT_MATERIALIZED",
-        inputArtifacts: [],
+        inputArtifacts: inputArtifacts.map((entry) => entry.artifactId),
         outputArtifacts: [artifact.artifactId],
         toolCalls: [
           {
@@ -549,6 +673,36 @@ export class StudioKernel {
     }
 
     return ledger;
+  }
+
+  private captureArtifactInputProvenance(artifact: Artifact): ArtifactInputProvenance[] {
+    if (!artifact.sourceTaskId) {
+      return [];
+    }
+    const task = this.state.tasks.find((candidate) => candidate.taskId === artifact.sourceTaskId);
+    if (!task) {
+      throw new Error(`Artifact ${artifact.artifactId} references unknown source task ${artifact.sourceTaskId}.`);
+    }
+    return [...new Set(task.inputArtifacts)].sort().map((inputArtifactId) => {
+      const inputArtifact = this.state.artifacts.find((candidate) => candidate.artifactId === inputArtifactId);
+      const evidence = this.state.artifactLedger.find((candidate) => candidate.artifactId === inputArtifactId);
+      if (!inputArtifact || evidence?.status !== "verified" || !evidence.hash || evidence.sizeBytes === undefined) {
+        throw new Error(
+          `Artifact ${artifact.artifactId} cannot be materialized before input ${inputArtifactId} has verified file evidence.`
+        );
+      }
+      return {
+        artifactId: inputArtifact.artifactId,
+        version: inputArtifact.version,
+        path: inputArtifact.path,
+        evidencePath: evidence.path,
+        hash: evidence.hash,
+        sizeBytes: evidence.sizeBytes,
+        ...(evidence.directoryManifest?.digest
+          ? { directoryManifestDigest: evidence.directoryManifest.digest }
+          : {})
+      };
+    });
   }
 
   updateArtifactStatus(
@@ -855,7 +1009,8 @@ export class StudioKernel {
     return {
       version: 1,
       savedAt,
-      project: this.state.project,
+      project: { ...this.state.project },
+      workflow: this.workflowAggregate.getSnapshot(),
       agentLoop: this.state.agentLoop,
       agentActivities: this.state.agentActivities,
       rooms: this.state.rooms,
@@ -1011,6 +1166,7 @@ export function createRestartedStudioKernel(project: Project): StudioKernel {
 
 export function createStudioKernelFromSnapshot(snapshot: StudioKernelSnapshot): StudioKernel {
   return new StudioKernel(snapshot.project, {
+    ...(snapshot.workflow ? { workflow: snapshot.workflow } : {}),
     agentLoop: snapshot.agentLoop,
     agentActivities: snapshot.agentActivities ?? [],
     rooms: snapshot.rooms,
@@ -1029,6 +1185,42 @@ export function createStudioKernelFromSnapshot(snapshot: StudioKernelSnapshot): 
   });
 }
 
+function createLegacyWorkflowAggregate(project: Project): WorkflowAggregate {
+  const initialStage = legacyInitialWorkflowStage(project.currentStage);
+  const aggregate = WorkflowAggregate.create(project.projectId, {
+    initialStage,
+    createdAt: project.createdAt
+  });
+  if (initialStage === project.currentStage) {
+    return aggregate;
+  }
+
+  aggregate.execute({
+    type: "submit_review",
+    expectedRevision: aggregate.revision,
+    idempotencyKey: `legacy:snapshot-migration:${project.projectId}:${project.currentStage}`,
+    actor: { actorId: "studio-kernel-snapshot-migration", role: "system" },
+    occurredAt: project.updatedAt,
+    label: `Migrated legacy ${project.currentStage} review`,
+    requiredArtifacts: ["legacy_snapshot"],
+    checks: ["legacy_snapshot_migrated"]
+  });
+  return aggregate;
+}
+
+function legacyInitialWorkflowStage(stage: WorkflowStage): WorkflowStage {
+  switch (stage) {
+    case "concept_review":
+      return "concept_discussion";
+    case "first_playable_review":
+      return "production";
+    case "release_gate":
+      return "release_preparation";
+    default:
+      return stage;
+  }
+}
+
 function createInitialAgentLoopState(project: Project): AgentLoopState {
   const status: AgentLoopState["status"] = project.executionStatus === "paused" ? "paused" : "idle";
   return {
@@ -1040,6 +1232,27 @@ function createInitialAgentLoopState(project: Project): AgentLoopState {
     agents: {},
     updatedAt: project.updatedAt
   };
+}
+
+function assertArtifactIdentityInvariant(existing: Artifact, incoming: Artifact): void {
+  const immutableFields: Array<keyof Pick<Artifact, "projectId" | "type" | "path" | "ownerAgentId">> = [
+    "projectId",
+    "type",
+    "path",
+    "ownerAgentId"
+  ];
+  for (const field of immutableFields) {
+    if (existing[field] !== incoming[field]) {
+      throw new Error(
+        `Artifact ${existing.artifactId} cannot change immutable ${field} from '${existing[field]}' to '${incoming[field]}'.`
+      );
+    }
+  }
+  if (existing.sourceTaskId && incoming.sourceTaskId && existing.sourceTaskId !== incoming.sourceTaskId) {
+    throw new Error(
+      `Artifact ${existing.artifactId} is already bound to source task ${existing.sourceTaskId}; it cannot move to ${incoming.sourceTaskId}.`
+    );
+  }
 }
 
 function summarizeClaimVerdict(claims: ClaimVerification[]): ClaimVerification["verdict"] | undefined {

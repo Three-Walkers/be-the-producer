@@ -11,6 +11,7 @@ import type {
 } from "@game-pipeline/shared-schemas";
 import type { AgentRouteScore, RoutePlan } from "../chat/router.js";
 import type { StudioKernel } from "../studio/studioKernel.js";
+import { createSampleIdeaTemplateRegistry, type IdeaTemplateRegistry } from "../templates/index.js";
 
 export interface LocalAgentRunResult {
   routePlan: RoutePlan;
@@ -21,6 +22,31 @@ export interface LocalAgentRuntimeOptions {
   scriptedReplies?: boolean;
   protocolFlows?: boolean;
   bootstrapProjectState?: boolean;
+  gateEvidencePolicy?: GateEvidencePolicy;
+}
+
+export interface LocalAgentRuntimeDependencies {
+  ideaTemplates?: IdeaTemplateRegistry;
+  gateEvidencePolicy?: GateEvidencePolicy;
+}
+
+export type GateEvidencePhase = "review" | "decision";
+
+export interface GateEvidenceRequirement {
+  gateActionId: "stage1" | "playable" | "release";
+  phase: GateEvidencePhase;
+  requiredArtifactIds: readonly string[];
+  qaTaskId?: string;
+  qaReportArtifactId?: string;
+}
+
+/**
+ * Application boundary for evidence validation. The runtime package deliberately
+ * knows nothing about workspace files, contract parsers, or protected QA receipts.
+ * Deployments must inject a policy that validates those application-owned facts.
+ */
+export interface GateEvidencePolicy {
+  assertGateEvidence(kernel: StudioKernel, requirement: GateEvidenceRequirement): void;
 }
 
 type Handler = (input: HandlerInput) => void;
@@ -30,6 +56,7 @@ interface HandlerInput {
   producerMessage: StudioMessage;
   route: AgentRouteScore;
   now: string;
+  ideaTemplates: IdeaTemplateRegistry;
 }
 
 type GateActionId = "stage1" | "playable" | "release";
@@ -38,7 +65,11 @@ interface GateAction {
   actionId: GateActionId;
   label: string;
   confirmToken: string;
+  sourceStage: StageId;
+  reviewStage: StageId;
   expectedStages: StageId[];
+  requiredArtifacts: string[];
+  checks: string[];
 }
 
 interface GateReviewLine {
@@ -53,19 +84,48 @@ const gateActions: Record<GateActionId, GateAction> = {
     actionId: "stage1",
     label: "确认立项",
     confirmToken: "执行确认：确认立项",
-    expectedStages: ["concept_discussion"]
+    sourceStage: "concept_discussion",
+    reviewStage: "concept_review",
+    expectedStages: ["concept_discussion", "concept_review"],
+    requiredArtifacts: [
+      "artifact_gdd_baseline_draft",
+      "artifact_game_contract_draft",
+      "artifact_art_bible_baseline_draft"
+    ],
+    checks: ["gdd_verified", "game_contract_verified", "art_direction_verified", "scope_reviewed"]
   },
   playable: {
     actionId: "playable",
     label: "首个可玩通过",
     confirmToken: "执行确认：首个可玩通过",
-    expectedStages: ["production"]
+    sourceStage: "production",
+    reviewStage: "first_playable_review",
+    expectedStages: ["production", "first_playable_review"],
+    requiredArtifacts: [
+      "artifact_game_contract_draft",
+      "artifact_asset_manifest_draft",
+      "artifact_scene_blueprint_draft",
+      "artifact_playtest_contract_draft",
+      "artifact_gameplay_source",
+      "artifact_wechat_dev_build",
+      "artifact_qa_playtest_report"
+    ],
+    checks: ["contracts_compatible", "development_build_verified", "playtest_passed"]
   },
   release: {
     actionId: "release",
     label: "批准发布",
     confirmToken: "执行确认：批准发布",
-    expectedStages: ["release_preparation", "release_gate"]
+    sourceStage: "release_preparation",
+    reviewStage: "release_gate",
+    expectedStages: ["release_preparation", "release_gate"],
+    requiredArtifacts: [
+      "artifact_wechat_release_build",
+      "artifact_release_gate_report",
+      "artifact_deployment_plan",
+      "artifact_rollback_plan"
+    ],
+    checks: ["release_build_verified", "release_playtest_passed", "rollback_ready", "deployment_plan_ready"]
   }
 };
 
@@ -78,6 +138,14 @@ const emptyChildrenSummary = (): TaskChildrenSummary => ({
 });
 
 export class LocalAgentRuntime {
+  private readonly ideaTemplates: IdeaTemplateRegistry;
+  private readonly gateEvidencePolicy: GateEvidencePolicy;
+
+  constructor(dependencies: LocalAgentRuntimeDependencies = {}) {
+    this.ideaTemplates = dependencies.ideaTemplates ?? createSampleIdeaTemplateRegistry();
+    this.gateEvidencePolicy = dependencies.gateEvidencePolicy ?? conservativeRuntimeGateEvidencePolicy;
+  }
+
   private readonly handlers: Partial<Record<AgentId, Handler>> = {
     studio_orchestrator: handleOrchestrator,
     producer: handleProducer,
@@ -106,7 +174,9 @@ export class LocalAgentRuntime {
 
     const gate = resolveGateAction(kernel, message.content);
     const shouldRunLocalDecisionFlow = gate ? protocolFlows : false;
-    const transitionApplied = gate && shouldRunLocalDecisionFlow ? applyProducerDecisionFlow(kernel, message, gate, now) : false;
+    const transitionApplied = gate && shouldRunLocalDecisionFlow
+      ? applyProducerDecisionFlow(kernel, message, gate, now, options.gateEvidencePolicy ?? this.gateEvidencePolicy)
+      : false;
     if (transitionApplied) {
       return {
         routePlan,
@@ -136,7 +206,8 @@ export class LocalAgentRuntime {
           kernel,
           producerMessage: message,
           route,
-          now
+          now,
+          ideaTemplates: this.ideaTemplates
         });
       }
     }
@@ -195,19 +266,35 @@ function writePresenceResponse(kernel: StudioKernel): void {
   });
 }
 
-function applyProducerDecisionFlow(kernel: StudioKernel, message: StudioMessage, gate: GateAction, now: string): boolean {
+function applyProducerDecisionFlow(
+  kernel: StudioKernel,
+  message: StudioMessage,
+  gate: GateAction,
+  now: string,
+  evidencePolicy: GateEvidencePolicy
+): boolean {
   const hasReview = hasRecentGateReview(kernel, gate, message.messageId);
   if (isGateExecutionConfirmation(message.content, gate) || (hasReview && isNaturalLanguageGateConfirmation(message.content))) {
-    executeGateAction(kernel, message, gate, now);
+    executeGateAction(kernel, message, gate, now, evidencePolicy);
     return true;
   }
 
-  writeGateReview(kernel, message, gate, now);
+  writeGateReview(kernel, message, gate, now, evidencePolicy);
   return true;
 }
 
-function executeGateAction(kernel: StudioKernel, message: StudioMessage, gate: GateAction, now: string): void {
-  if (!isGateStageApplicable(kernel, gate)) {
+function executeGateAction(
+  kernel: StudioKernel,
+  message: StudioMessage,
+  gate: GateAction,
+  now: string,
+  evidencePolicy: GateEvidencePolicy
+): void {
+  const decisionIdempotencyKey = gateDecisionIdempotencyKey(kernel, gate, message);
+  const isDecisionReplay = kernel.getWorkflowSnapshot().processedCommands.some(
+    (command) => command.idempotencyKey === decisionIdempotencyKey
+  );
+  if (!isDecisionReplay && !isGateStageApplicable(kernel, gate)) {
     writeAgentMessage(kernel, {
       agentId: "studio_orchestrator",
       roomKind: "studio-main",
@@ -217,7 +304,7 @@ function executeGateAction(kernel: StudioKernel, message: StudioMessage, gate: G
     return;
   }
 
-  if (!hasRecentGateReview(kernel, gate, message.messageId)) {
+  if (!isDecisionReplay && !hasRecentGateReview(kernel, gate, message.messageId)) {
     writeAgentMessage(kernel, {
       agentId: "studio_orchestrator",
       roomKind: "studio-main",
@@ -227,24 +314,34 @@ function executeGateAction(kernel: StudioKernel, message: StudioMessage, gate: G
     return;
   }
 
+  if (!isDecisionReplay && kernel.project.currentStage !== gate.reviewStage) {
+    writeAgentMessage(kernel, {
+      agentId: "studio_orchestrator",
+      roomKind: "studio-main",
+      messageType: "blocker",
+      content: `无法执行「${gate.label}」：Workflow Aggregate 尚未处于「${stageText(gate.reviewStage)}」。请先发起门禁评审。`
+    });
+    return;
+  }
+
   switch (gate.actionId) {
     case "stage1":
       try {
-        approveStageOne(kernel, message, now);
+        approveStageOne(kernel, message, now, evidencePolicy);
       } catch (error) {
         writeEvidenceBlocker(kernel, gate, error);
       }
       return;
     case "playable":
       try {
-        approveFirstPlayable(kernel, message, now);
+        approveFirstPlayable(kernel, message, now, evidencePolicy);
       } catch (error) {
         writeEvidenceBlocker(kernel, gate, error);
       }
       return;
     case "release":
       try {
-        approveRelease(kernel, message, now);
+        approveRelease(kernel, message, now, evidencePolicy);
       } catch (error) {
         writeEvidenceBlocker(kernel, gate, error);
       }
@@ -252,7 +349,29 @@ function executeGateAction(kernel: StudioKernel, message: StudioMessage, gate: G
   }
 }
 
-function writeGateReview(kernel: StudioKernel, message: StudioMessage, gate: GateAction, now: string): void {
+function writeGateReview(
+  kernel: StudioKernel,
+  message: StudioMessage,
+  gate: GateAction,
+  now: string,
+  evidencePolicy: GateEvidencePolicy
+): void {
+  if (!isGateStageApplicable(kernel, gate)) {
+    const reviewLines = buildGateReviewLines(kernel, gate, false, now);
+    for (const line of reviewLines) {
+      writeAgentMessage(kernel, line);
+    }
+    return;
+  }
+
+  try {
+    assertGateEvidence(evidencePolicy, kernel, gate, "review");
+    submitWorkflowReview(kernel, message, gate, now);
+  } catch (error) {
+    writeEvidenceBlocker(kernel, gate, error);
+    return;
+  }
+
   const stageApplicable = isGateStageApplicable(kernel, gate);
   const reviewLines = buildGateReviewLines(kernel, gate, stageApplicable, now);
   for (const line of reviewLines) {
@@ -265,6 +384,48 @@ function writeGateReview(kernel: StudioKernel, message: StudioMessage, gate: Gat
     type: "gate_review",
     content: `制作人请求「${gate.label}」门禁评审。系统已记录相关 Agent 准备度、阻塞和风险；未执行阶段推进。`,
     now
+  });
+}
+
+function submitWorkflowReview(kernel: StudioKernel, message: StudioMessage, gate: GateAction, now: string): void {
+  const snapshot = kernel.getWorkflowSnapshot();
+  const idempotencyKey = `gate:${kernel.project.projectId}:${gate.actionId}:review:${message.messageId}`;
+  const wasProcessed = snapshot.processedCommands.some((command) => command.idempotencyKey === idempotencyKey);
+  if (wasProcessed) {
+    kernel.executeWorkflow({
+      type: "submit_review",
+      expectedRevision: snapshot.revision,
+      idempotencyKey,
+      actor: { actorId: "studio_orchestrator", role: "orchestrator" },
+      occurredAt: now,
+      label: gate.label,
+      requiredArtifacts: gate.requiredArtifacts,
+      checks: gate.checks
+    });
+    return;
+  }
+
+  if (snapshot.activeGateId) {
+    const activeGate = snapshot.gates.find((candidate) => candidate.gateId === snapshot.activeGateId);
+    if (activeGate?.reviewStage === gate.reviewStage) {
+      return;
+    }
+    throw new Error(`另一个门禁「${activeGate?.label ?? snapshot.activeGateId}」正在等待制作人决策。`);
+  }
+
+  if (kernel.project.currentStage !== gate.sourceStage) {
+    throw new Error(`「${gate.label}」只能从「${stageText(gate.sourceStage)}」提交评审。`);
+  }
+
+  kernel.executeWorkflow({
+    type: "submit_review",
+    expectedRevision: snapshot.revision,
+    idempotencyKey,
+    actor: { actorId: "studio_orchestrator", role: "orchestrator" },
+    occurredAt: now,
+    label: gate.label,
+    requiredArtifacts: gate.requiredArtifacts,
+    checks: gate.checks
   });
 }
 
@@ -285,10 +446,12 @@ function buildStageOneReview(kernel: StudioKernel, gate: GateAction, stageApplic
   const artTask = kernel.findTask("task_stage_1_art_direction");
   const scopeTask = kernel.findTask("task_stage_1_scope_review");
   const gdd = kernel.listArtifacts().find((artifact) => artifact.artifactId === "artifact_gdd_baseline_draft");
+  const gameContract = kernel.listArtifacts().find((artifact) => artifact.artifactId === "artifact_game_contract_draft");
   const artBible = kernel.listArtifacts().find((artifact) => artifact.artifactId === "artifact_art_bible_baseline_draft");
   const blockers = [...(designTask?.blockers ?? []), ...(artTask?.blockers ?? []), ...(scopeTask?.blockers ?? [])];
   const missing = [
     ...(gdd ? [] : ["GDD baseline 尚未生成"]),
+    ...(gameContract ? [] : ["GameContract 尚未生成"]),
     ...(artBible ? [] : ["Art Bible baseline 尚未生成"])
   ];
   const risks = [
@@ -302,7 +465,7 @@ function buildStageOneReview(kernel: StudioKernel, gate: GateAction, stageApplic
       agentId: "game_designer",
       roomKind: "design-room",
       messageType: "review",
-      content: `门禁评审：${gate.label}。策划准备度：${readinessText(stageApplicable && Boolean(gdd) && !designTask?.blockers.length)}。${taskStatusText(designTask)} 风险：${formatList([...(designTask?.blockers ?? []), "核心操作、胜负条件和第一可玩范围需要制作人明确确认。"])}`
+      content: `门禁评审：${gate.label}。策划准备度：${readinessText(stageApplicable && Boolean(gdd) && Boolean(gameContract) && !designTask?.blockers.length)}。${taskStatusText(designTask)} 风险：${formatList([...(designTask?.blockers ?? []), gameContract ? "GameContract 已生成，仍需制作人确认核心循环与输入语义。" : "缺少可机读的 GameContract。", "核心操作、胜负条件和第一可玩范围需要制作人明确确认。"])}`
     },
     {
       agentId: "art_director",
@@ -365,18 +528,18 @@ function buildPlayableReview(kernel: StudioKernel, gate: GateAction, stageApplic
 function buildReleaseReview(kernel: StudioKernel, gate: GateAction, stageApplicable: boolean): GateReviewLine[] {
   const releaseTask = kernel.findTask("task_stage_3_wechat_release");
   const qaTask = kernel.findTask("task_stage_3_qa_release_gate");
-  const devopsTask = kernel.findTask("task_stage_3_devops_deploy");
+  const devopsTask = kernel.findTask("task_stage_3_devops_plan");
   const releaseBuild = kernel.listArtifacts().find((artifact) => artifact.artifactId === "artifact_wechat_release_build");
   const releaseGate = kernel.listArtifacts().find((artifact) => artifact.artifactId === "artifact_release_gate_report");
   const releaseQaPassed = releaseGate?.metadata.playtestVerdict === "pass" &&
     (releaseGate.metadata.toolName === "run_playtest" || releaseGate.metadata.harnessToolName === "run_playtest");
-  const deployment = kernel.listArtifacts().find((artifact) => artifact.artifactId === "artifact_deployment_report");
+  const deploymentPlan = kernel.listArtifacts().find((artifact) => artifact.artifactId === "artifact_deployment_plan");
   const rollback = kernel.listArtifacts().find((artifact) => artifact.artifactId === "artifact_rollback_plan");
   const blockers = [...(releaseTask?.blockers ?? []), ...(qaTask?.blockers ?? []), ...(devopsTask?.blockers ?? [])];
   const missing = [
     ...(releaseBuild ? [] : ["微信 release 构建尚未生成"]),
     ...(releaseQaPassed ? [] : [releaseGate ? "发布门禁报告存在，但真实试玩结论尚未通过" : "发布门禁报告尚未生成"]),
-    ...(deployment ? [] : ["部署记录尚未生成"]),
+    ...(deploymentPlan ? [] : ["部署计划尚未生成"]),
     ...(rollback ? [] : ["回滚方案尚未生成"])
   ];
   const risks = [
@@ -402,13 +565,13 @@ function buildReleaseReview(kernel: StudioKernel, gate: GateAction, stageApplica
       agentId: "devops",
       roomKind: "release-room",
       messageType: "review",
-      content: `门禁评审：${gate.label}。运维准备度：${readinessText(stageApplicable && Boolean(deployment) && Boolean(rollback) && !devopsTask?.blockers.length)}。${taskStatusText(devopsTask)} 风险：${formatList([...(devopsTask?.blockers ?? []), deployment && rollback ? "部署和回滚记录存在，但仍需确认真实凭据引用。" : "缺少部署记录或回滚方案。"])}`
+      content: `门禁评审：${gate.label}。运维准备度：${readinessText(stageApplicable && Boolean(deploymentPlan) && Boolean(rollback) && !devopsTask?.blockers.length)}。${taskStatusText(devopsTask)} 风险：${formatList([...(devopsTask?.blockers ?? []), deploymentPlan && rollback ? "部署计划和回滚方案已准备，仍需确认凭据只使用 Secret Vault 引用。" : "缺少部署计划或回滚方案。"])}`
     },
     {
       agentId: "liveops_analytics",
       roomKind: "studio-main",
       messageType: "review",
-      content: `门禁评审：${gate.label}。LiveOps 准备度：${readinessText(stageApplicable && Boolean(deployment))}。上线后仍需观察留存、失败率、局内流失点和后续迭代优先级。`
+      content: `门禁评审：${gate.label}。LiveOps 尚未启动；只有审批后的真实部署报告通过验证并完成生产健康检查，Workflow 才能进入持续运营。上线后需观察留存、失败率、局内流失点和后续迭代优先级。`
     },
     gateSummaryLine(kernel, gate, stageApplicable, risks)
   ];
@@ -524,16 +687,22 @@ function hasRecentGateReview(kernel: StudioKernel, gate: GateAction, currentMess
   return latestReview !== -1 && latestReview > latestExecution;
 }
 
-function approveStageOne(kernel: StudioKernel, message: StudioMessage, now: string): void {
+function approveStageOne(
+  kernel: StudioKernel,
+  message: StudioMessage,
+  now: string,
+  evidencePolicy: GateEvidencePolicy
+): void {
   ensureStageOneTasks(kernel, now);
-  requireVerifiedArtifacts(kernel, ["artifact_gdd_baseline_draft", "artifact_art_bible_baseline_draft"]);
+  assertGateEvidence(evidencePolicy, kernel, gateActions.stage1, "decision");
+  approveActiveWorkflowGate(kernel, gateActions.stage1, message, now);
   for (const taskId of ["task_stage_1_design_clarification", "task_stage_1_art_direction", "task_stage_1_scope_review"]) {
     kernel.updateTaskStatus(taskId, "done", now);
   }
   kernel.updateTaskStatus("task_group_stage_1", "done", now);
 
-  kernel.setStage("production", now);
   ensureArtifactStatus(kernel, "artifact_gdd_baseline_draft", "approved", now);
+  ensureArtifactStatus(kernel, "artifact_game_contract_draft", "approved", now);
   ensureArtifactStatus(kernel, "artifact_art_bible_baseline_draft", "approved", now);
   ensureStageTwoTasksAndArtifacts(kernel, message, now);
   writeProjectMemory(kernel, {
@@ -624,12 +793,20 @@ function formatList(items: string[]): string {
   return filtered.join("；");
 }
 
-function approveFirstPlayable(kernel: StudioKernel, message: StudioMessage, now: string): void {
-  requireVerifiedArtifacts(kernel, ["artifact_asset_manifest_draft", "artifact_scene_blueprint_draft", "artifact_wechat_dev_build", "artifact_qa_playtest_report"]);
-  requirePassingPlaytest(kernel, "artifact_qa_playtest_report");
+function approveFirstPlayable(
+  kernel: StudioKernel,
+  message: StudioMessage,
+  now: string,
+  evidencePolicy: GateEvidencePolicy
+): void {
+  assertGateEvidence(evidencePolicy, kernel, gateActions.playable, "decision");
+  approveActiveWorkflowGate(kernel, gateActions.playable, message, now);
   for (const taskId of [
     "task_stage_2_asset_pipeline",
+    "task_stage_2_cocos_architecture",
     "task_stage_2_cocos_implementation",
+    "task_stage_2_playtest_contract",
+    "task_stage_2_cocos_build",
     "task_stage_2_qa_playtest",
     "task_group_stage_2"
   ]) {
@@ -638,7 +815,6 @@ function approveFirstPlayable(kernel: StudioKernel, message: StudioMessage, now:
     }
   }
 
-  kernel.setStage("release_preparation", now);
   ensureReleaseTasksAndArtifacts(kernel, message, now);
   writeProjectMemory(kernel, {
     memoryId: `mem_first_playable_approved_${message.messageId}`,
@@ -655,41 +831,72 @@ function approveFirstPlayable(kernel: StudioKernel, message: StudioMessage, now:
   });
 }
 
-function approveRelease(kernel: StudioKernel, message: StudioMessage, now: string): void {
-  requireVerifiedArtifacts(kernel, [
-    "artifact_wechat_release_build",
-    "artifact_release_gate_report",
-    "artifact_deployment_report",
-    "artifact_rollback_plan",
-    "artifact_release_notes"
-  ]);
-  requirePassingPlaytest(kernel, "artifact_release_gate_report");
-  for (const taskId of [
-    "task_stage_3_wechat_release",
-    "task_stage_3_qa_release_gate",
-    "task_stage_3_devops_deploy",
-    "task_stage_3_liveops_backlog",
-    "task_group_stage_3"
-  ]) {
+function approveRelease(
+  kernel: StudioKernel,
+  message: StudioMessage,
+  now: string,
+  evidencePolicy: GateEvidencePolicy
+): void {
+  assertGateEvidence(evidencePolicy, kernel, gateActions.release, "decision");
+  approveActiveWorkflowGate(kernel, gateActions.release, message, now);
+  for (const taskId of ["task_stage_3_wechat_release", "task_stage_3_qa_release_gate", "task_stage_3_devops_plan"]) {
     if (kernel.findTask(taskId)) {
       kernel.updateTaskStatus(taskId, "done", now);
     }
   }
+  if (kernel.findTask("task_stage_3_devops_deploy")) {
+    kernel.updateTaskStatus("task_stage_3_devops_deploy", "doing", now);
+  }
+  if (kernel.findTask("task_stage_3_liveops_backlog")) {
+    kernel.updateTaskStatus("task_stage_3_liveops_backlog", "todo", now);
+  }
+  if (kernel.findTask("task_group_stage_3")) {
+    kernel.updateTaskStatus("task_group_stage_3", "doing", now);
+  }
 
-  kernel.setStage("liveops", now);
   writeProjectMemory(kernel, {
     memoryId: `mem_release_approved_${message.messageId}`,
     ownerAgent: "producer",
     type: "release_approval",
-    content: "制作人已批准发布，项目进入 LiveOps 持续迭代。",
+    content: "制作人已批准发布，项目进入生产部署；部署健康检查完成后才可进入 LiveOps。",
     now
   });
   writeAgentMessage(kernel, {
     agentId: "devops",
     roomKind: "release-room",
     messageType: "deployment_record",
-    relatedArtifactIds: ["artifact_deployment_report", "artifact_rollback_plan"],
-    content: "发布审批已记录。当前本地 MVP 已生成部署记录和回滚计划占位，真实部署将由 Secret Vault 和 DevOps 工具执行。"
+    relatedArtifactIds: ["artifact_deployment_plan", "artifact_rollback_plan", "artifact_deployment_report"],
+    content: "发布审批已记录，Workflow 已进入生产部署。deployment_report 尚未生成；只有 DevOps 执行真实部署并通过健康检查后，才能写入已验证部署记录并请求进入 LiveOps。"
+  });
+}
+
+function gateDecisionIdempotencyKey(kernel: StudioKernel, gate: GateAction, message: StudioMessage): string {
+  return `gate:${kernel.project.projectId}:${gate.actionId}:decision:${message.messageId}`;
+}
+
+function approveActiveWorkflowGate(
+  kernel: StudioKernel,
+  gate: GateAction,
+  message: StudioMessage,
+  now: string
+): void {
+  const snapshot = kernel.getWorkflowSnapshot();
+  const activeGate = snapshot.activeGateId
+    ? snapshot.gates.find((candidate) => candidate.gateId === snapshot.activeGateId)
+    : [...snapshot.gates].reverse().find((candidate) => candidate.reviewStage === gate.reviewStage);
+  if (!activeGate) {
+    throw new Error(`Workflow Aggregate 中不存在「${gate.label}」的评审门禁。`);
+  }
+
+  kernel.executeWorkflow({
+    type: "record_gate_decision",
+    expectedRevision: snapshot.revision,
+    idempotencyKey: gateDecisionIdempotencyKey(kernel, gate, message),
+    actor: { actorId: message.senderId, role: "producer" },
+    occurredAt: now,
+    gateId: activeGate.gateId,
+    verdict: "approved",
+    notes: `制作人通过二次确认批准「${gate.label}」。`
   });
 }
 
@@ -702,8 +909,9 @@ function handleProducer({ kernel }: HandlerInput): void {
   });
 }
 
-function handleGameDesigner({ kernel, producerMessage, now }: HandlerInput): void {
+function handleGameDesigner({ kernel, producerMessage, now, ideaTemplates }: HandlerInput): void {
   const artifactId = "artifact_gdd_baseline_draft";
+  const gameContractArtifactId = "artifact_game_contract_draft";
   ensureArtifact(kernel, {
     artifactId,
     projectId: kernel.project.projectId,
@@ -721,6 +929,25 @@ function handleGameDesigner({ kernel, producerMessage, now }: HandlerInput): voi
     createdAt: now,
     updatedAt: now
   });
+  ensureArtifact(kernel, {
+    artifactId: gameContractArtifactId,
+    projectId: kernel.project.projectId,
+    type: "game_contract",
+    path: "agents/design/contracts/game-contract.json",
+    ownerAgentId: "game_designer",
+    stageId: kernel.project.currentStage,
+    status: "draft",
+    version: 1,
+    sourceTaskId: "task_stage_1_design_clarification",
+    sourceDecisionIds: [],
+    metadata: {
+      generatedBy: "local_agent_runtime",
+      sourceIdea: producerMessage.content,
+      schemaVersion: 1
+    },
+    createdAt: now,
+    updatedAt: now
+  });
   writeProjectMemory(kernel, {
     memoryId: `mem_design_draft_${producerMessage.messageId}`,
     ownerAgent: "game_designer",
@@ -732,12 +959,12 @@ function handleGameDesigner({ kernel, producerMessage, now }: HandlerInput): voi
     agentId: "game_designer",
     roomKind: "design-room",
     messageType: "decision_request",
-    relatedArtifactIds: [artifactId],
-    content: buildDesignOpeningQuestion(producerMessage.content)
+    relatedArtifactIds: [artifactId, gameContractArtifactId],
+    content: buildDesignOpeningQuestion(producerMessage.content, ideaTemplates)
   });
 }
 
-function handleArtDirector({ kernel, producerMessage, now }: HandlerInput): void {
+function handleArtDirector({ kernel, producerMessage, now, ideaTemplates }: HandlerInput): void {
   const artifactId = "artifact_art_bible_baseline_draft";
   ensureArtifact(kernel, {
     artifactId,
@@ -768,29 +995,12 @@ function handleArtDirector({ kernel, producerMessage, now }: HandlerInput): void
     roomKind: "art-room",
     messageType: "decision_request",
     relatedArtifactIds: [artifactId],
-    content: buildArtOpeningQuestion(producerMessage.content)
+    content: buildArtOpeningQuestion(producerMessage.content, ideaTemplates)
   });
 }
 
-function buildDesignOpeningQuestion(idea: string): string {
-  const text = idea.toLowerCase();
-  const questions: string[] = [];
-  if (text.includes("毛线") || text.includes("线团") || text.includes("球")) {
-    questions.push("毛线球的核心物理行为是什么：弹开、滚动、缠住、还是被点击后短暂停滞？");
-  }
-  if (text.includes("防守") || text.includes("守") || text.includes("篮")) {
-    questions.push("防守失败的判定要精确到什么程度：碰到篮筐边缘、越过某条线，还是落入篮内才失败？");
-  }
-  if (text.includes("微信") || text.includes("小游戏")) {
-    questions.push("微信小游戏首个可玩要优先验证哪件事：上手速度、单局留存、分享复玩，还是手感反馈？");
-  }
-  if (text.includes("可爱") || text.includes("轻松") || text.includes("治愈")) {
-    questions.push("你希望玩家的主要情绪更偏轻松治愈、手忙脚乱的快乐，还是紧张但不挫败？");
-  }
-  if (questions.length < 3) {
-    questions.push("玩家每局最核心的一句话目标是什么？");
-    questions.push("玩家失败后应该立刻想再来一局，还是先看到成长/奖励反馈？");
-  }
+function buildDesignOpeningQuestion(idea: string, ideaTemplates: IdeaTemplateRegistry): string {
+  const questions = ideaTemplates.select(idea).designPrompts;
 
   return [
     "策划已接收 idea，我不会把立项讨论自动结束。",
@@ -800,22 +1010,8 @@ function buildDesignOpeningQuestion(idea: string): string {
   ].join("\n");
 }
 
-function buildArtOpeningQuestion(idea: string): string {
-  const text = idea.toLowerCase();
-  const prompts: string[] = [];
-  if (text.includes("毛线") || text.includes("猫") || text.includes("可爱")) {
-    prompts.push("毛线球和场景要偏手作毛绒、扁平贴纸，还是更像柔软 3D 玩具？");
-  }
-  if (text.includes("轻松") || text.includes("治愈") || text.includes("可爱")) {
-    prompts.push("整体色彩要偏奶油暖色、清爽浅色，还是高对比的街机糖果色？");
-  }
-  if (text.includes("篮球") || text.includes("篮")) {
-    prompts.push("篮子/边界要明显游戏化，还是融入生活化场景让防守目标更自然？");
-  }
-  if (prompts.length < 3) {
-    prompts.push("有没有明确参考图、参考游戏或不想出现的视觉风格？");
-    prompts.push("首个可玩阶段优先保证角色识别、操作反馈，还是场景氛围？");
-  }
+function buildArtOpeningQuestion(idea: string, ideaTemplates: IdeaTemplateRegistry): string {
+  const prompts = ideaTemplates.select(idea).artPrompts;
 
   return [
     "美术已接收 idea，我不会把视觉讨论自动结束。",
@@ -912,7 +1108,7 @@ function ensureStageOneTasks(kernel: StudioKernel, now: string): void {
     taskLevel: "task_group",
     ownerAgentId: "studio_orchestrator",
     title: "阶段 1：立项、机制和世界观讨论",
-    description: "把制作人 idea 澄清成可执行 GDD baseline、Art Bible baseline 和第一可玩范围。",
+    description: "把制作人 idea 澄清成可执行 GDD baseline、版本化 GameContract、Art Bible baseline 和第一可玩范围。",
     status: "doing",
     priority: 100,
     sortOrder: 10,
@@ -920,7 +1116,7 @@ function ensureStageOneTasks(kernel: StudioKernel, now: string): void {
     childrenSummary: emptyChildrenSummary(),
     inputArtifacts: [],
     outputArtifacts: [],
-    acceptanceCriteria: ["核心玩法已确认", "美术方向已确认", "第一可玩范围已确认"],
+    acceptanceCriteria: ["核心玩法已确认", "GameContract 已通过结构校验", "美术方向已确认", "第一可玩范围已确认"],
     blockers: [],
     createdAt: now,
     updatedAt: now
@@ -933,16 +1129,16 @@ function ensureStageOneTasks(kernel: StudioKernel, now: string): void {
     roomId: kernel.getRoom("design-room").roomId,
     taskLevel: "task",
     ownerAgentId: "game_designer",
-    title: "澄清玩法并生成 GDD baseline",
-    description: "确认核心循环、单局时长、胜负条件、机制边界和第一可玩范围。",
+    title: "澄清玩法并生成 GDD 与 GameContract baseline",
+    description: "确认核心循环、状态模型、输入动作、运行时信号、胜负条件、机制边界和第一可玩范围。",
     status: "doing",
     priority: 90,
     sortOrder: 20,
     progressPercent: 50,
     childrenSummary: emptyChildrenSummary(),
     inputArtifacts: [],
-    outputArtifacts: ["artifact_gdd_baseline_draft"],
-    acceptanceCriteria: ["GDD baseline 已提交", "制作人完成核心玩法审批"],
+    outputArtifacts: ["artifact_gdd_baseline_draft", "artifact_game_contract_draft"],
+    acceptanceCriteria: ["GDD baseline 已提交", "GameContract 通过严格结构校验", "制作人完成核心玩法审批"],
     blockers: ["等待制作人回答开局澄清问题"],
     createdAt: now,
     updatedAt: now
@@ -983,7 +1179,7 @@ function ensureStageOneTasks(kernel: StudioKernel, now: string): void {
     priority: 85,
     sortOrder: 40,
     childrenSummary: emptyChildrenSummary(),
-    inputArtifacts: ["artifact_gdd_baseline_draft", "artifact_art_bible_baseline_draft"],
+    inputArtifacts: ["artifact_gdd_baseline_draft", "artifact_game_contract_draft", "artifact_art_bible_baseline_draft"],
     outputArtifacts: [],
     acceptanceCriteria: ["制作人完成 Stage 1 审批或提交变更请求"],
     blockers: [],
@@ -1010,10 +1206,11 @@ function ensureStageTwoTasksAndArtifacts(kernel: StudioKernel, message: StudioMe
     sortOrder: 100,
     progressPercent: 0,
     childrenSummary: emptyChildrenSummary(),
-    inputArtifacts: ["artifact_gdd_baseline_draft", "artifact_art_bible_baseline_draft"],
+    inputArtifacts: ["artifact_gdd_baseline_draft", "artifact_game_contract_draft", "artifact_art_bible_baseline_draft"],
     outputArtifacts: [
       "artifact_asset_manifest_draft",
       "artifact_scene_blueprint_draft",
+      "artifact_playtest_contract_draft",
       "artifact_gameplay_source",
       "artifact_wechat_dev_build",
       "artifact_qa_playtest_report"
@@ -1054,13 +1251,13 @@ function ensureStageTwoTasksAndArtifacts(kernel: StudioKernel, message: StudioMe
     taskLevel: "task",
     ownerAgentId: "cocos_tech_lead",
     title: "设计 Cocos 场景与模块蓝图",
-    description: "根据 GDD 定义场景层级、Prefab 边界、资源加载契约和性能预算。",
+    description: "根据 GDD 与 GameContract 定义通用 SceneBlueprint、稳定 testId、组件属性/引用、Prefab 边界、资源加载契约和性能预算。",
     status: "doing",
     priority: 95,
     sortOrder: 115,
     progressPercent: 10,
     childrenSummary: emptyChildrenSummary(),
-    inputArtifacts: ["artifact_gdd_baseline_draft"],
+    inputArtifacts: ["artifact_gdd_baseline_draft", "artifact_game_contract_draft"],
     outputArtifacts: ["artifact_scene_blueprint_draft"],
     acceptanceCriteria: ["SceneBlueprint 已通过证据验证", "模块边界和性能预算明确"],
     blockers: [],
@@ -1076,15 +1273,37 @@ function ensureStageTwoTasksAndArtifacts(kernel: StudioKernel, message: StudioMe
     taskLevel: "task",
     ownerAgentId: "gameplay_programmer",
     title: "实现 Cocos 首个可玩核心循环",
-    description: "根据 GDD 和 SceneBlueprint 实现点击防守玩法、状态机和基础 UI TypeScript 代码。",
+    description: "根据已审批 GameContract 和 SceneBlueprint 实现该项目的核心循环、状态模型、标准运行时信号和基础 UI TypeScript 代码。",
     status: "todo",
     priority: 90,
     sortOrder: 120,
     progressPercent: 50,
     childrenSummary: emptyChildrenSummary(),
-    inputArtifacts: ["artifact_gdd_baseline_draft", "artifact_scene_blueprint_draft"],
+    inputArtifacts: ["artifact_gdd_baseline_draft", "artifact_game_contract_draft", "artifact_scene_blueprint_draft"],
     outputArtifacts: ["artifact_gameplay_source"],
     acceptanceCriteria: ["玩法 TypeScript 源码已写入 Cocos assets/scripts", "核心循环状态机和 UI 逻辑明确"],
+    blockers: [],
+    createdAt: now,
+    updatedAt: now
+  });
+  ensureTask(kernel, {
+    taskId: "task_stage_2_playtest_contract",
+    projectId,
+    stageId,
+    parentTaskId: groupId,
+    roomId: kernel.getRoom("qa-room").roomId,
+    taskLevel: "task",
+    ownerAgentId: "qa_evaluator",
+    title: "定义首个可玩测试契约",
+    description: "根据已审批 GameContract 和 SceneBlueprint 定义受限声明式 PlaytestContract；测试语义不得依赖固定游戏状态名、私有字段或节点文案。",
+    status: "todo",
+    priority: 92,
+    sortOrder: 118,
+    progressPercent: 0,
+    childrenSummary: emptyChildrenSummary(),
+    inputArtifacts: ["artifact_game_contract_draft", "artifact_scene_blueprint_draft"],
+    outputArtifacts: ["artifact_playtest_contract_draft"],
+    acceptanceCriteria: ["PlaytestContract 通过严格结构校验", "所有循环和超时均有上限", "required 场景覆盖核心循环"],
     blockers: [],
     createdAt: now,
     updatedAt: now
@@ -1104,7 +1323,12 @@ function ensureStageTwoTasksAndArtifacts(kernel: StudioKernel, message: StudioMe
     sortOrder: 125,
     progressPercent: 0,
     childrenSummary: emptyChildrenSummary(),
-    inputArtifacts: ["artifact_asset_manifest_draft", "artifact_scene_blueprint_draft", "artifact_gameplay_source"],
+    inputArtifacts: [
+      "artifact_asset_manifest_draft",
+      "artifact_scene_blueprint_draft",
+      "artifact_playtest_contract_draft",
+      "artifact_gameplay_source"
+    ],
     outputArtifacts: ["artifact_wechat_dev_build"],
     acceptanceCriteria: ["Cocos MCP 构建命令成功", "微信小游戏开发构建可启动"],
     blockers: [],
@@ -1120,17 +1344,17 @@ function ensureStageTwoTasksAndArtifacts(kernel: StudioKernel, message: StudioMe
     taskLevel: "task",
     ownerAgentId: "qa_evaluator",
     title: "执行首个可玩 QA 试玩",
-    description: "运行 Cocos MiniGame Bench，生成试玩报告、截图和 Bug 列表。",
+    description: "按已审批 PlaytestContract 运行 Cocos MiniGame Bench，生成场景结果、试玩报告、截图和 Bug 列表。",
     status: "todo",
     priority: 85,
     sortOrder: 130,
     childrenSummary: emptyChildrenSummary(),
-    inputArtifacts: ["artifact_wechat_dev_build"],
+    inputArtifacts: ["artifact_wechat_dev_build", "artifact_playtest_contract_draft"],
     outputArtifacts: ["artifact_qa_playtest_report"],
     acceptanceCriteria: [
       "真实 Cocos Web 构建已在 Chrome 中启动",
-      "开始、运行、胜负终局和重新开始状态路径全部通过",
-      "终局统计不存在 N/M/下划线等占位值",
+      "PlaytestContract 中全部 required 场景和断言通过",
+      "运行时适配器与契约 id、版本和 hash 完成握手",
       "文字不溢出且活动 UI 组件不存在显著重叠",
       "控制台无运行时错误",
       "截图、控制台日志和机器可读 QA 报告均已登记证据"
@@ -1170,6 +1394,24 @@ function ensureStageTwoTasksAndArtifacts(kernel: StudioKernel, message: StudioMe
     sourceDecisionIds: [],
     metadata: {
       generatedBy: "local_agent_runtime"
+    },
+    createdAt: now,
+    updatedAt: now
+  });
+  ensureArtifact(kernel, {
+    artifactId: "artifact_playtest_contract_draft",
+    projectId,
+    type: "playtest_contract",
+    path: "agents/qa/contracts/core-loop.playtest-contract.json",
+    ownerAgentId: "qa_evaluator",
+    stageId,
+    status: "draft",
+    version: 1,
+    sourceTaskId: "task_stage_2_playtest_contract",
+    sourceDecisionIds: [],
+    metadata: {
+      generatedBy: "local_agent_runtime",
+      schemaVersion: 1
     },
     createdAt: now,
     updatedAt: now
@@ -1240,8 +1482,8 @@ function ensureStageTwoTasksAndArtifacts(kernel: StudioKernel, message: StudioMe
     agentId: "cocos_tech_lead",
     roomKind: "engineering-room",
     messageType: "progress_update",
-    relatedArtifactIds: ["artifact_scene_blueprint_draft"],
-    content: "Stage 2 Cocos 架构任务已排队；场景蓝图完成后会交接给玩法程序和 Cocos 自动化。"
+    relatedArtifactIds: ["artifact_scene_blueprint_draft", "artifact_playtest_contract_draft"],
+    content: "Stage 2 Cocos 架构任务已排队；通用场景蓝图完成后会交接给玩法程序、QA 契约设计和 Cocos 自动化。"
   });
   writeAgentMessage(kernel, {
     agentId: "cocos_automation",
@@ -1271,15 +1513,15 @@ function ensureReleaseTasksAndArtifacts(kernel: StudioKernel, message: StudioMes
     taskLevel: "task_group",
     ownerAgentId: "studio_orchestrator",
     title: "阶段 3：上线、运维和持续迭代",
-    description: "完成微信发布准备、QA 发布门禁、部署记录、回滚方案和 LiveOps backlog。",
+    description: "先完成微信发布准备、QA 发布门禁、部署计划和回滚方案；制作人批准后再执行真实部署，最后进入 LiveOps。",
     status: "doing",
     priority: 100,
     sortOrder: 200,
     progressPercent: 0,
     childrenSummary: emptyChildrenSummary(),
     inputArtifacts: ["artifact_wechat_dev_build", "artifact_qa_playtest_report"],
-    outputArtifacts: ["artifact_wechat_release_build", "artifact_release_gate_report", "artifact_deployment_report", "artifact_rollback_plan", "artifact_release_notes"],
-    acceptanceCriteria: ["发布门禁通过", "部署记录存在", "回滚方案存在", "LiveOps backlog 存在"],
+    outputArtifacts: ["artifact_wechat_release_build", "artifact_release_gate_report", "artifact_deployment_plan", "artifact_rollback_plan", "artifact_deployment_report", "artifact_release_notes"],
+    acceptanceCriteria: ["发布门禁通过", "审批前部署与回滚计划完备", "审批后真实部署记录存在", "LiveOps backlog 存在"],
     blockers: [],
     createdAt: now,
     updatedAt: now
@@ -1322,7 +1564,7 @@ function ensureReleaseTasksAndArtifacts(kernel: StudioKernel, message: StudioMes
       sortOrder: 220,
       progressPercent: 50,
       childrenSummary: emptyChildrenSummary(),
-      inputArtifacts: ["artifact_wechat_release_build"],
+      inputArtifacts: ["artifact_wechat_release_build", "artifact_playtest_contract_draft"],
       outputArtifacts: ["artifact_release_gate_report"],
       acceptanceCriteria: ["真实 Cocos 试玩全状态路径通过", "不存在 blocker/critical/major 缺陷", "发布门禁证据完整"],
       blockers: [],
@@ -1330,30 +1572,51 @@ function ensureReleaseTasksAndArtifacts(kernel: StudioKernel, message: StudioMes
       updatedAt: now
     },
     {
-      taskId: "task_stage_3_devops_deploy",
+      taskId: "task_stage_3_devops_plan",
       projectId,
       stageId,
       parentTaskId: groupId,
       roomId: kernel.getRoom("release-room").roomId,
       taskLevel: "task",
       ownerAgentId: "devops",
-      title: "准备部署记录和回滚方案",
-      description: "使用 Secret Vault 引用生成部署计划、部署记录和回滚方案。",
-      status: "todo",
+      title: "准备部署计划和回滚方案",
+      description: "在发布审批前使用 Secret Vault 引用生成可审阅的部署计划和回滚方案，不执行真实部署。",
+      status: "doing",
       priority: 85,
       sortOrder: 230,
       childrenSummary: emptyChildrenSummary(),
       inputArtifacts: ["artifact_release_gate_report"],
-      outputArtifacts: ["artifact_deployment_report", "artifact_rollback_plan"],
-      acceptanceCriteria: ["部署记录存在", "回滚方案存在"],
-      blockers: ["等待制作人发布审批"],
+      outputArtifacts: ["artifact_deployment_plan", "artifact_rollback_plan"],
+      acceptanceCriteria: ["部署步骤、健康检查和凭据引用明确", "回滚触发条件与恢复步骤明确"],
+      blockers: [],
+      createdAt: now,
+      updatedAt: now
+    },
+    {
+      taskId: "task_stage_3_devops_deploy",
+      projectId,
+      stageId: "production_deploy",
+      parentTaskId: groupId,
+      roomId: kernel.getRoom("release-room").roomId,
+      taskLevel: "task",
+      ownerAgentId: "devops",
+      title: "执行生产部署和健康检查",
+      description: "制作人批准发布后，按已验证计划执行真实部署和健康检查，并据实生成部署记录。",
+      status: "todo",
+      priority: 80,
+      sortOrder: 235,
+      childrenSummary: emptyChildrenSummary(),
+      inputArtifacts: ["artifact_wechat_release_build", "artifact_deployment_plan", "artifact_rollback_plan"],
+      outputArtifacts: ["artifact_deployment_report"],
+      acceptanceCriteria: ["真实部署成功", "健康检查通过", "部署记录包含可审计执行证据"],
+      blockers: [],
       createdAt: now,
       updatedAt: now
     },
     {
       taskId: "task_stage_3_liveops_backlog",
       projectId,
-      stageId,
+      stageId: "liveops",
       parentTaskId: groupId,
       roomId: kernel.getRoom("studio-main").roomId,
       taskLevel: "task",
@@ -1408,17 +1671,32 @@ function ensureReleaseTasksAndArtifacts(kernel: StudioKernel, message: StudioMes
       updatedAt: now
     },
     {
+      artifactId: "artifact_deployment_plan",
+      projectId,
+      type: "deployment_plan",
+      path: "agents/devops/deployment-plans/deploy-plan-001.md",
+      ownerAgentId: "devops",
+      stageId,
+      status: "draft",
+      version: 1,
+      sourceTaskId: "task_stage_3_devops_plan",
+      sourceDecisionIds: [],
+      metadata: { secretMode: "vault_reference_only", executionStatus: "not_started" },
+      createdAt: now,
+      updatedAt: now
+    },
+    {
       artifactId: "artifact_deployment_report",
       projectId,
       type: "deployment_report",
       path: "agents/devops/deployment-reports/deploy-001.md",
       ownerAgentId: "devops",
-      stageId,
+      stageId: "production_deploy",
       status: "draft",
       version: 1,
       sourceTaskId: "task_stage_3_devops_deploy",
       sourceDecisionIds: [],
-      metadata: { secretMode: "vault_reference_only" },
+      metadata: { secretMode: "vault_reference_only", deploymentStatus: "not_run" },
       createdAt: now,
       updatedAt: now
     },
@@ -1431,7 +1709,7 @@ function ensureReleaseTasksAndArtifacts(kernel: StudioKernel, message: StudioMes
       stageId,
       status: "draft",
       version: 1,
-      sourceTaskId: "task_stage_3_devops_deploy",
+      sourceTaskId: "task_stage_3_devops_plan",
       sourceDecisionIds: [],
       metadata: {},
       createdAt: now,
@@ -1443,7 +1721,7 @@ function ensureReleaseTasksAndArtifacts(kernel: StudioKernel, message: StudioMes
       type: "release_notes",
       path: "shared/release-notes/release-001.md",
       ownerAgentId: "liveops_analytics",
-      stageId,
+      stageId: "liveops",
       status: "draft",
       version: 1,
       sourceTaskId: "task_stage_3_liveops_backlog",
@@ -1551,10 +1829,11 @@ function writeAgentMessage(
   });
 }
 
-function requireVerifiedArtifacts(kernel: StudioKernel, artifactIds: string[]): void {
+function requireVerifiedArtifacts(kernel: StudioKernel, artifactIds: readonly string[]): void {
   const missing = artifactIds.filter((artifactId) => {
+    const artifact = kernel.listArtifacts().find((entry) => entry.artifactId === artifactId);
     const ledger = kernel.listArtifactLedger().find((entry) => entry.artifactId === artifactId);
-    return !ledger || ledger.status !== "verified" || !ledger.hash || !ledger.sizeBytes;
+    return !artifact?.metadata.toolExecutedAt || !ledger || ledger.status !== "verified" || !ledger.hash || !ledger.sizeBytes;
   });
   if (missing.length > 0) {
     throw new Error(`缺少已验证产物证据：${missing.join("、")}`);
@@ -1571,6 +1850,40 @@ function requirePassingPlaytest(kernel: StudioKernel, artifactId: string): void 
   if (defects.some((defect) => typeof defect === "object" && defect !== null && ["blocker", "critical", "major"].includes(String((defect as { severity?: unknown }).severity)))) {
     throw new Error(`QA 真实试玩仍有 blocker/critical/major 缺陷：${artifactId}`);
   }
+}
+
+const conservativeRuntimeGateEvidencePolicy: GateEvidencePolicy = {
+  assertGateEvidence(kernel, requirement): void {
+    requireVerifiedArtifacts(kernel, requirement.requiredArtifactIds);
+    if (requirement.qaReportArtifactId) {
+      requirePassingPlaytest(kernel, requirement.qaReportArtifactId);
+    }
+  }
+};
+
+function assertGateEvidence(
+  policy: GateEvidencePolicy,
+  kernel: StudioKernel,
+  gate: GateAction,
+  phase: GateEvidencePhase
+): void {
+  policy.assertGateEvidence(kernel, {
+    gateActionId: gate.actionId,
+    phase,
+    requiredArtifactIds: gate.requiredArtifacts,
+    ...(gate.actionId === "playable"
+      ? {
+          qaTaskId: "task_stage_2_qa_playtest",
+          qaReportArtifactId: "artifact_qa_playtest_report"
+        }
+      : {}),
+    ...(gate.actionId === "release"
+      ? {
+          qaTaskId: "task_stage_3_qa_release_gate",
+          qaReportArtifactId: "artifact_release_gate_report"
+        }
+      : {})
+  });
 }
 
 function writeEvidenceBlocker(kernel: StudioKernel, gate: GateAction, error: unknown): void {

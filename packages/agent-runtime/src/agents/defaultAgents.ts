@@ -222,7 +222,7 @@ export const defaultAgentContracts: AgentContract[] = [
       read: ["project", "decision", "artifact", "qa", "release", "producer_preference"],
       write: ["role", "qa", "artifact", "knowledge"]
     },
-    tools: ["run_playtest", "create_bug_report", "create_release_gate"],
+    tools: ["write_artifact", "run_playtest", "create_bug_report", "create_release_gate"],
     forbiddenActions: ["fix_code_directly", "approve_producer_decision", "read_secret_plaintext"],
     handoffTargets: ["gameplay_programmer", "art_director", "asset_production", "cocos_automation", "wechat_platform", "devops"],
     messageTypes: ["playtest_summary", "bug_report", "qa_failure", "release_gate", "progress_update", "blocker"],
@@ -253,9 +253,9 @@ export const defaultAgentContracts: AgentContract[] = [
   {
     agentId: "devops",
     displayName: "DevOps Agent",
-    roleScope: "Handles server deployment, redacted logs, rollback, health checks, and production readiness.",
+    roleScope: "Handles pre-release deployment planning, server deployment, redacted logs, rollback, health checks, and production readiness.",
     roomMemberships: ["release-room", "studio-main"],
-    stageLeads: ["production_deploy"],
+    stageLeads: ["release_preparation", "production_deploy"],
     modelProfile: {
       capability: "reasoning",
       costTier: "standard",
