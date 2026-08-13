@@ -1,4 +1,4 @@
-import type { AgentContract, AgentHarnessId, AgentLoopControl, AgentSessionScope } from "@game-pipeline/shared-schemas";
+import type { AgentContract, AgentHarnessId, AgentLoopControl, AgentSessionScope, Artifact, ArtifactDirectoryManifest, ArtifactInputProvenance } from "@game-pipeline/shared-schemas";
 import type { ModelProviderConfig } from "./modelSettings.js";
 
 export type AgentHarnessProgressType = "started" | "model_output" | "tool_started" | "tool_completed" | "completed" | "failed";
@@ -22,8 +22,9 @@ export interface AgentHarnessRunInput {
   model: string;
   systemPrompt: string;
   userPrompt: string;
-  allowedRoots?: string[];
+  authorization: AgentHarnessAuthorization;
   expectedPaths?: string[];
+  taskInputEvidence?: ArtifactInputProvenance[];
   requireToolProgress?: boolean;
   toolMode?: "conversation" | "task";
   sessionKey?: string;
@@ -35,6 +36,25 @@ export interface AgentHarnessRunInput {
   includePartialMessages?: boolean;
   abortSignal?: AbortSignal;
   onProgress?: (event: AgentHarnessProgressEvent) => void;
+}
+
+export interface AgentHarnessAuthorizationArtifact {
+  artifactId: Artifact["artifactId"];
+  type: Artifact["type"];
+  path: string;
+  ownerAgentId: Artifact["ownerAgentId"];
+  sourceTaskId?: Artifact["sourceTaskId"];
+}
+
+export interface AgentHarnessAuthorization {
+  mode: "conversation" | "task";
+  taskId?: string;
+  inputArtifactIds: string[];
+  outputArtifactIds: string[];
+  artifacts: AgentHarnessAuthorizationArtifact[];
+  readRoots: string[];
+  serviceReadPaths: string[];
+  serviceWritePaths: string[];
 }
 
 export interface AgentHarnessRunResult {
@@ -58,6 +78,12 @@ export interface AgentHarnessRunResult {
 export interface AgentHarnessToolOperation {
   toolName: string;
   path: string;
+  status?: "completed" | "failed";
+  bridgeOk?: boolean;
+  operationId?: string;
+  operationType?: string;
+  directoryManifest?: ArtifactDirectoryManifest;
+  error?: string;
   hash?: string;
   sizeBytes?: number;
   recordedAt?: string;

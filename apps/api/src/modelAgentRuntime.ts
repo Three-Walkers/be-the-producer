@@ -4,12 +4,13 @@ import { generateModelChat, ModelRequestError, type ModelChatInput, type ModelRe
 import { modelSettingsStore } from "./modelSettings.js";
 import { executableToolsForAgent, type ToolExecutionResult } from "./toolExecutor.js";
 import { ClaudeCliTimeoutError, ClaudeSessionResumeError, claudeCliHarness } from "./claudeCliHarness.js";
-import { allowedRootsForAgent, attachHarnessEvidenceToMessage, captureWorkspaceSnapshot, recordHarnessWorkspaceChanges } from "./harnessWorkspaceEvidence.js";
+import { attachHarnessEvidenceToMessage, captureWorkspaceSnapshot, recordHarnessWorkspaceChanges } from "./harnessWorkspaceEvidence.js";
 import { readArtifactContentForModel, resolveProjectWorkspaceRoot, syncProjectWorkspace } from "./workspaceWriter.js";
-import { expectedHarnessOutputPaths, requiredRuntimePngPaths, taskOutputsVerified } from "./taskOutputEvidence.js";
+import { captureCurrentTaskInputProvenance, expectedHarnessOutputPaths, requiredRuntimePngPaths, taskOutputsVerified } from "./taskOutputEvidence.js";
 import { sessionCoordinator } from "./sessionCoordinator.js";
 import { AgentActivityReporter } from "./agentActivity.js";
 import type { AgentHarnessProgressEvent } from "./agentHarness.js";
+import { createConversationHarnessAuthorization, createTaskHarnessAuthorization } from "./toolAuthorization.js";
 
 export interface ModelAgentRunResult {
   agentMessages: StudioMessage[];
@@ -500,8 +501,9 @@ async function runClaudeTaskSession(
     model,
     systemPrompt: buildClaudeHarnessSystemPrompt(agent),
     userPrompt: buildClaudeHarnessTaskPrompt(kernel, task, agent, input, contextPrompt),
-    allowedRoots: allowedRootsForAgent(agent),
+    authorization: createTaskHarnessAuthorization(kernel, task, agent, taskHarnessServicePaths(kernel, task, agent)),
     expectedPaths: expectedHarnessOutputPaths(kernel, task),
+    taskInputEvidence: captureCurrentTaskInputProvenance(kernel, task),
     requireToolProgress: true,
     toolMode: "task",
     sessionKey: session.sessionKey,
@@ -510,6 +512,45 @@ async function runClaudeTaskSession(
     ...(session.sessionId ? { sessionId: session.sessionId } : {}),
     ...(input.abortSignal ? { abortSignal: input.abortSignal } : {})
   });
+}
+
+function taskHarnessServicePaths(
+  kernel: StudioKernel,
+  task: Task,
+  agent: AgentContract
+): { read: string[]; write: string[] } {
+  const expected = expectedHarnessOutputPaths(kernel, task);
+  if (agent.agentId === "cocos_automation") {
+    return {
+      read: ["package.json", "settings", "assets"],
+      write: [
+        ...expected,
+        "agents/cocos-automation/validation",
+        "agents/cocos-automation/imports",
+        "agents/cocos-automation/scene-ops",
+        "agents/cocos-automation/build-ops",
+        "agents/cocos-automation/cocos-build-logs",
+        "assets/resources/btp",
+        "assets/resources/btp-art",
+        "assets/scripts/btp",
+        "assets/scenes/MainGame.scene",
+        "assets/scenes/MainGame.scene.meta"
+      ]
+    };
+  }
+  if (agent.agentId === "qa_evaluator") {
+    return {
+      read: ["package.json", "settings", "assets"],
+      write: [
+        ...expected,
+        "agents/qa/playtest-runs",
+        "shared/build-artifacts/playtest",
+        "agents/cocos-automation/build-ops",
+        "agents/cocos-automation/cocos-build-logs"
+      ]
+    };
+  }
+  return { read: [], write: expected };
 }
 
 async function runClaudeRoomSession(
@@ -533,7 +574,7 @@ async function runClaudeRoomSession(
     model,
     systemPrompt: buildClaudeRoomSystemPrompt(agent),
     userPrompt: buildRoomUserPrompt(kernel, producerMessage, routeReasons, contextPrompt),
-    allowedRoots: allowedRootsForAgent(agent),
+    authorization: createConversationHarnessAuthorization(kernel, agent),
     expectedPaths: [],
     requireToolProgress: false,
     toolMode: "conversation",
@@ -810,18 +851,7 @@ function buildTaskLoopPrompt(
 }
 
 function buildClaudeHarnessSystemPrompt(agent: AgentContract): string {
-  const roleSpecificInstructions = agent.agentId === "asset_production"
-    ? [
-        "SVG 只能作为可编辑源资产，不能作为 Cocos 运行时交付物。每个登记到任务的 SVG 都必须调用 mcp__btp_workspace__render_svg_to_png 生成同名 PNG，并在 asset manifest 中把 PNG 标记为 runtimePath。",
-        "只有全部 SVG 都存在对应 PNG、PNG 已通过工具证据登记且 manifest 指向 PNG 时，才可以请求 ready_for_review。"
-      ]
-    : agent.agentId === "qa_evaluator"
-      ? [
-          "你不能通过阅读代码或手写测试报告宣布可玩性通过。每次首个可玩或发布门禁任务必须调用 mcp__btp_workspace__run_playtest，让服务端真实构建并驱动游戏。",
-          "run_playtest 的 fail/blocked 是有效测试结果，不要反复运行同一个未修复构建。必须报告 handoff，把结构化缺陷交给对应程序、Cocos 或美术角色；只有 verdict=pass 才能请求 ready_for_review。",
-          "你禁止直接修改游戏代码和美术资产。你的职责是执行、取证、分级、复测和守住门禁。"
-        ]
-      : [];
+  const roleSpecificInstructions = roleSpecificContractInstructions(agent.agentId);
   return [
     `你是 Be The Producer 游戏工作室里的 ${agent.displayName}。`,
     `职责：${agent.roleScope}`,
@@ -892,9 +922,11 @@ function buildClaudeHarnessTaskPrompt(
     "已验证的上游文件：",
     verifiedInputs || "无",
     "",
-    agent.agentId === "qa_evaluator"
-      ? "请现在调用 run_playtest 执行真实试玩。不要编辑游戏产物；失败时依据工具返回的结构化缺陷 handoff 给责任角色，成功时才请求评审。"
-      : `请现在持续完成该任务，直接使用工具检查和修改项目。优先写入 ${agent.workspace} 或上述登记输出路径。`,
+    task.outputArtifacts.some((artifactId) => kernel.listArtifacts().find((artifact) => artifact.artifactId === artifactId)?.type === "playtest_contract")
+      ? "这是测试设计任务：请写入登记的 PlaytestContract JSON 并让严格校验器验证；此任务不运行游戏，也不能降低 GameContract 中的成功标准。"
+      : agent.agentId === "qa_evaluator"
+        ? "请现在调用 run_playtest 执行真实试玩。不要编辑游戏产物；失败时依据工具返回的结构化缺陷 handoff 给责任角色，成功时才请求评审。"
+        : `请现在持续完成该任务，直接使用工具检查和修改项目。优先写入 ${agent.workspace} 或上述登记输出路径。`,
     "不要输出 JSON 工具协议；直接调用 btp_workspace MCP 工具。没有实际文件变化时，不得说已完成。",
     "本轮结束前必须调用 report_task_status。能继续推进就填 continue；只有确实需要制作人决定时填 waiting_for_producer；需要其他角色接棒时填 handoff；真实依赖缺失时填 blocked。ready_for_review 仍必须由 Artifact Ledger 证据通过后才生效。",
     stageGateInstruction(kernel.project.currentStage)
@@ -935,6 +967,7 @@ function buildSystemPrompt(agent: AgentContract): string {
     "如果需要产出文件，不要只说“等待服务端工具执行”。必须在回复末尾附加一个 JSON 工具请求代码块，服务端只会执行这个结构化请求。",
     `你当前可执行的产物工具：${executableTools.join("、") || "无"}。不得虚构或调用未列出的工具。`,
     toolExecutionGuidance(executableTools),
+    ...roleSpecificContractInstructions(agent.agentId),
     "工具请求格式：```json\n{\"toolRequests\":[{\"tool\":\"write_artifact\",\"path\":\"docs/design/example.md\",\"artifactType\":\"gdd\",\"content\":\"# 文档标题\\n正文\"}]}\n```",
     "写入型工具的 path 必须是项目根目录内的相对路径，content 必须是完整可写入内容。Cocos Bridge 工具使用各自声明的参数，不需要伪造 content。",
     "你可以先用自然语言说明计划，然后附加工具请求；工具请求成功后，系统会自动回填服务端执行结果和证据。",
@@ -944,6 +977,39 @@ function buildSystemPrompt(agent: AgentContract): string {
     "如果制作人 @ 你，要直接回答被问到的问题；如果问题超出职责，说明需要哪个角色接手。",
     "回复使用中文，保持具体、简洁、可执行。"
   ].join("\n");
+}
+
+function roleSpecificContractInstructions(agentId: AgentId): string[] {
+  switch (agentId) {
+    case "game_designer":
+      return [
+        "GameContract 是 GDD 的机器可执行边界：必须使用 schemaVersion=1.0.0、kind=game_contract，并完整定义 identity、genre、coreLoop、stateModel、inputModel、runtimeSignals；不得把某个示例玩法当成平台默认。",
+        "GameContract 中所有 stateId、actionId、signalId 和引用必须使用稳定小写标识符并相互闭合；JSON 契约只允许整份替换，服务端会严格拒绝未知字段和悬空引用。"
+      ];
+    case "cocos_tech_lead":
+      return [
+        "SceneBlueprint 必须使用 schemaVersion=1.0.0、kind=scene_blueprint，并引用已审批 GameContract 的 contractId/revision；节点使用稳定 nodeId/testId 语义，不得依赖节点显示名猜测玩法。",
+        "组件、属性和引用必须由蓝图显式声明；不得要求 Cocos Bridge 按 GameController、篮子、毛线球、拼图等业务名称做特判。"
+      ];
+    case "gameplay_programmer":
+      return [
+        "实现必须遵循 GameContract 的状态、动作和公开 runtime signal，不得引入未登记的核心状态或改变胜负语义。",
+        "运行时适配器只能上报 state、metrics、ui 和 recentEvents 等事实，不能上报 verdict/pass；QA 结论只能由 PlaytestContract 与 Harness 计算。"
+      ];
+    case "asset_production":
+      return [
+        "SVG 只能作为可编辑源资产，不能作为 Cocos 运行时交付物。每个登记到任务的 SVG 都必须调用 mcp__btp_workspace__render_svg_to_png 生成同名 PNG，并在 asset manifest 中把 PNG 标记为 runtimePath。",
+        "只有全部 SVG 都存在对应 PNG、PNG 已通过工具证据登记且 manifest 指向 PNG 时，才可以请求 ready_for_review。"
+      ];
+    case "qa_evaluator":
+      return [
+        "测试设计任务必须先写入严格的 PlaytestContract：schemaVersion=1.0.0、kind=playtest_contract，引用已审批 GameContract，并以声明式、有超时上限的 scenarios/steps/assertions/qualityGates 定义通过标准。",
+        "执行任务不能通过阅读代码或手写报告宣布通过；必须调用 run_playtest。没有终局或没有重开需求的游戏只执行契约声明的场景，不得套用固定 IDLE/GAME_OVER/WIN 状态链。",
+        "run_playtest 的 fail/blocked 是有效结果；必须把结构化缺陷 handoff 给责任角色。你禁止直接修改游戏代码和美术资产。"
+      ];
+    default:
+      return [];
+  }
 }
 
 function toolExecutionGuidance(tools: ReturnType<typeof executableToolsForAgent>): string {
@@ -961,7 +1027,7 @@ function toolExecutionGuidance(tools: ReturnType<typeof executableToolsForAgent>
     guidance.push("Cocos 自动化必须按 cocos_validate_project → cocos_import_assets → cocos_apply_blueprint → cocos_build 的顺序调用。前一步失败时立即报告真实阻塞，不得继续或声称完成。cocos_build 只有真实 Creator 进程成功且产生本轮新构建文件时才成立。");
   }
   if (tools.includes("run_playtest")) {
-    guidance.push("run_playtest 不需要 path/content。它会真实构建 Cocos Web 包并用 Chrome 覆盖开始、运行、终局、动态数字、UI 重叠、重开和控制台错误；verdict=fail/blocked 时必须 handoff，禁止重复测试未修改的构建或手写通过报告。");
+    guidance.push("run_playtest 不需要 path/content。它会读取当前 QA 任务输入中的已验证 PlaytestContract，真实构建 Cocos Web 包并执行契约场景、通用 UI 和控制台检查；verdict=fail/blocked 时必须 handoff，禁止重复测试未修改的构建或手写通过报告。");
   }
   return guidance.join("\n") || "所有工具都由服务端执行并登记证据；没有成功结果就不能宣称产物成立。";
 }

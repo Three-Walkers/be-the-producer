@@ -80,6 +80,9 @@ export class ClaudeCliHarness implements AgentHarness {
 
   async run(input: AgentHarnessRunInput): Promise<AgentHarnessRunResult> {
     assertClaudeCompatibleProvider(input);
+    if (input.authorization.mode !== (input.toolMode ?? "task")) {
+      throw new Error(`Harness authorization mode=${input.authorization.mode} 与 toolMode=${input.toolMode ?? "task"} 不一致。`);
+    }
     const invocationId = `inv_${randomUUID()}`;
     const configDir = join(input.projectRoot, ".be-the-producer", "harness", input.agent.agentId);
     const controlPath = join(configDir, `control-${invocationId}.json`);
@@ -257,12 +260,10 @@ function assertClaudeCompatibleProvider(input: AgentHarnessRunInput): void {
 
 function claudeToolsForAgent(agent: AgentContract, mode: "conversation" | "task"): string[] {
   if (mode === "conversation") {
-    return ["Read", "Glob", "Grep"];
+    return ["mcp__btp_workspace__read_file", "mcp__btp_workspace__list_files"];
   }
   const tools = [
-    "Read",
-    "Glob",
-    "Grep",
+    "mcp__btp_workspace__read_file",
     "mcp__btp_workspace__write_artifact",
     "mcp__btp_workspace__append_document",
     "mcp__btp_workspace__list_files",
@@ -270,9 +271,6 @@ function claudeToolsForAgent(agent: AgentContract, mode: "conversation" | "task"
   ];
   if (["art_director", "asset_production"].includes(agent.agentId)) {
     tools.push("mcp__btp_workspace__render_svg_to_png");
-  }
-  if (["coding", "evaluation"].includes(agent.modelProfile.capability) || ["devops", "wechat_platform", "cocos_automation"].includes(agent.agentId)) {
-    tools.push("mcp__btp_workspace__run_project_check");
   }
   if (agent.agentId === "qa_evaluator") {
     tools.push("mcp__btp_workspace__run_playtest");
@@ -299,20 +297,18 @@ function mcpConfig(input: AgentHarnessRunInput, controlPath: string, operationLo
         env: {
           BTP_PROJECT_ROOT: input.projectRoot,
           BTP_AGENT_ID: input.agent.agentId,
+          BTP_TOOL_MODE: input.toolMode ?? "task",
+          BTP_AUTHORIZATION: JSON.stringify(input.authorization),
           BTP_SESSION_KEY: input.sessionKey ?? "",
           BTP_SESSION_SCOPE: input.sessionScope ?? "room",
-          BTP_ALLOWED_ROOTS: JSON.stringify(input.allowedRoots ?? [input.agent.workspace.replace(/\/+$/, "")]),
-          BTP_EXPECTED_PATHS: JSON.stringify(input.expectedPaths ?? []),
+          BTP_TASK_INPUT_EVIDENCE: JSON.stringify(input.taskInputEvidence ?? []),
           BTP_CONTROL_PATH: controlPath,
           BTP_OPERATION_LOG_PATH: operationLogPath,
           BTP_COCOS_EXECUTABLE: cocosConfig.executablePath,
           BTP_COCOS_VERSION: cocosConfig.version,
           BTP_COCOS_PLATFORM: cocosConfig.platform,
           BTP_COCOS_BUILD_CONFIG: cocosConfig.buildConfigPath,
-          BTP_COCOS_TIMEOUT_MS: String(cocosConfig.timeoutMs),
-          BTP_ALLOW_PROJECT_CHECKS: String(
-            ["coding", "evaluation"].includes(input.agent.modelProfile.capability) || ["devops", "wechat_platform", "cocos_automation"].includes(input.agent.agentId)
-          )
+          BTP_COCOS_TIMEOUT_MS: String(cocosConfig.timeoutMs)
         }
       }
     }
@@ -348,6 +344,12 @@ function parseToolOperations(operationLogPath: string): AgentHarnessToolOperatio
         return [{
           toolName: parsed.toolName,
           path: parsed.path.trim(),
+          ...(parsed.status === "completed" || parsed.status === "failed" ? { status: parsed.status } : {}),
+          ...(typeof parsed.bridgeOk === "boolean" ? { bridgeOk: parsed.bridgeOk } : {}),
+          ...(typeof parsed.operationId === "string" ? { operationId: parsed.operationId } : {}),
+          ...(typeof parsed.operationType === "string" ? { operationType: parsed.operationType } : {}),
+          ...(isDirectoryManifest(parsed.directoryManifest) ? { directoryManifest: parsed.directoryManifest } : {}),
+          ...(typeof parsed.error === "string" ? { error: parsed.error } : {}),
           ...(typeof parsed.hash === "string" ? { hash: parsed.hash } : {}),
           ...(typeof parsed.sizeBytes === "number" ? { sizeBytes: parsed.sizeBytes } : {}),
           ...(typeof parsed.recordedAt === "string" ? { recordedAt: parsed.recordedAt } : {})
@@ -356,6 +358,14 @@ function parseToolOperations(operationLogPath: string): AgentHarnessToolOperatio
         return [];
       }
     });
+}
+
+function isDirectoryManifest(value: unknown): value is import("@game-pipeline/shared-schemas").ArtifactDirectoryManifest {
+  return typeof value === "object" && value !== null && !Array.isArray(value) &&
+    (value as { schemaVersion?: unknown }).schemaVersion === 1 &&
+    typeof (value as { rootPath?: unknown }).rootPath === "string" &&
+    typeof (value as { digest?: unknown }).digest === "string" &&
+    Array.isArray((value as { files?: unknown }).files);
 }
 
 function readLoopControl(controlPath: string): AgentLoopControl | undefined {
@@ -395,7 +405,18 @@ function readLoopControl(controlPath: string): AgentLoopControl | undefined {
 function claudeEnvironment(input: AgentHarnessRunInput, configDir: string): NodeJS.ProcessEnv {
   const key = input.provider.apiKey ?? "";
   return {
-    ...process.env,
+    PATH: process.env.PATH,
+    HOME: process.env.HOME,
+    TMPDIR: process.env.TMPDIR,
+    USER: process.env.USER,
+    LOGNAME: process.env.LOGNAME,
+    SHELL: process.env.SHELL,
+    LANG: process.env.LANG ?? "C.UTF-8",
+    LC_ALL: process.env.LC_ALL,
+    TERM: process.env.TERM,
+    NODE_EXTRA_CA_CERTS: process.env.NODE_EXTRA_CA_CERTS,
+    SSL_CERT_FILE: process.env.SSL_CERT_FILE,
+    SSL_CERT_DIR: process.env.SSL_CERT_DIR,
     ANTHROPIC_API_KEY: key,
     ANTHROPIC_AUTH_TOKEN: key,
     ANTHROPIC_BASE_URL: input.provider.baseUrl.replace(/\/+$/, ""),
@@ -706,7 +727,14 @@ function hasRecordedProgress(path: string | undefined): boolean {
 }
 
 function expectedOutputsExist(progress: NonNullable<ProcessOptions["progress"]>): boolean {
-  return progress.expectedPaths.length > 0 && progress.expectedPaths.every((path) => existsSync(join(progress.projectRoot, path)));
+  if (progress.expectedPaths.length === 0) return false;
+  const operations = parseToolOperations(progress.operationLogPath);
+  return progress.expectedPaths.every((path) =>
+    operations.some((operation) =>
+      operation.status !== "failed" && operation.bridgeOk !== false &&
+      (operation.path === path || operation.path.startsWith(`${path.replace(/\/+$/, "")}/`))
+    )
+  );
 }
 
 function compactProcessError(value: string): string {

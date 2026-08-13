@@ -1,13 +1,20 @@
 import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { dirname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
-import { spawnSync } from "node:child_process";
 import { rasterizeSvgFile } from "./svgRasterizer.js";
 import { CocosEngineBridge, type CocosBridgeResult } from "./cocosEngineBridge.js";
 import { cocosEngineSettingsStore } from "./cocosEngineSettings.js";
 import { CocosPlaytestHarness } from "./cocosPlaytestHarness.js";
 import { assertQaEvidenceWriteAllowed } from "./qaEvidenceProtection.js";
+import {
+  assertContractPathContent,
+  assertContractRevisionAdvance,
+  contractArtifactTypeForPath
+} from "./contractArtifacts.js";
+import type { ArtifactInputProvenance } from "@game-pipeline/shared-schemas";
+import type { AgentHarnessAuthorization, AgentHarnessAuthorizationArtifact } from "./agentHarness.js";
+import { normalizeRelativePathWithinRoot, resolvePathWithinRoot } from "./pathSafety.js";
 
 interface JsonRpcRequest {
   jsonrpc?: string;
@@ -18,8 +25,10 @@ interface JsonRpcRequest {
 
 const projectRoot = resolve(requiredEnvironment("BTP_PROJECT_ROOT"));
 const agentId = requiredEnvironment("BTP_AGENT_ID");
-const allowedRoots = parseStringArray(process.env.BTP_ALLOWED_ROOTS);
-const expectedPaths = parseStringArray(process.env.BTP_EXPECTED_PATHS);
+const toolMode = parseToolMode(requiredEnvironment("BTP_TOOL_MODE"));
+const authorization = parseAuthorization(requiredEnvironment("BTP_AUTHORIZATION"));
+assertAuthorizationEnvelope();
+const taskInputEvidence = parseTaskInputEvidence(process.env.BTP_TASK_INPUT_EVIDENCE);
 const controlPath = process.env.BTP_CONTROL_PATH?.trim();
 const operationLogPath = process.env.BTP_OPERATION_LOG_PATH?.trim();
 const reader = createInterface({ input: process.stdin, terminal: false });
@@ -74,11 +83,45 @@ async function handleRequest(request: JsonRpcRequest): Promise<void> {
 }
 
 function toolDefinitions(): Array<Record<string, unknown>> {
+  const readTools: Array<Record<string, unknown>> = [
+    {
+      name: "read_file",
+      title: "Read authorized project file",
+      description: "Read one UTF-8 project file allowed by the current task-bound authorization.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Authorized project-relative file path" },
+          maxBytes: { type: "integer", minimum: 1, maximum: 1048576 }
+        },
+        required: ["path"],
+        additionalProperties: false
+      }
+    },
+    {
+      name: "list_files",
+      title: "List authorized project files",
+      description: "List files below a task-authorized input/output or minimal role read root.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Authorized project-relative directory" },
+          limit: { type: "integer", minimum: 1, maximum: 300 }
+        },
+        required: ["path"],
+        additionalProperties: false
+      }
+    }
+  ];
+  if (toolMode === "conversation") {
+    return readTools;
+  }
   const tools: Array<Record<string, unknown>> = [
+    ...readTools,
     {
       name: "write_artifact",
       title: "Write project artifact",
-      description: "Create or replace a text file inside this role's authorized project paths. Use this instead of merely describing a file.",
+      description: "Create or replace exactly one current-task output artifact path.",
       inputSchema: {
         type: "object",
         properties: {
@@ -100,19 +143,6 @@ function toolDefinitions(): Array<Record<string, unknown>> {
           content: { type: "string" }
         },
         required: ["path", "content"],
-        additionalProperties: false
-      }
-    },
-    {
-      name: "list_files",
-      title: "List project files",
-      description: "List files below an authorized project-relative directory so the Agent can inspect actual workspace state.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          path: { type: "string", description: "Authorized project-relative directory; defaults to the role workspace" },
-          limit: { type: "integer", minimum: 1, maximum: 300 }
-        },
         additionalProperties: false
       }
     },
@@ -152,21 +182,6 @@ function toolDefinitions(): Array<Record<string, unknown>> {
           width: { type: "integer", minimum: 1, maximum: 4096, description: "Optional output width; aspect ratio is preserved" }
         },
         required: ["sourcePath", "path"],
-        additionalProperties: false
-      }
-    });
-  }
-  if (process.env.BTP_ALLOW_PROJECT_CHECKS === "true") {
-    tools.push({
-      name: "run_project_check",
-      title: "Run controlled project check",
-      description: "Run one controlled validation command in the Cocos project without arbitrary shell access.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          check: { type: "string", enum: ["typescript", "build", "tests", "git-diff"] }
-        },
-        required: ["check"],
         additionalProperties: false
       }
     });
@@ -239,15 +254,44 @@ function toolDefinitions(): Array<Record<string, unknown>> {
 async function callTool(params: Record<string, unknown> | undefined): Promise<Record<string, unknown>> {
   const name = typeof params?.name === "string" ? params.name : "";
   const args = isRecord(params?.arguments) ? params.arguments : {};
+  if (!toolDefinitions().some((tool) => tool.name === name)) {
+    throw new Error(`当前 ${toolMode} 会话未授权 MCP 工具：${name || "unknown"}`);
+  }
+  if (name === "read_file") {
+    const target = resolveAuthorizedTarget(requiredString(args.path, "path"), false, "read");
+    if (!existsSync(target.absolutePath) || !statSync(target.absolutePath).isFile()) {
+      throw new Error(`待读取文件不存在：${target.relativePath}`);
+    }
+    const maxBytes = typeof args.maxBytes === "number"
+      ? Math.max(1, Math.min(1_048_576, Math.floor(args.maxBytes)))
+      : 256 * 1024;
+    const body = readFileSync(target.absolutePath);
+    if (body.byteLength > maxBytes) {
+      throw new Error(`文件 ${target.relativePath} 为 ${body.byteLength} bytes，超过本次读取上限 ${maxBytes} bytes。`);
+    }
+    return {
+      content: [{ type: "text", text: body.toString("utf8") }],
+      structuredContent: { path: target.relativePath, sizeBytes: body.byteLength }
+    };
+  }
   if (name === "write_artifact" || name === "append_document") {
     const path = requiredString(args.path, "path");
     const content = requiredString(args.content, "content", true);
     if (Buffer.byteLength(content, "utf8") > 5 * 1024 * 1024) {
       throw new Error("单次 MCP 文本写入不能超过 5 MB。");
     }
-    const target = resolveAuthorizedTarget(path, false);
+    let target = resolveAuthorizedTarget(path, false, "artifact_write");
     assertQaEvidenceWriteAllowed(target.relativePath, name);
+    assertContractPathContent(target.relativePath, content, name === "append_document" ? "append" : "write");
+    const contractType = contractArtifactTypeForPath(target.relativePath);
+    if (contractType && name === "write_artifact") {
+      const previousContent = existsSync(target.absolutePath) && statSync(target.absolutePath).isFile()
+        ? readFileSync(target.absolutePath, "utf8")
+        : undefined;
+      assertContractRevisionAdvance(contractType, previousContent, content);
+    }
     mkdirSync(dirname(target.absolutePath), { recursive: true });
+    target = resolveAuthorizedTarget(path, false, "artifact_write");
     if (name === "append_document") {
       const needsSeparator = existsSync(target.absolutePath) && statSync(target.absolutePath).size > 0 && !readFileSync(target.absolutePath, "utf8").endsWith("\n");
       appendFileSync(target.absolutePath, `${needsSeparator ? "\n" : ""}${content}${content.endsWith("\n") ? "" : "\n"}`, "utf8");
@@ -256,15 +300,15 @@ async function callTool(params: Record<string, unknown> | undefined): Promise<Re
     }
     const stats = statSync(target.absolutePath);
     const hash = createHash("sha256").update(readFileSync(target.absolutePath)).digest("hex");
-    recordOperation(name, target.relativePath, hash, stats.size);
+    recordOperation({ toolName: name, path: target.relativePath, hash, sizeBytes: stats.size, status: "completed" });
     return {
       content: [{ type: "text", text: `写入成功：${target.relativePath}；hash=${hash}；size=${stats.size} bytes` }],
       structuredContent: { path: target.relativePath, hash, sizeBytes: stats.size }
     };
   }
   if (name === "list_files") {
-    const requestedPath = typeof args.path === "string" && args.path.trim() ? args.path : allowedRoots[0] ?? "";
-    const target = resolveAuthorizedTarget(requestedPath, true);
+    const requestedPath = requiredString(args.path, "path");
+    const target = resolveAuthorizedTarget(requestedPath, true, "read");
     const limit = typeof args.limit === "number" ? Math.max(1, Math.min(300, Math.floor(args.limit))) : 120;
     const files = listFiles(target.absolutePath, limit).map((absolutePath) => relative(projectRoot, absolutePath).split(sep).join("/"));
     return {
@@ -273,11 +317,14 @@ async function callTool(params: Record<string, unknown> | undefined): Promise<Re
     };
   }
   if (name === "render_svg_to_png" && ["art_director", "asset_production"].includes(agentId)) {
-    const source = resolveAuthorizedTarget(requiredString(args.sourcePath, "sourcePath"), false);
-    const target = resolveAuthorizedTarget(requiredString(args.path, "path"), false);
+    const source = resolveAuthorizedTarget(requiredString(args.sourcePath, "sourcePath"), false, "read");
+    const targetPath = requiredString(args.path, "path");
+    let target = resolveAuthorizedTarget(targetPath, false, "service_write");
+    mkdirSync(dirname(target.absolutePath), { recursive: true });
+    target = resolveAuthorizedTarget(targetPath, false, "service_write");
     const width = typeof args.width === "number" ? args.width : undefined;
     const rendered = rasterizeSvgFile(source.absolutePath, target.absolutePath, width);
-    recordOperation(name, target.relativePath, rendered.hash, rendered.sizeBytes);
+    recordOperation({ toolName: name, path: target.relativePath, hash: rendered.hash, sizeBytes: rendered.sizeBytes, status: "completed" });
     return {
       content: [{
         type: "text",
@@ -313,34 +360,35 @@ async function callTool(params: Record<string, unknown> | undefined): Promise<Re
       structuredContent: { status, reason, handoffAgentIds }
     };
   }
-  if (name === "run_project_check" && process.env.BTP_ALLOW_PROJECT_CHECKS === "true") {
-    const check = requiredString(args.check, "check");
-    const command = projectCheckCommand(check);
-    const result = spawnSync(command.executable, command.args, {
-      cwd: projectRoot,
-      encoding: "utf8",
-      timeout: 120_000,
-      maxBuffer: 2 * 1024 * 1024,
-      env: safeCommandEnvironment()
-    });
-    const output = `${result.stdout ?? ""}\n${result.stderr ?? ""}`.trim().slice(-8_000);
-    const ok = result.status === 0;
-    return {
-      content: [{ type: "text", text: `${check} ${ok ? "通过" : "失败"}（exit=${result.status ?? "null"}）${output ? `\n${output}` : ""}` }],
-      structuredContent: { check, ok, exitCode: result.status, output },
-      isError: !ok
-    };
-  }
   if (name === "run_playtest" && agentId === "qa_evaluator") {
+    const reportArtifact = taskOutputArtifacts().find((artifact) => artifact.type === "qa_report");
+    const playtestContract = taskInputArtifacts().find((artifact) => artifact.type === "playtest_contract");
+    if (!reportArtifact) {
+      throw new Error(`任务 ${authorization.taskId ?? "missing"} 没有登记 qa_report 输出，run_playtest 已拒绝。`);
+    }
+    assertPathAuthorized(reportArtifact.path, "artifact_write");
+    for (const path of ["agents/qa/playtest-runs", "shared/build-artifacts/playtest", "agents/cocos-automation/build-ops", "agents/cocos-automation/cocos-build-logs"]) {
+      assertPathAuthorized(path, "service_write");
+    }
     const maxDurationSec = typeof args.maxDurationSec === "number" ? Math.max(10, Math.min(120, Math.floor(args.maxDurationSec))) : undefined;
     const result = await new CocosPlaytestHarness(projectRoot, cocosEngineSettingsStore.getResolvedConfig()).run({
       ...(maxDurationSec ? { maxDurationSec } : {}),
-      ...(expectedPaths.find((path) => path.startsWith("agents/qa/") && path.endsWith(".md"))
-        ? { reportPath: expectedPaths.find((path) => path.startsWith("agents/qa/") && path.endsWith(".md")) as string }
-        : {})
+      taskInputEvidence,
+      ...(playtestContract ? { playtestContractPath: playtestContract.path } : {}),
+      reportPath: reportArtifact.path
     });
     for (const item of result.evidence) {
-      recordOperation(name, item.path, item.hash, item.sizeBytes);
+      assertServiceEvidenceAuthorized(item.path, result.reportPath);
+      recordOperation({
+        toolName: name,
+        path: item.path,
+        hash: item.hash,
+        sizeBytes: item.sizeBytes,
+        status: result.ok ? "completed" : "failed",
+        operationId: result.operationId,
+        operationType: "playtest",
+        ...(result.ok ? {} : { error: result.summary })
+      });
     }
     return {
       content: [{
@@ -359,6 +407,7 @@ async function callTool(params: Record<string, unknown> | undefined): Promise<Re
     };
   }
   if (agentId === "cocos_automation" && name.startsWith("cocos_")) {
+    assertCocosRequestAuthorized(name, args);
     const bridge = new CocosEngineBridge(projectRoot, cocosEngineSettingsStore.getResolvedConfig());
     let result: CocosBridgeResult;
     if (name === "cocos_validate_project") {
@@ -383,7 +432,21 @@ async function callTool(params: Record<string, unknown> | undefined): Promise<Re
       throw new Error(`不支持的 Cocos Bridge 工具：${name}`);
     }
     for (const item of result.evidence) {
-      recordOperation(name, item.path, item.hash, item.sizeBytes);
+      assertServiceEvidenceAuthorized(item.path, result.reportPath);
+      recordOperation({
+        toolName: name,
+        path: item.path,
+        hash: item.hash,
+        sizeBytes: item.sizeBytes,
+        status: result.ok ? "completed" : "failed",
+        bridgeOk: result.ok,
+        operationId: result.operationId,
+        operationType: result.operationType,
+        ...(item.path === result.reportPath && isDirectoryManifest(result.details.outputManifest)
+          ? { directoryManifest: result.details.outputManifest }
+          : {}),
+        ...(result.error ? { error: result.error } : {})
+      });
     }
     return {
       content: [{ type: "text", text: `${result.summary}${result.error ? `\n错误：${result.error}` : ""}\n报告：${result.reportPath}` }],
@@ -394,63 +457,249 @@ async function callTool(params: Record<string, unknown> | undefined): Promise<Re
   throw new Error(`不支持的 BTP MCP 工具：${name || "unknown"}`);
 }
 
-function recordOperation(toolName: string, path: string, hash: string, sizeBytes: number): void {
+function parseTaskInputEvidence(raw: string | undefined): ArtifactInputProvenance[] {
+  if (!raw?.trim()) return [];
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((entry): entry is ArtifactInputProvenance =>
+      typeof entry === "object" && entry !== null && !Array.isArray(entry) &&
+      typeof (entry as ArtifactInputProvenance).artifactId === "string" &&
+      typeof (entry as ArtifactInputProvenance).version === "number" &&
+      typeof (entry as ArtifactInputProvenance).path === "string" &&
+      typeof (entry as ArtifactInputProvenance).evidencePath === "string" &&
+      typeof (entry as ArtifactInputProvenance).hash === "string" &&
+      typeof (entry as ArtifactInputProvenance).sizeBytes === "number"
+    );
+  } catch {
+    return [];
+  }
+}
+
+function isDirectoryManifest(value: unknown): value is import("@game-pipeline/shared-schemas").ArtifactDirectoryManifest {
+  return isRecord(value) && value.schemaVersion === 1 && typeof value.rootPath === "string" &&
+    typeof value.digest === "string" && Array.isArray(value.files) && value.files.every((entry) =>
+      isRecord(entry) && typeof entry.path === "string" && typeof entry.hash === "string" && typeof entry.sizeBytes === "number"
+    );
+}
+
+function parseToolMode(value: string): "conversation" | "task" {
+  if (value !== "conversation" && value !== "task") {
+    throw new Error(`BTP_TOOL_MODE must be conversation or task, received ${value}`);
+  }
+  return value;
+}
+
+function parseAuthorization(value: string): AgentHarnessAuthorization {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    throw new Error("BTP_AUTHORIZATION must be valid JSON.");
+  }
+  if (!isRecord(parsed) || !["conversation", "task"].includes(String(parsed.mode)) ||
+    !Array.isArray(parsed.inputArtifactIds) || !Array.isArray(parsed.outputArtifactIds) ||
+    !Array.isArray(parsed.artifacts) || !Array.isArray(parsed.readRoots) ||
+    !Array.isArray(parsed.serviceReadPaths) || !Array.isArray(parsed.serviceWritePaths)) {
+    throw new Error("BTP_AUTHORIZATION has an invalid envelope.");
+  }
+  const artifacts = parsed.artifacts.map((candidate, index): AgentHarnessAuthorizationArtifact => {
+    if (!isRecord(candidate) || typeof candidate.artifactId !== "string" || typeof candidate.type !== "string" ||
+      typeof candidate.path !== "string" || typeof candidate.ownerAgentId !== "string" ||
+      (candidate.sourceTaskId !== undefined && typeof candidate.sourceTaskId !== "string")) {
+      throw new Error(`BTP_AUTHORIZATION artifact[${index}] has invalid identity fields.`);
+    }
+    return {
+      artifactId: requiredString(candidate.artifactId, `artifact[${index}].artifactId`),
+      type: candidate.type as AgentHarnessAuthorizationArtifact["type"],
+      path: normalizeAuthorizationPath(candidate.path),
+      ownerAgentId: requiredString(candidate.ownerAgentId, `artifact[${index}].ownerAgentId`),
+      ...(candidate.sourceTaskId ? { sourceTaskId: candidate.sourceTaskId } : {})
+    };
+  });
+  const artifactIds = artifacts.map((artifact) => artifact.artifactId);
+  const artifactPaths = artifacts.map((artifact) => artifact.path);
+  if (new Set(artifactIds).size !== artifactIds.length || new Set(artifactPaths).size !== artifactPaths.length) {
+    throw new Error("BTP_AUTHORIZATION artifact ids and paths must be unique.");
+  }
+  return {
+    mode: parsed.mode as AgentHarnessAuthorization["mode"],
+    ...(typeof parsed.taskId === "string" && parsed.taskId.trim() ? { taskId: parsed.taskId.trim() } : {}),
+    inputArtifactIds: parseAuthorizationStringList(parsed.inputArtifactIds, "inputArtifactIds", false),
+    outputArtifactIds: parseAuthorizationStringList(parsed.outputArtifactIds, "outputArtifactIds", false),
+    artifacts,
+    readRoots: parseAuthorizationStringList(parsed.readRoots, "readRoots", true),
+    serviceReadPaths: parseAuthorizationStringList(parsed.serviceReadPaths, "serviceReadPaths", true),
+    serviceWritePaths: parseAuthorizationStringList(parsed.serviceWritePaths, "serviceWritePaths", true)
+  };
+}
+
+function parseAuthorizationStringList(value: unknown[], label: string, paths: boolean): string[] {
+  const values = value.map((item, index) => {
+    if (typeof item !== "string" || !item.trim()) throw new Error(`BTP_AUTHORIZATION ${label}[${index}] must be a non-empty string.`);
+    return paths ? normalizeAuthorizationPath(item) : item.trim();
+  });
+  return [...new Set(values)];
+}
+
+function normalizeAuthorizationPath(path: string): string {
+  const normalized = normalizeRelativePathWithinRoot(path.replaceAll("\\", "/"), { label: "Harness authorization path" })
+    .split(sep)
+    .join("/");
+  assertNotInternalPath(normalized);
+  return normalized;
+}
+
+function assertAuthorizationEnvelope(): void {
+  if (authorization.mode !== toolMode) throw new Error("Harness tool mode and authorization mode differ.");
+  if (toolMode === "task" && !authorization.taskId) throw new Error("Task harness authorization requires taskId.");
+  if (toolMode === "conversation" && (authorization.outputArtifactIds.length > 0 || authorization.serviceWritePaths.length > 0)) {
+    throw new Error("Conversation harness authorization must be read-only.");
+  }
+  const artifactIds = new Set(authorization.artifacts.map((artifact) => artifact.artifactId));
+  for (const artifactId of [...authorization.inputArtifactIds, ...authorization.outputArtifactIds]) {
+    if (!artifactIds.has(artifactId)) throw new Error(`Authorization references unknown artifact ${artifactId}.`);
+  }
+  for (const artifact of taskOutputArtifacts()) {
+    if (artifact.ownerAgentId !== agentId || artifact.sourceTaskId !== authorization.taskId) {
+      throw new Error(`Output artifact ${artifact.artifactId} owner/sourceTask does not match this task authorization.`);
+    }
+  }
+}
+
+function taskOutputArtifacts(): AgentHarnessAuthorizationArtifact[] {
+  return authorization.artifacts.filter((artifact) => authorization.outputArtifactIds.includes(artifact.artifactId));
+}
+
+function taskInputArtifacts(): AgentHarnessAuthorizationArtifact[] {
+  return authorization.artifacts.filter((artifact) => authorization.inputArtifactIds.includes(artifact.artifactId));
+}
+
+function assertPathAuthorized(path: string, access: "read" | "artifact_write" | "service_write"): void {
+  resolveAuthorizedTarget(path, true, access);
+}
+
+function assertServiceEvidenceAuthorized(path: string, reportPath: string): void {
+  const registeredOutput = taskOutputArtifacts().find((artifact) =>
+    path === artifact.path || path.startsWith(`${artifact.path.replace(/\/+$/, "")}/`)
+  );
+  if (registeredOutput && (path === reportPath || registeredOutput.type === "build")) {
+    assertPathAuthorized(registeredOutput.path, "artifact_write");
+    return;
+  }
+  assertPathAuthorized(path, "service_write");
+}
+
+function assertCocosRequestAuthorized(name: string, args: Record<string, unknown>): void {
+  if (name === "cocos_validate_project") {
+    for (const path of ["package.json", "assets", "settings"]) assertPathAuthorized(path, "read");
+    assertPathAuthorized("agents/cocos-automation/validation", "service_write");
+    return;
+  }
+  if (name === "cocos_import_assets") {
+    const manifestPath = typeof args.manifestPath === "string" ? args.manifestPath : "agents/art/asset-manifest.json";
+    const manifestTarget = resolveAuthorizedTarget(manifestPath, false, "read");
+    const manifest = JSON.parse(readFileSync(manifestTarget.absolutePath, "utf8")) as unknown;
+    for (const runtimePath of collectManifestRuntimePaths(manifest)) assertPathAuthorized(runtimePath, "read");
+    for (const path of ["assets/resources/btp-art", "assets/resources/btp/asset-map.json", "agents/cocos-automation/imports"]) {
+      assertPathAuthorized(path, "service_write");
+    }
+    return;
+  }
+  if (name === "cocos_apply_blueprint") {
+    const blueprintPath = typeof args.blueprintPath === "string" ? args.blueprintPath : "agents/engineering/cocos-scene-blueprints/main.scene-blueprint.json";
+    const scenePath = typeof args.scenePath === "string" ? args.scenePath : "assets/scenes/MainGame.scene";
+    assertPathAuthorized(blueprintPath, "read");
+    assertPathAuthorized("assets/scripts", "read");
+    for (const path of [scenePath, `${scenePath}.meta`, "assets/resources/btp", "assets/scripts/btp", "agents/cocos-automation/scene-ops"]) {
+      assertPathAuthorized(path, "service_write");
+    }
+    return;
+  }
+  if (name === "cocos_build") {
+    const registeredBuilds = taskOutputArtifacts().filter((artifact) => artifact.type === "build");
+    const outputDir = typeof args.outputDir === "string" ? args.outputDir : registeredBuilds[0]?.path;
+    if (!outputDir || !registeredBuilds.some((artifact) => artifact.path === outputDir)) {
+      throw new Error(`cocos_build outputDir 必须精确等于当前任务登记的 build 产物路径：${outputDir ?? "missing"}`);
+    }
+    assertPathAuthorized(outputDir, "artifact_write");
+    assertPathAuthorized(outputDir, "service_write");
+    for (const path of ["assets/scenes", "package.json", "settings"]) assertPathAuthorized(path, "read");
+    for (const path of ["agents/cocos-automation/build-ops", "agents/cocos-automation/cocos-build-logs"]) {
+      assertPathAuthorized(path, "service_write");
+    }
+    const configPath = typeof args.configPath === "string" && args.configPath.trim()
+      ? args.configPath
+      : cocosEngineSettingsStore.getResolvedConfig().buildConfigPath;
+    if (configPath) assertPathAuthorized(configPath, "read");
+  }
+}
+
+function collectManifestRuntimePaths(value: unknown): string[] {
+  const paths: string[] = [];
+  const visit = (candidate: unknown): void => {
+    if (Array.isArray(candidate)) {
+      candidate.forEach(visit);
+      return;
+    }
+    if (!isRecord(candidate)) return;
+    const runtimePath = candidate.runtimePath ?? candidate.runtime_path ?? candidate.cocosPath ?? candidate.cocos_path;
+    if (typeof runtimePath === "string" && runtimePath.trim()) paths.push(runtimePath);
+    Object.values(candidate).forEach(visit);
+  };
+  visit(value);
+  return [...new Set(paths)];
+}
+
+function recordOperation(operation: import("./agentHarness.js").AgentHarnessToolOperation): void {
   if (!operationLogPath) {
     return;
   }
   mkdirSync(dirname(operationLogPath), { recursive: true });
   appendFileSync(
     operationLogPath,
-    `${JSON.stringify({ toolName, path, hash, sizeBytes, recordedAt: new Date().toISOString() })}\n`,
+    `${JSON.stringify({ ...operation, recordedAt: new Date().toISOString() })}\n`,
     { encoding: "utf8", mode: 0o600 }
   );
 }
 
-function projectCheckCommand(check: string): { executable: string; args: string[] } {
-  switch (check) {
-    case "typescript":
-      return { executable: "npx", args: ["--no-install", "tsc", "--noEmit"] };
-    case "build":
-      return { executable: "npm", args: ["run", "build", "--if-present"] };
-    case "tests":
-      return { executable: "npm", args: ["test", "--if-present"] };
-    case "git-diff":
-      return { executable: "git", args: ["diff", "--check"] };
-    default:
-      throw new Error(`不支持的项目检查：${check}`);
-  }
-}
-
-function safeCommandEnvironment(): NodeJS.ProcessEnv {
-  return {
-    PATH: process.env.PATH,
-    HOME: join(projectRoot, ".be-the-producer", "command-home"),
-    TMPDIR: process.env.TMPDIR,
-    LANG: process.env.LANG ?? "C.UTF-8",
-    LC_ALL: process.env.LC_ALL ?? "C.UTF-8",
-    CI: "1"
-  };
-}
-
-function resolveAuthorizedTarget(path: string, allowDirectory: boolean): { relativePath: string; absolutePath: string } {
-  const cleaned = normalize(path.trim().replace(/^\.\/+/, ""));
-  if (!cleaned || isAbsolute(cleaned) || cleaned.startsWith("..") || cleaned.includes(`${sep}..${sep}`)) {
-    throw new Error(`不安全的项目路径：${path}`);
-  }
-  const relativePath = cleaned.split(sep).join("/");
-  const allowed = allowedRoots.some((root) => relativePath === root || relativePath.startsWith(`${root}/`)) || expectedPaths.some((expected) => relativePath === expected || relativePath.startsWith(`${expected.replace(/\/+$/, "")}/`));
+function resolveAuthorizedTarget(
+  path: string,
+  allowDirectory: boolean,
+  access: "read" | "artifact_write" | "service_write"
+): { relativePath: string; absolutePath: string } {
+  const relativePath = normalizeRelativePathWithinRoot(path, { label: "MCP 项目路径" }).split(sep).join("/");
+  const inputPaths = authorization.artifacts
+    .filter((artifact) => authorization.inputArtifactIds.includes(artifact.artifactId))
+    .map((artifact) => artifact.path);
+  const outputPaths = authorization.artifacts
+    .filter((artifact) => authorization.outputArtifactIds.includes(artifact.artifactId))
+    .map((artifact) => artifact.path);
+  assertNotInternalPath(relativePath);
+  const allowedPaths = access === "read"
+    ? [...inputPaths, ...outputPaths, ...authorization.readRoots, ...authorization.serviceReadPaths]
+    : access === "artifact_write"
+      ? outputPaths
+      : authorization.serviceWritePaths;
+  const allowed = access === "artifact_write"
+    ? allowedPaths.includes(relativePath)
+    : allowedPaths.some((root) => relativePath === root || relativePath.startsWith(`${root.replace(/\/+$/, "")}/`));
   if (!allowed) {
     throw new Error(`该角色无权写入或枚举此路径：${relativePath}`);
   }
-  const absolutePath = resolve(projectRoot, cleaned);
-  const inside = relative(projectRoot, absolutePath);
-  if (inside.startsWith("..") || isAbsolute(inside)) {
-    throw new Error(`路径超出项目根目录：${relativePath}`);
+  const target = resolvePathWithinRoot(projectRoot, relativePath, {
+    allowMissing: true,
+    ...(allowDirectory ? {} : { expectedKind: "file" as const }),
+    label: "MCP 项目路径"
+  });
+  return { relativePath, absolutePath: target.absolutePath };
+}
+
+function assertNotInternalPath(path: string): void {
+  const roots = [".git", ".be-the-producer", "node_modules", "library", "temp", "local"];
+  if (roots.some((root) => path === root || path.startsWith(`${root}/`))) {
+    throw new Error(`Harness 不允许访问内部或临时目录：${path}`);
   }
-  if (!allowDirectory && existsSync(absolutePath) && statSync(absolutePath).isDirectory()) {
-    throw new Error(`目标是目录而不是文件：${relativePath}`);
-  }
-  return { relativePath, absolutePath };
 }
 
 function listFiles(directory: string, limit: number): string[] {
@@ -463,10 +712,20 @@ function listFiles(directory: string, limit: number): string[] {
   const files: string[] = [];
   const visit = (current: string): void => {
     for (const entry of readdirSync(current, { withFileTypes: true })) {
-      if (files.length >= limit || entry.isSymbolicLink() || [".git", ".be-the-producer", "node_modules", "library", "temp"].includes(entry.name)) {
+      if (files.length >= limit) {
+        return;
+      }
+      if (entry.isSymbolicLink()) {
+        throw new Error(`MCP 文件枚举拒绝符号链接：${relative(projectRoot, join(current, entry.name)).split(sep).join("/")}`);
+      }
+      if ([".git", ".be-the-producer", "node_modules", "library", "temp"].includes(entry.name)) {
         continue;
       }
-      const absolutePath = join(current, entry.name);
+      const childPath = relative(projectRoot, join(current, entry.name)).split(sep).join("/");
+      const absolutePath = resolvePathWithinRoot(projectRoot, childPath, {
+        allowMissing: false,
+        label: "MCP 文件枚举路径"
+      }).absolutePath;
       if (entry.isDirectory()) {
         visit(absolutePath);
       } else if (entry.isFile()) {
@@ -484,18 +743,6 @@ function respond(id: JsonRpcRequest["id"], result: unknown): void {
 
 function respondError(id: JsonRpcRequest["id"], code: number, message: string): void {
   process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id, error: { code, message } })}\n`);
-}
-
-function parseStringArray(value: string | undefined): string[] {
-  if (!value) {
-    return [];
-  }
-  try {
-    const parsed = JSON.parse(value) as unknown;
-    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === "string").map((item) => item.replace(/^\.\//, "").replace(/\/+$/, "")) : [];
-  } catch {
-    return [];
-  }
 }
 
 function requiredEnvironment(name: string): string {

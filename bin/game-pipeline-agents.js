@@ -10,6 +10,11 @@ const port = readArgValue(args, "--port") ?? process.env.PORT ?? "8787";
 const host = readArgValue(args, "--host") ?? process.env.HOST ?? "127.0.0.1";
 const shouldOpen = args.includes("--open");
 
+if (!isLoopbackHost(host) && !process.env.BTP_API_TOKEN) {
+  console.error("Refusing to bind the API to a non-loopback host without BTP_API_TOKEN.");
+  process.exit(1);
+}
+
 process.env.PORT = port;
 process.env.HOST = host;
 process.env.INIT_CWD = process.env.INIT_CWD ?? repoRoot;
@@ -38,4 +43,14 @@ function readArgValue(values, name) {
   }
 
   return values[index + 1];
+}
+
+function isLoopbackHost(value) {
+  const host = value.trim().toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+  if (host === "localhost" || host === "::1" || host === "0:0:0:0:0:0:0:1") {
+    return true;
+  }
+  const ipv4 = host.startsWith("::ffff:") ? host.slice("::ffff:".length) : host;
+  const octets = ipv4.split(".");
+  return octets.length === 4 && octets.every((octet) => /^\d{1,3}$/.test(octet) && Number(octet) <= 255) && Number(octets[0]) === 127;
 }
