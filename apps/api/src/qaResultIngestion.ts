@@ -1,9 +1,9 @@
 import { createHash } from "node:crypto";
-import type { StudioKernel } from "@game-pipeline/agent-runtime";
+import { workflowTaskStages, type StudioKernel } from "@game-pipeline/agent-runtime";
 import type { AgentId, Artifact, MemoryRecord, Task } from "@game-pipeline/shared-schemas";
 import { materializeQaFailureRepairs, resumeQaTasksAfterVerifiedRepairs } from "./qaRepairFlow.js";
 import { readVerifiedQaPlaytestReceipts, type QaPlaytestReceipt } from "./qaPlaytestReceipt.js";
-import { taskOutputsVerified } from "./taskOutputEvidence.js";
+import { captureCurrentTaskInputProvenance, taskOutputsVerified } from "./taskOutputEvidence.js";
 import { resolveProjectWorkspaceRoot } from "./workspaceWriter.js";
 
 export interface QaResultIngestionOutcome {
@@ -17,6 +17,7 @@ export function reconcileQaPlaytestResults(kernel: StudioKernel): QaResultIngest
   const processedOperationIds: string[] = [];
   const failedOperationIds: string[] = [];
   const queuedAgentIds = new Set<AgentId>();
+  const executionStages = new Set(workflowTaskStages(kernel.project.currentStage));
 
   for (const receipt of readVerifiedQaPlaytestReceipts(projectRoot)) {
     if (wasReceiptProcessed(kernel, receipt.operationId)) {
@@ -24,6 +25,9 @@ export function reconcileQaPlaytestResults(kernel: StudioKernel): QaResultIngest
     }
     const qaTask = findQaTask(kernel, receipt);
     if (!qaTask) {
+      continue;
+    }
+    if (!receiptInputsMatchCurrentTask(kernel, qaTask, receipt)) {
       continue;
     }
     const reportArtifactId = registerReceiptEvidence(kernel, qaTask, receipt);
@@ -63,7 +67,7 @@ export function reconcileQaPlaytestResults(kernel: StudioKernel): QaResultIngest
   resumeQaTasksAfterVerifiedRepairs(kernel);
   for (const task of kernel.listTasks().filter((candidate) =>
     candidate.ownerAgentId === "qa_evaluator" &&
-    candidate.stageId === kernel.project.currentStage &&
+    executionStages.has(candidate.stageId) &&
     ["review", "done"].includes(candidate.status)
   )) {
     if (taskOutputsVerified(kernel, task)) {
@@ -90,7 +94,11 @@ export function reconcileQaPlaytestResults(kernel: StudioKernel): QaResultIngest
     });
     queuedAgentIds.add(task.ownerAgentId);
   }
-  for (const task of kernel.listTasks().filter((candidate) => candidate.ownerAgentId === "qa_evaluator" && ["todo", "doing"].includes(candidate.status))) {
+  for (const task of kernel.listTasks().filter((candidate) =>
+    candidate.ownerAgentId === "qa_evaluator" &&
+    executionStages.has(candidate.stageId) &&
+    ["todo", "doing"].includes(candidate.status)
+  )) {
     if (taskOutputsVerified(kernel, task)) {
       kernel.updateTask(task.taskId, {
         status: "review",
@@ -108,15 +116,26 @@ export function reconcileQaPlaytestResults(kernel: StudioKernel): QaResultIngest
   };
 }
 
+function receiptInputsMatchCurrentTask(kernel: StudioKernel, task: Task, receipt: QaPlaytestReceipt): boolean {
+  try {
+    const expected = captureCurrentTaskInputProvenance(kernel, task);
+    const actual = [...(receipt.taskInputEvidence ?? [])].sort((left, right) => left.artifactId.localeCompare(right.artifactId));
+    return JSON.stringify(expected) === JSON.stringify(actual);
+  } catch {
+    return false;
+  }
+}
+
 function findQaTask(kernel: StudioKernel, receipt: QaPlaytestReceipt): Task | undefined {
   const reportArtifact = kernel.listArtifacts().find((artifact) => artifact.path === receipt.reportPath && artifact.ownerAgentId === "qa_evaluator");
   if (reportArtifact?.sourceTaskId) {
     const task = kernel.findTask(reportArtifact.sourceTaskId);
     if (task) return task;
   }
+  const executionStages = new Set(workflowTaskStages(kernel.project.currentStage));
   return kernel.listTasks().find((task) =>
     task.ownerAgentId === "qa_evaluator" &&
-    task.stageId === kernel.project.currentStage &&
+    executionStages.has(task.stageId) &&
     task.taskLevel !== "task_group" &&
     task.outputArtifacts.some((artifactId) => kernel.listArtifacts().some((artifact) => artifact.artifactId === artifactId && artifact.path === receipt.reportPath))
   );
@@ -150,7 +169,11 @@ function registerReceiptEvidence(kernel: StudioKernel, qaTask: Task, receipt: Qa
         playtestChecks: receipt.result.checks,
         playtestDefects: receipt.result.defects,
         playtestEvidencePaths: receipt.result.evidencePaths,
-        playtestRuntime: receipt.result.runtime
+        playtestRuntime: receipt.result.runtime,
+        ...(receipt.result.schemaVersion === 2 ? { playtestSchemaVersion: 2 } : {}),
+        ...(receipt.result.contract ? { playtestContract: receipt.result.contract } : {}),
+        ...(receipt.result.scenarios ? { playtestScenarios: receipt.result.scenarios } : {}),
+        playtestTaskInputEvidence: receipt.taskInputEvidence ?? []
       },
       createdAt: existing?.createdAt ?? now,
       updatedAt: now

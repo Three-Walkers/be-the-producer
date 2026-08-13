@@ -1,48 +1,47 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { readFile } from "node:fs/promises";
-import { dirname, extname, join, normalize, sep } from "node:path";
+import { dirname, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { URL } from "node:url";
 import { modelSettingsStore, type SaveAgentModelAssignmentInput, type SaveModelProviderInput } from "./modelSettings.js";
 import { claudeCliHarness } from "./claudeCliHarness.js";
 import { cocosEngineSettingsStore, type SaveCocosEngineConfigInput } from "./cocosEngineSettings.js";
 import { HttpError, studioStore, type CreateProjectInput, type PostMessageInput } from "./store.js";
+import {
+  ApiRequestError,
+  assertRequestAuthorized,
+  assertRequestOriginAllowed,
+  loadApiSecurityConfig,
+  readJsonBody,
+  securityResponseHeaders,
+  type ApiSecurityConfig
+} from "./apiSecurity.js";
+import { resolvePathWithinRoot } from "./pathSafety.js";
 
 const defaultPort = 8787;
 const publicRoot = join(resolveRepoRoot(), "apps", "api", "public");
 
-async function readJson<T>(request: IncomingMessage): Promise<T> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of request) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-  }
-
-  if (chunks.length === 0) {
-    return {} as T;
-  }
-
-  return JSON.parse(Buffer.concat(chunks).toString("utf8")) as T;
-}
-
 function sendJson(response: ServerResponse, statusCode: number, body: unknown): void {
   response.writeHead(statusCode, {
-    "content-type": "application/json; charset=utf-8",
-    "access-control-allow-origin": "*",
-    "access-control-allow-methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
-    "access-control-allow-headers": "content-type"
+    "content-type": "application/json; charset=utf-8"
   });
   response.end(JSON.stringify(body, null, 2));
 }
 
 async function sendStatic(response: ServerResponse, relativePath: string): Promise<void> {
-  const safePath = normalize(relativePath);
-  if (safePath.startsWith("..") || safePath.includes(`${sep}..${sep}`)) {
+  let target: string;
+  try {
+    target = resolvePathWithinRoot(publicRoot, relativePath, {
+      allowMissing: false,
+      expectedKind: "file",
+      label: "静态资源路径"
+    }).absolutePath;
+  } catch {
     throw new HttpError(404, "Route not found");
   }
-
-  const body = await readFile(join(publicRoot, safePath));
+  const body = await readFile(target);
   response.writeHead(200, {
-    "content-type": contentTypeFor(safePath)
+    "content-type": contentTypeFor(relativePath)
   });
   response.end(body);
 }
@@ -95,14 +94,31 @@ function routeSettingsPath(pathname: string): { resource: string; childId?: stri
   };
 }
 
-export async function handleRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
+export async function handleRequest(
+  request: IncomingMessage,
+  response: ServerResponse,
+  securityConfig: ApiSecurityConfig = loadApiSecurityConfig()
+): Promise<void> {
   try {
-    if (request.method === "OPTIONS") {
-      sendJson(response, 204, {});
-      return;
+    const url = new URL(request.url ?? "/", "http://localhost");
+    const isStaticRequest =
+      request.method === "GET" &&
+      (url.pathname === "/" || url.pathname === "/app.js" || url.pathname === "/dashboard-progress.js" || url.pathname === "/styles.css");
+    const responseKind = request.method === "OPTIONS" ? "preflight" : isStaticRequest ? "static" : "api";
+
+    const securityHeaders = securityResponseHeaders(request, securityConfig, responseKind);
+    for (const [name, value] of Object.entries(securityHeaders)) {
+      response.setHeader(name, value);
     }
 
-    const url = new URL(request.url ?? "/", "http://localhost");
+    assertRequestOriginAllowed(request, securityConfig);
+    assertRequestAuthorized(request, url.pathname, securityConfig);
+
+    if (request.method === "OPTIONS") {
+      response.writeHead(204);
+      response.end();
+      return;
+    }
 
     if (
       request.method === "GET" &&
@@ -128,13 +144,13 @@ export async function handleRequest(request: IncomingMessage, response: ServerRe
       }
 
       if (request.method === "POST" && !settingsRoute.childId) {
-        const input = await readJson<SaveModelProviderInput>(request);
+        const input = await readJsonBody<SaveModelProviderInput>(request, securityConfig);
         sendJson(response, 201, { provider: modelSettingsStore.createProvider(input) });
         return;
       }
 
       if (request.method === "PUT" && settingsRoute.childId) {
-        const input = await readJson<SaveModelProviderInput>(request);
+        const input = await readJsonBody<SaveModelProviderInput>(request, securityConfig);
         sendJson(response, 200, { provider: modelSettingsStore.saveProvider(settingsRoute.childId, input) });
         return;
       }
@@ -155,7 +171,7 @@ export async function handleRequest(request: IncomingMessage, response: ServerRe
 
     if (settingsRoute?.resource === "model-assignments") {
       if (request.method === "PUT" && settingsRoute.childId) {
-        const input = await readJson<SaveAgentModelAssignmentInput>(request);
+        const input = await readJsonBody<SaveAgentModelAssignmentInput>(request, securityConfig);
         sendJson(response, 200, { assignment: modelSettingsStore.saveAgentAssignment(settingsRoute.childId, input) });
         return;
       }
@@ -184,7 +200,7 @@ export async function handleRequest(request: IncomingMessage, response: ServerRe
         return;
       }
       if (request.method === "PUT") {
-        const input = await readJson<SaveCocosEngineConfigInput>(request);
+        const input = await readJsonBody<SaveCocosEngineConfigInput>(request, securityConfig);
         sendJson(response, 200, { config: cocosEngineSettingsStore.save(input) });
         return;
       }
@@ -206,7 +222,7 @@ export async function handleRequest(request: IncomingMessage, response: ServerRe
     }
 
     if (request.method === "POST" && url.pathname === "/projects") {
-      const input = await readJson<CreateProjectInput>(request);
+      const input = await readJsonBody<CreateProjectInput>(request, securityConfig);
       if (!input.name) {
         throw new HttpError(400, "name is required");
       }
@@ -274,7 +290,7 @@ export async function handleRequest(request: IncomingMessage, response: ServerRe
     }
 
     if (request.method === "PATCH" && resource === "rooms" && childId && nested === "participants") {
-      const input = await readJson<{ agentId?: string; action?: "invite" | "remove" }>(request);
+      const input = await readJsonBody<{ agentId?: string; action?: "invite" | "remove" }>(request, securityConfig);
       if (!input.agentId || (input.action !== "invite" && input.action !== "remove")) {
         throw new HttpError(400, "agentId and action=invite|remove are required");
       }
@@ -293,7 +309,7 @@ export async function handleRequest(request: IncomingMessage, response: ServerRe
     }
 
     if (request.method === "POST" && resource === "messages") {
-      const input = await readJson<PostMessageInput>(request);
+      const input = await readJsonBody<PostMessageInput>(request, securityConfig);
       if (!input.content) {
         throw new HttpError(400, "content is required");
       }
@@ -313,7 +329,7 @@ export async function handleRequest(request: IncomingMessage, response: ServerRe
     }
 
     if (request.method === "PATCH" && resource === "tasks" && childId && nested === "status") {
-      const input = await readJson<{ status: Parameters<typeof kernel.updateTaskStatus>[1] }>(request);
+      const input = await readJsonBody<{ status: Parameters<typeof kernel.updateTaskStatus>[1] }>(request, securityConfig);
       if (!input.status) {
         throw new HttpError(400, "status is required");
       }
@@ -338,13 +354,21 @@ export async function handleRequest(request: IncomingMessage, response: ServerRe
       return;
     }
 
+    if (request.method === "GET" && resource === "workflow") {
+      sendJson(response, 200, {
+        workflow: kernel.getWorkflowSnapshot(),
+        events: kernel.listWorkflowEvents()
+      });
+      return;
+    }
+
     if (request.method === "GET" && resource === "workspace-tree") {
       sendJson(response, 200, studioStore.readWorkspaceTree(projectRoute.projectId));
       return;
     }
 
     if (request.method === "POST" && resource === "workspace" && childId === "open") {
-      const input = await readJson<{ path?: string; allowFallback?: boolean }>(request);
+      const input = await readJsonBody<{ path?: string; allowFallback?: boolean }>(request, securityConfig);
       if (!input.path) {
         throw new HttpError(400, "path is required");
       }
@@ -388,20 +412,29 @@ export async function handleRequest(request: IncomingMessage, response: ServerRe
 
     throw new HttpError(404, "Route not found");
   } catch (error) {
+    if (error instanceof ApiRequestError) {
+      if (error.statusCode === 401) {
+        response.setHeader("www-authenticate", "Bearer");
+      }
+      sendJson(response, error.statusCode, { error: error.message });
+      return;
+    }
+
     if (error instanceof HttpError) {
       sendJson(response, error.statusCode, { error: error.message, ...(error.details ? { details: error.details } : {}) });
       return;
     }
 
     sendJson(response, 500, {
-      error: error instanceof Error ? error.message : "Unknown error"
+      error: "Internal server error"
     });
   }
 }
 
 export function startServer(port = Number(process.env.PORT ?? defaultPort), host = process.env.HOST ?? "127.0.0.1"): ReturnType<typeof createServer> {
+  const securityConfig = loadApiSecurityConfig({ bindHost: host });
   const server = createServer((request, response) => {
-    void handleRequest(request, response);
+    void handleRequest(request, response, securityConfig);
   });
   server.on("error", (error: NodeJS.ErrnoException) => {
     if (error.code === "EADDRINUSE") {
@@ -414,7 +447,7 @@ export function startServer(port = Number(process.env.PORT ?? defaultPort), host
     process.exitCode = 1;
   });
   server.listen(port, host, () => {
-    console.log(`Game Pipeline Agents API listening on http://localhost:${port}`);
+    console.log(`Game Pipeline Agents API listening on http://${host}:${port}`);
   });
   return server;
 }

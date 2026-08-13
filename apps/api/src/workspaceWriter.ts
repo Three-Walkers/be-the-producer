@@ -1,8 +1,14 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { dirname, extname, isAbsolute, join, normalize, relative, sep } from "node:path";
+import { dirname, extname, join, relative, sep } from "node:path";
 import type { Artifact, MemoryRecord, StudioMessage, Task } from "@game-pipeline/shared-schemas";
 import type { StudioKernel } from "@game-pipeline/agent-runtime";
+import {
+  assertSafePathSegment,
+  assertSafeAbsoluteFile,
+  normalizeRelativePathWithinRoot,
+  resolvePathWithinRoot
+} from "./pathSafety.js";
 
 export interface WorkspaceSyncResult {
   projectRoot: string;
@@ -59,12 +65,45 @@ export interface ToolArtifactWriteResult {
 const defaultWorkspaceRoot = (): string =>
   process.env.STUDIO_WORKSPACE_ROOT ?? join(process.env.INIT_CWD ?? process.cwd(), "studio", "projects");
 
+function ensureProjectWorkspaceRoot(projectId: string, workspaceRoot: string): string {
+  const projectRoot = resolveProjectWorkspaceRoot(projectId, workspaceRoot);
+  mkdirSync(projectRoot, { recursive: true });
+  return resolvePathWithinRoot(workspaceRoot, assertSafePathSegment(projectId, "projectId"), {
+    allowMissing: false,
+    expectedKind: "directory",
+    label: "项目工作区"
+  }).absolutePath;
+}
+
+function ensureSafeDirectory(root: string, path: string, label: string): string {
+  const requested = path === "." ? "." : safeWorkspacePath(path);
+  let resolved = resolvePathWithinRoot(root, requested, {
+    allowMissing: true,
+    allowRoot: true,
+    expectedKind: "directory",
+    label
+  });
+  mkdirSync(resolved.absolutePath, { recursive: true });
+  resolved = resolvePathWithinRoot(root, requested, {
+    allowMissing: false,
+    allowRoot: true,
+    expectedKind: "directory",
+    label
+  });
+  return resolved.absolutePath;
+}
+
 export function resolveProjectWorkspaceRoot(projectId: string, workspaceRoot = defaultWorkspaceRoot()): string {
-  return join(workspaceRoot, projectId);
+  const safeProjectId = assertSafePathSegment(projectId, "projectId");
+  return resolvePathWithinRoot(workspaceRoot, safeProjectId, {
+    allowMissing: true,
+    expectedKind: "directory",
+    label: "项目工作区"
+  }).absolutePath;
 }
 
 export function syncProjectWorkspace(kernel: StudioKernel, workspaceRoot = defaultWorkspaceRoot()): WorkspaceSyncResult {
-  const projectRoot = join(workspaceRoot, kernel.project.projectId);
+  const projectRoot = ensureProjectWorkspaceRoot(kernel.project.projectId, workspaceRoot);
   const filesWritten: string[] = [];
   const taskBoard = kernel.buildTaskBoard();
   const messages = kernel.listMessages();
@@ -77,9 +116,10 @@ export function syncProjectWorkspace(kernel: StudioKernel, workspaceRoot = defau
     status: ["active", "draft", "superseded", "rejected", "archived"]
   });
 
-  mkdirSync(projectRoot, { recursive: true });
   writeCocosProjectScaffold(projectRoot, kernel, filesWritten);
   writeJson(projectRoot, "shared/milestones/project.json", kernel.project, filesWritten);
+  writeJson(projectRoot, "shared/workflow/workflow.json", kernel.getWorkflowSnapshot(), filesWritten);
+  writeJson(projectRoot, "shared/workflow/events.json", kernel.listWorkflowEvents(), filesWritten);
   writeJson(projectRoot, "shared/task-board/current-status.json", taskBoard, filesWritten);
   writeJson(projectRoot, "shared/tasks/tasks.json", tasks, filesWritten);
   writeJson(projectRoot, "shared/chat/messages.json", messages, filesWritten);
@@ -119,7 +159,7 @@ export function readWorkspaceTree(projectId: string, workspaceRoot = defaultWork
   projectRoot: string;
   entries: WorkspaceTreeEntry[];
 } {
-  const projectRoot = join(workspaceRoot, projectId);
+  const projectRoot = resolveProjectWorkspaceRoot(projectId, workspaceRoot);
   if (!existsSync(projectRoot)) {
     return {
       projectRoot,
@@ -134,7 +174,13 @@ export function readWorkspaceTree(projectId: string, workspaceRoot = defaultWork
 }
 
 export function deleteProjectWorkspace(projectId: string, workspaceRoot = defaultWorkspaceRoot()): void {
-  rmSync(join(workspaceRoot, projectId), {
+  const safeProjectId = assertSafePathSegment(projectId, "projectId");
+  const projectRoot = resolvePathWithinRoot(workspaceRoot, safeProjectId, {
+    allowMissing: true,
+    expectedKind: "directory",
+    label: "待删除项目工作区"
+  }).absolutePath;
+  rmSync(projectRoot, {
     recursive: true,
     force: true
   });
@@ -146,16 +192,16 @@ export function writeToolArtifactContent(
   input: { content: string; mode: "replace" | "append" },
   workspaceRoot = defaultWorkspaceRoot()
 ): ToolArtifactWriteResult {
-  const projectRoot = join(workspaceRoot, kernel.project.projectId);
+  const projectRoot = ensureProjectWorkspaceRoot(kernel.project.projectId, workspaceRoot);
   const filesWritten: string[] = [];
-  mkdirSync(projectRoot, { recursive: true });
   writeCocosProjectScaffold(projectRoot, kernel, filesWritten);
 
   const relativePath = safeWorkspacePath(artifactFilePath(artifact));
-  const absolutePath = join(projectRoot, relativePath);
-  if (!isInsideRoot(projectRoot, absolutePath)) {
-    throw new Error(`Unsafe artifact path: ${artifact.path}`);
-  }
+  const absolutePath = resolvePathWithinRoot(projectRoot, relativePath, {
+    allowMissing: true,
+    expectedKind: "file",
+    label: "交付物路径"
+  }).absolutePath;
 
   const previousContent = input.mode === "append" && existsSync(absolutePath) && statSync(absolutePath).isFile() ? readFileSync(absolutePath, "utf8") : "";
   const separator = previousContent && !previousContent.endsWith("\n") ? "\n" : "";
@@ -165,13 +211,6 @@ export function writeToolArtifactContent(
   const stats = statSync(absolutePath);
   const hash = hashWorkspaceFile(absolutePath);
   const materializedAt = stats.mtime.toISOString();
-  kernel.recordArtifactMaterialization(artifact.artifactId, {
-    path: relative(projectRoot, absolutePath).split(sep).join("/"),
-    hash,
-    sizeBytes: stats.size,
-    materializedAt
-  });
-
   return {
     projectRoot,
     relativePath: relative(projectRoot, absolutePath).split(sep).join("/"),
@@ -188,12 +227,14 @@ export function resolveArtifactWorkspaceTarget(
   artifact: Artifact,
   workspaceRoot = defaultWorkspaceRoot()
 ): ArtifactWorkspaceTarget {
-  const projectRoot = join(workspaceRoot, projectId);
+  const projectRoot = resolveProjectWorkspaceRoot(projectId, workspaceRoot);
   const relativePath = safeWorkspacePath(artifactFilePath(artifact));
-  const absolutePath = join(projectRoot, relativePath);
-  if (!isInsideRoot(projectRoot, absolutePath)) {
-    throw new Error(`Unsafe artifact path: ${artifact.path}`);
-  }
+  const resolved = resolvePathWithinRoot(projectRoot, relativePath, {
+    allowMissing: true,
+    expectedKind: "file",
+    label: "交付物路径"
+  });
+  const absolutePath = resolved.absolutePath;
 
   if (!existsSync(absolutePath)) {
     return {
@@ -221,12 +262,13 @@ export function resolveWorkspacePathTarget(
   path: string,
   workspaceRoot = defaultWorkspaceRoot()
 ): WorkspacePathTarget {
-  const projectRoot = join(workspaceRoot, projectId);
+  const projectRoot = resolveProjectWorkspaceRoot(projectId, workspaceRoot);
   const relativePath = safeWorkspacePath(path);
-  const absolutePath = join(projectRoot, relativePath);
-  if (!isInsideRoot(projectRoot, absolutePath)) {
-    throw new Error(`Unsafe workspace path: ${path}`);
-  }
+  const resolved = resolvePathWithinRoot(projectRoot, relativePath, {
+    allowMissing: true,
+    label: "工作区路径"
+  });
+  const absolutePath = resolved.absolutePath;
 
   if (!existsSync(absolutePath)) {
     return {
@@ -263,14 +305,14 @@ export function resolveWorkspacePathOpenTarget(
     };
   }
 
-  const projectRoot = join(workspaceRoot, projectId);
+  const projectRoot = resolveProjectWorkspaceRoot(projectId, workspaceRoot);
   let fallbackRelativePath = dirname(requested.relativePath);
   while (fallbackRelativePath && fallbackRelativePath !== "." && fallbackRelativePath !== "..") {
     const candidatePath = safeWorkspacePath(fallbackRelativePath);
-    const absolutePath = join(projectRoot, candidatePath);
-    if (!isInsideRoot(projectRoot, absolutePath)) {
-      break;
-    }
+    const absolutePath = resolvePathWithinRoot(projectRoot, candidatePath, {
+      allowMissing: true,
+      label: "工作区回退路径"
+    }).absolutePath;
 
     if (existsSync(absolutePath)) {
       const stats = statSync(absolutePath);
@@ -410,14 +452,20 @@ function isModelReadableText(path: string): boolean {
 
 function listWorkspaceEntries(root: string, current: string): WorkspaceTreeEntry[] {
   const entries: WorkspaceTreeEntry[] = [];
-  for (const name of readdirSync(current).sort()) {
+  for (const entry of readdirSync(current, { withFileTypes: true }).sort((left, right) => left.name.localeCompare(right.name))) {
+    const name = entry.name;
+    if (entry.isSymbolicLink()) {
+      throw new Error(`工作区读取拒绝符号链接：${relative(root, join(current, name)).split(sep).join("/")}`);
+    }
     if (name === "secrets") {
       continue;
     }
-
-    const absolutePath = join(current, name);
+    const entryPath = relative(root, join(current, name)).split(sep).join("/");
+    const absolutePath = resolvePathWithinRoot(root, entryPath, {
+      allowMissing: false,
+      label: "工作区读取路径"
+    }).absolutePath;
     const stats = statSync(absolutePath);
-    const entryPath = relative(root, absolutePath).split(sep).join("/");
     if (stats.isDirectory()) {
       entries.push({
         path: entryPath,
@@ -577,7 +625,11 @@ function cocosWorkspaceDirectories(): string[] {
 
 function writeTextIfMissing(projectRoot: string, path: string, content: string, filesWritten: string[]): void {
   const safePath = safeWorkspacePath(path);
-  const absolutePath = join(projectRoot, safePath);
+  const absolutePath = resolvePathWithinRoot(projectRoot, safePath, {
+    allowMissing: true,
+    expectedKind: "file",
+    label: "工作区写入路径"
+  }).absolutePath;
   if (existsSync(absolutePath)) {
     return;
   }
@@ -587,8 +639,18 @@ function writeTextIfMissing(projectRoot: string, path: string, content: string, 
 
 function writeText(projectRoot: string, path: string, content: string, filesWritten: string[]): void {
   const safePath = safeWorkspacePath(path);
-  const absolutePath = join(projectRoot, safePath);
-  mkdirSync(dirname(absolutePath), { recursive: true });
+  let resolved = resolvePathWithinRoot(projectRoot, safePath, {
+    allowMissing: true,
+    expectedKind: "file",
+    label: "工作区写入路径"
+  });
+  ensureSafeDirectory(projectRoot, dirname(safePath), "工作区写入父目录");
+  resolved = resolvePathWithinRoot(projectRoot, safePath, {
+    allowMissing: true,
+    expectedKind: "file",
+    label: "工作区写入路径"
+  });
+  const absolutePath = resolved.absolutePath;
   if (existsSync(absolutePath) && statSync(absolutePath).isFile() && readFileSync(absolutePath, "utf8") === content) {
     return;
   }
@@ -612,7 +674,11 @@ function writeArtifactFile(
   const toolContent = typeof artifact.metadata.toolContent === "string" ? artifact.metadata.toolContent : undefined;
 
   if (artifact.metadata.nativeHarnessManaged === true) {
-    const absolutePath = join(projectRoot, safeWorkspacePath(targetPath));
+    const absolutePath = resolvePathWithinRoot(projectRoot, safeWorkspacePath(targetPath), {
+      allowMissing: true,
+      expectedKind: "file",
+      label: "Harness 交付物路径"
+    }).absolutePath;
     if (existsSync(absolutePath) && statSync(absolutePath).isFile()) {
       recordArtifactFileEvidence(projectRoot, kernel, artifact, targetPath);
       return;
@@ -627,12 +693,10 @@ function writeArtifactFile(
 
   if (targetPath.endsWith(".json")) {
     writeJson(projectRoot, targetPath, { artifact: artifactDocument, sourceTask, relatedMemory: sourceMemory }, filesWritten);
-    recordArtifactFileEvidence(projectRoot, kernel, artifact, targetPath);
     return;
   }
 
   writeText(projectRoot, targetPath, renderArtifactMarkdown(artifact, sourceTask, sourceMemory), filesWritten);
-  recordArtifactFileEvidence(projectRoot, kernel, artifact, targetPath);
 }
 
 function artifactDocumentView(artifact: Artifact): Artifact {
@@ -655,37 +719,34 @@ export function artifactFilePath(artifact: Artifact): string {
 }
 
 function safeWorkspacePath(path: string): string {
-  const safePath = normalize(path);
-  if (isAbsolute(safePath) || safePath.startsWith("..") || safePath.includes(`${sep}..${sep}`)) {
-    throw new Error(`Unsafe workspace path: ${path}`);
-  }
-
-  return safePath;
-}
-
-function isInsideRoot(root: string, target: string): boolean {
-  const relativePath = relative(root, target);
-  return relativePath === "" || (!relativePath.startsWith("..") && !relativePath.includes(`${sep}..${sep}`));
+  return normalizeRelativePathWithinRoot(path, { label: "工作区路径" });
 }
 
 function recordArtifactFileEvidence(projectRoot: string, kernel: StudioKernel, artifact: Artifact, path: string): void {
   const safePath = safeWorkspacePath(path);
-  const absolutePath = join(projectRoot, safePath);
+  const absolutePath = resolvePathWithinRoot(projectRoot, safePath, {
+    allowMissing: true,
+    expectedKind: "file",
+    label: "交付物证据路径"
+  }).absolutePath;
   if (!existsSync(absolutePath) || !statSync(absolutePath).isFile()) {
     return;
   }
 
   const stats = statSync(absolutePath);
+  const directoryManifest = kernel.listArtifactLedger().find((entry) => entry.artifactId === artifact.artifactId)?.directoryManifest;
   kernel.recordArtifactMaterialization(artifact.artifactId, {
     path: relative(projectRoot, absolutePath).split(sep).join("/"),
     hash: hashWorkspaceFile(absolutePath),
     sizeBytes: stats.size,
-    materializedAt: stats.mtime.toISOString()
+    materializedAt: stats.mtime.toISOString(),
+    ...(directoryManifest ? { directoryManifest } : {})
   });
 }
 
 export function hashWorkspaceFile(absolutePath: string): string {
-  return createHash("sha256").update(readFileSync(absolutePath)).digest("hex");
+  const safePath = assertSafeAbsoluteFile(absolutePath, "待哈希工作区文件");
+  return createHash("sha256").update(readFileSync(safePath)).digest("hex");
 }
 
 function sanitizePackageName(projectName: string, projectId: string): string {

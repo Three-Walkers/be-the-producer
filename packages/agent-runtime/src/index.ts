@@ -7,3 +7,5 @@ export * from "./chat/router.js";
 export * from "./memory/memoryStore.js";
 export * from "./studio/studioKernel.js";
 export * from "./tasks/taskBoard.js";
+export * from "./templates/index.js";
+export * from "./workflow/index.js";

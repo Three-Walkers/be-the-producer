@@ -433,15 +433,18 @@ export interface Artifact {
   projectId: ProjectId;
   type:
     | "gdd"
+    | "game_contract"
     | "art_bible"
     | "asset_spec"
     | "asset"
     | "asset_manifest"
     | "scene_blueprint"
+    | "playtest_contract"
     | "source_code"
     | "build"
     | "qa_report"
     | "bug_report"
+    | "deployment_plan"
     | "deployment_report"
     | "rollback_plan"
     | "release_notes";
@@ -461,6 +464,36 @@ export interface Artifact {
 export type ArtifactOperationStatus = "started" | "completed" | "failed";
 export type ArtifactOperationType = "write_artifact" | "append_document";
 export type ArtifactEvidenceStatus = "pending" | "verified" | "mismatch" | "insufficient";
+
+/**
+ * Immutable evidence for one declared task input at the moment an output was
+ * materialized.  `path` is the registered artifact path while `evidencePath`
+ * is the concrete file represented by the ledger entry (a build artifact, for
+ * example, is registered as a directory but evidenced by its build report).
+ */
+export interface ArtifactInputProvenance {
+  artifactId: ArtifactId;
+  version: number;
+  path: string;
+  evidencePath: string;
+  hash: string;
+  sizeBytes: number;
+  directoryManifestDigest?: string;
+}
+
+export interface ArtifactDirectoryManifestEntry {
+  path: string;
+  hash: string;
+  sizeBytes: number;
+}
+
+/** Canonical, complete file inventory for a directory-backed artifact. */
+export interface ArtifactDirectoryManifest {
+  schemaVersion: 1;
+  rootPath: string;
+  files: ArtifactDirectoryManifestEntry[];
+  digest: string;
+}
 
 export interface ArtifactOperation {
   operationId: OperationId;
@@ -493,6 +526,10 @@ export interface ArtifactLedgerEntry {
   materializedAt?: string;
   sourceOperationId: OperationId;
   status: ArtifactEvidenceStatus;
+  /** Frozen declared inputs for this exact materialization. */
+  inputArtifacts?: ArtifactInputProvenance[];
+  /** Present for directory-backed artifacts such as Cocos builds. */
+  directoryManifest?: ArtifactDirectoryManifest;
   reason?: string;
 }
 

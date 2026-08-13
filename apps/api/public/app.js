@@ -20,6 +20,7 @@ const state = {
   harnessStatuses: [],
   cocosEngine: null,
   cocosEngineTestResult: null,
+  apiToken: "",
   pendingAgentResponses: [],
   roomSettingsKind: null,
   selectedModelProviderId: "dashscope"
@@ -33,7 +34,7 @@ const presets = {
     label: "确认立项",
     pendingLabel: "确认执行立项",
     confirmToken: "执行确认：确认立项",
-    expectedStages: ["concept_discussion"],
+    expectedStages: ["concept_discussion", "concept_review"],
     reviewMessageType: "review",
     reviewContent: "请求门禁评审：确认立项。请策划、美术、Producer Agent 和 Orchestrator 评估准备度、阻塞和风险，不要直接推进阶段。",
     confirmMessageType: "decision_record",
@@ -44,7 +45,7 @@ const presets = {
     label: "首个可玩通过",
     pendingLabel: "确认执行可玩",
     confirmToken: "执行确认：首个可玩通过",
-    expectedStages: ["production"],
+    expectedStages: ["production", "first_playable_review"],
     reviewMessageType: "review",
     reviewContent: "请求门禁评审：首个可玩通过。请程序、Cocos 自动化和 QA 评估构建、可玩性、测试报告和风险，不要直接推进阶段。",
     confirmMessageType: "decision_record",
@@ -59,7 +60,7 @@ const presets = {
     reviewMessageType: "review",
     reviewContent: "请求门禁评审：批准发布。请微信平台、QA、DevOps 和 LiveOps 评估 release 构建、发布门禁、部署回滚和上线风险，不要直接发布或推进阶段。",
     confirmMessageType: "decision_record",
-    confirmContent: "执行确认：批准发布。制作人已阅读 Agent 门禁评审和风险提示，仍确认进入发布和持续运营。"
+    confirmContent: "执行确认：批准发布。制作人已阅读 Agent 门禁评审和风险提示，仍确认进入生产部署；健康检查通过后再进入持续运营。"
   },
   progress: {
     roomKind: "studio-main",
@@ -191,6 +192,7 @@ const artifactTypeLabels = {
   build: "可玩构建",
   qa_report: "测试报告",
   bug_report: "问题报告",
+  deployment_plan: "部署计划",
   deployment_report: "部署记录",
   rollback_plan: "回滚方案",
   release_notes: "运营迭代说明"
@@ -2475,15 +2477,29 @@ function summarizeText(text, limit) {
 }
 
 async function request(path, options = {}) {
+  const { promptForToken = true, ...fetchOptions } = options;
+  const tokenUsed = state.apiToken;
+  const headers = {
+    "content-type": "application/json",
+    ...(tokenUsed ? { authorization: `Bearer ${tokenUsed}` } : {}),
+    ...(fetchOptions.headers ?? {})
+  };
   const response = await fetch(path, {
-    headers: {
-      "content-type": "application/json",
-      ...(options.headers ?? {})
-    },
-    ...options
+    ...fetchOptions,
+    headers
   });
 
   const payload = await response.json().catch(() => ({}));
+  if (response.status === 401 && promptForToken) {
+    if (state.apiToken === tokenUsed) {
+      state.apiToken = "";
+    }
+    const token = state.apiToken || window.prompt("此服务器启用了 API 访问令牌。请输入 BTP_API_TOKEN：", "")?.trim();
+    if (token) {
+      state.apiToken = token;
+      return request(path, { ...fetchOptions, promptForToken: false });
+    }
+  }
   if (!response.ok) {
     const error = new Error(payload.error ?? `Request failed: ${response.status}`);
     error.status = response.status;

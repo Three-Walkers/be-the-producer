@@ -6,10 +6,10 @@ import type {
   Task,
   TaskId
 } from "@game-pipeline/shared-schemas";
-import type { StudioKernel } from "@game-pipeline/agent-runtime";
+import { workflowTaskStages, type StudioKernel } from "@game-pipeline/agent-runtime";
 import { finalizeTaskSessionProtocol, ModelAgentRuntime } from "./modelAgentRuntime.js";
 import { executeAgentToolRequests, type ToolExecutionResult } from "./toolExecutor.js";
-import { taskOutputsVerified } from "./taskOutputEvidence.js";
+import { artifactReadyForConsumption, taskOutputsVerified } from "./taskOutputEvidence.js";
 import { resumeQaTasksAfterVerifiedRepairs } from "./qaRepairFlow.js";
 import { finalizeMessageActivity, recordServerToolActivity } from "./agentActivity.js";
 
@@ -274,11 +274,12 @@ export class AgentLoopService {
 
 function selectRunnableTasks(kernel: StudioKernel, preferredAgentIds: AgentId[] = []): Task[] {
   const preferred = new Set(preferredAgentIds);
+  const executionStages = taskExecutionStages(kernel);
   return kernel
     .listTasks()
     .filter(
       (task) =>
-        task.stageId === kernel.project.currentStage &&
+        executionStages.has(task.stageId) &&
         task.taskLevel !== "task_group" &&
         ["todo", "doing"].includes(task.status) &&
         !["producer", "studio_orchestrator"].includes(task.ownerAgentId) &&
@@ -295,19 +296,14 @@ function inputArtifactsVerified(kernel: StudioKernel, task: Task): boolean {
   if (task.inputArtifacts.length === 0) {
     return true;
   }
-  const artifacts = kernel.listArtifacts();
-  const ledger = kernel.listArtifactLedger();
-  return task.inputArtifacts.every((artifactId) => {
-    const artifact = artifacts.find((candidate) => candidate.artifactId === artifactId);
-    const evidence = ledger.find((entry) => entry.artifactId === artifactId);
-    return Boolean(artifact?.metadata.toolExecutedAt && evidence?.status === "verified");
-  });
+  return task.inputArtifacts.every((artifactId) => artifactReadyForConsumption(kernel, artifactId));
 }
 
 function advanceVerifiedTasksToReview(kernel: StudioKernel): void {
+  const executionStages = taskExecutionStages(kernel);
   for (const task of kernel.listTasks()) {
     if (
-      task.stageId === kernel.project.currentStage &&
+      executionStages.has(task.stageId) &&
       task.taskLevel !== "task_group" &&
       ["todo", "doing"].includes(task.status) &&
       taskOutputsVerified(kernel, task)
@@ -323,8 +319,9 @@ function advanceVerifiedTasksToReview(kernel: StudioKernel): void {
 }
 
 function unlockTasksWaitingForProducer(kernel: StudioKernel): void {
+  const executionStages = taskExecutionStages(kernel);
   for (const task of kernel.listTasks()) {
-    if (task.stageId !== kernel.project.currentStage || task.taskLevel === "task_group") {
+    if (!executionStages.has(task.stageId) || task.taskLevel === "task_group") {
       continue;
     }
     const remaining = task.blockers.filter(
@@ -344,8 +341,9 @@ function unlockTasksWaitingForProducer(kernel: StudioKernel): void {
 function unlockRetryableAgentFailures(kernel: StudioKernel): void {
   const nonRetryable = /越权|删除操作|项目根目录之外|阶段门禁/;
   const now = new Date().toISOString();
+  const executionStages = taskExecutionStages(kernel);
   for (const task of kernel.listTasks()) {
-    if (task.stageId !== kernel.project.currentStage || task.taskLevel === "task_group" || task.status !== "blocked") {
+    if (!executionStages.has(task.stageId) || task.taskLevel === "task_group" || task.status !== "blocked") {
       continue;
     }
     const remaining = task.blockers.filter(
@@ -589,9 +587,10 @@ function retryTransientFailure(
 }
 
 function settleWithoutRunnableTasks(kernel: StudioKernel): void {
+  const executionStages = taskExecutionStages(kernel);
   const stageTasks = kernel
     .listTasks()
-    .filter((task) => task.stageId === kernel.project.currentStage && task.taskLevel !== "task_group");
+    .filter((task) => executionStages.has(task.stageId) && task.taskLevel !== "task_group");
   const blocked = stageTasks.filter((task) => task.status === "blocked");
   const review = stageTasks.filter((task) => task.status === "review");
   const pendingDependencies = stageTasks.filter((task) => ["todo", "doing"].includes(task.status));
@@ -612,6 +611,10 @@ function settleWithoutRunnableTasks(kernel: StudioKernel): void {
     waitingReason: reason,
     updatedAt: new Date().toISOString()
   });
+}
+
+function taskExecutionStages(kernel: StudioKernel): ReadonlySet<Task["stageId"]> {
+  return new Set(workflowTaskStages(kernel.project.currentStage));
 }
 
 function readLoopControl(message: StudioMessage): AgentLoopControl | undefined {

@@ -41,6 +41,7 @@ Be The Producer 是一个面向“AI 虚拟游戏工作室”的正式产品系�
 ### 输出
 
 - 游戏设计文档 GDD。
+- 版本化 GameContract、SceneBlueprint 和 PlaytestContract。
 - 美术风格文档 Art Bible 和资产生产计划。
 - 可运行的 2D 资产、UI 资产、动画、音效引用和资产清单。
 - Cocos Creator 工程。
@@ -58,13 +59,13 @@ Be The Producer 是一个面向“AI 虚拟游戏工作室”的正式产品系�
 | --- | --- | --- |
 | Studio Orchestrator | 控制工作流状态、消息路由、任务拆解、阶段门禁和跨 Agent 协作。 | 阶段计划、任务图、决策请求、项目状态。 |
 | Producer Agent | 把制作人的意图转化为范围、排期、风险和里程碑评审。 | 生产计划、backlog、风险日志、评审议程、决策日志。 |
-| Game Designer Agent | 设计核心循环、规则、成长、关卡、数值和平衡。 | GDD、核心循环说明、关卡规格、数值规格。 |
+| Game Designer Agent | 设计核心循环、规则、成长、关卡、数值和平衡。 | GDD、GameContract、关卡规格、数值规格。 |
 | Art Director Agent | 定义美术风格、UI 方向、可读性规则、色板、动画语气和资产质量标准。 | Art Bible、风格板、UI 视觉规范、资产评审记录。 |
 | Asset Production Agent | 生产、清洗、规格化、打包和版本化游戏资产。 | 精灵图、UI 资产、sprite sheet、动画序列、asset manifest。 |
-| Cocos Tech Lead Agent | 负责 Cocos 架构、场景结构、Prefab 策略、资源加载、性能预算和技术规范。 | 技术方案、场景蓝图、模块计划、性能检查清单。 |
+| Cocos Tech Lead Agent | 负责 Cocos 架构、场景结构、Prefab 策略、资源加载、性能预算和技术规范。 | 技术方案、SceneBlueprint、模块计划、性能检查清单。 |
 | Gameplay Programmer Agent | 实现游戏系统、UI 逻辑、玩法规则、数据加载和集成代码。 | TypeScript 代码、Cocos 组件、实现说明、代码变更日志。 |
 | Cocos Automation Agent | 通过引擎桥或 MCP 工具操作 Cocos。 | 场景操作记录、Prefab 更新记录、资源导入记录、构建日志、编辑器快照。 |
-| Game Evaluator / QA Agent | 负责游戏作品评估，不只是执行单元测试。 | 试玩报告、视觉 QA、Bug 报告、发布门禁评估。 |
+| Game Evaluator / QA Agent | 负责游戏作品评估，不只是执行单元测试。 | PlaytestContract、试玩证据、Bug 报告、发布门禁评估。 |
 | WeChat Platform Agent | 负责微信小游戏打包、平台约束、预览、上传和平台适配。 | 微信构建配置、预览包、上传报告、包体体积报告。 |
 | DevOps Agent | 负责服务器部署、环境配置、日志、回滚和生产就绪性。 | 部署方案、发布记录、回滚方案、服务器健康报告。 |
 | LiveOps / Analytics Agent | 负责上线后的数据观察和持续迭代计划。 | 埋点方案、事件结构、迭代 backlog、调优方案。 |
@@ -247,6 +248,9 @@ flowchart LR
       vector-index-metadata.json
     decisions/
     milestones/
+    workflow/
+      workflow.json
+      events.json
     build-artifacts/
     release-notes/
 
@@ -490,7 +494,7 @@ flowchart TB
 
 ## 产品能力模块
 
-Game Pipeline Agents 由一组相互连接的完整产品能力模块组成：
+Game Pipeline Agents 的目标产品由一组相互连接的能力模块组成：
 
 | 模块 | 职责 |
 | --- | --- |
@@ -512,4 +516,4 @@ Game Pipeline Agents 由一组相互连接的完整产品能力模块组成：
 
 ## 当前状态
 
-当前仓库包含 Game Pipeline Agents 的产品规格。实现范围覆盖上文描述的完整产品系统：工作室协作、Agent 执行、生产记忆、角色工作空间、Cocos 自动化、QA 评估、发布运维和持续迭代。
+当前仓库处于本地纵向 MVP 阶段。版本化 GameContract、SceneBlueprint 和 PlaytestContract 已落地严格校验与跨契约门禁；Cocos Bridge 已改为声明式通用渲染，QA 已能按契约执行多场景、公开事实断言和证据绑定。Workflow Aggregate 已把评审、制作人决策、变更、豁免、回滚和 LiveOps 迭代变成可重放的一等领域记录。工具执行已绑定 Agent、当前任务、产物身份和路径；Claude MCP 房间会话只读。Artifact Ledger 会冻结输入版本/hash，构建产物使用完整文件 manifest，旧构建、旧 QA、外部篡改和符号链接越界都会在消费前失效。本地项目状态采用原子替换、有效备份与损坏隔离；非本机 API 绑定要求 Bearer token，并具备同源/CORS、请求体限制和基础安全响应头。tap-defense、puzzle、runner/endless 的自动化 fixture 证明核心层不再依赖单一样例，但还没有三套真实 Cocos 游戏端到端交付。生产数据库与分布式队列/租约、Secret Vault、隔离构建 worker、真实微信发布、游戏脚本 Runtime Adapter、Prefab 真实物化及生产 LiveOps 闭环仍在建设中，因此尚不能视为完整产品系统。

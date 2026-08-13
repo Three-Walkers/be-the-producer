@@ -1,5 +1,5 @@
 import { readFileSync, readdirSync, statSync } from "node:fs";
-import { relative, resolve, sep } from "node:path";
+import { join, relative, sep } from "node:path";
 import type { AgentContract, Artifact, StudioMessage, Task } from "@game-pipeline/shared-schemas";
 import type { StudioKernel } from "@game-pipeline/agent-runtime";
 import { inferArtifactType, stableArtifactId, type ToolExecutionResult } from "./toolExecutor.js";
@@ -7,6 +7,8 @@ import { artifactFilePath, hashWorkspaceFile } from "./workspaceWriter.js";
 import { parsePlaytestMarker } from "./playtestEvidence.js";
 import type { AgentHarnessToolOperation } from "./agentHarness.js";
 import { isQaHarnessManagedPath } from "./qaEvidenceProtection.js";
+import { assertAgentPathAuthorized } from "./toolAuthorization.js";
+import { resolvePathWithinRoot } from "./pathSafety.js";
 
 export interface WorkspaceFileEvidence {
   path: string;
@@ -53,8 +55,14 @@ const generatedWorkspaceFiles = new Set([
 ]);
 
 export function captureWorkspaceSnapshot(projectRoot: string): WorkspaceSnapshot {
+  const safeRoot = resolvePathWithinRoot(projectRoot, ".", {
+    allowMissing: false,
+    allowRoot: true,
+    expectedKind: "directory",
+    label: "Harness 工作区"
+  }).absolutePath;
   const files = new Map<string, WorkspaceFileEvidence>();
-  walkDirectory(projectRoot, projectRoot, files);
+  walkDirectory(safeRoot, safeRoot, files);
   return files;
 }
 
@@ -76,15 +84,12 @@ export function recordHarnessWorkspaceChanges(
     ? [...new Set(invocationChangedPaths)].filter((path) => after.has(path)).sort()
     : workspaceChangedPaths;
   const deletedPaths = [...before.keys()].filter((path) => !after.has(path)).sort();
-  const expectedArtifacts = task.outputArtifacts
-    .map((artifactId) => kernel.listArtifacts().find((artifact) => artifact.artifactId === artifactId))
-    .filter((artifact): artifact is Artifact => Boolean(artifact));
   const protectedMutationPaths = changedPaths.filter((path) => {
     if (!isQaHarnessManagedPath(path)) return false;
     return invocationToolOperations?.filter((operation) => operation.path === path).at(-1)?.toolName !== "run_playtest";
   });
   const violations = [
-    ...changedPaths.filter((path) => !isAllowedAgentPath(agent, path, expectedArtifacts)),
+    ...changedPaths.filter((path) => !isAllowedAgentPath(kernel, task, agent, path)),
     ...protectedMutationPaths.map((path) => `受保护 QA 机器证据被非 run_playtest 工具修改：${path}`),
     ...deletedPaths.map((path) => `删除：${path}`)
   ];
@@ -101,7 +106,9 @@ export function recordHarnessWorkspaceChanges(
       continue;
     }
     const existing = findArtifactForPath(kernel, task, path);
-    const sourceTool = invocationToolOperations?.filter((operation) => operation.path === path).at(-1)?.toolName;
+    const sourceOperation = invocationToolOperations?.filter((operation) => operation.path === path).at(-1);
+    const sourceTool = sourceOperation?.toolName;
+    const operationFailed = sourceOperation?.status === "failed" || sourceOperation?.bridgeOk === false;
     const playtest = path.endsWith(".md") ? parsePlaytestMarker(readFileSync(file.absolutePath, "utf8")) : undefined;
     const artifact: Artifact = {
       artifactId: existing?.artifactId ?? stableArtifactId(kernel.project.projectId, agent.agentId, path),
@@ -120,6 +127,10 @@ export function recordHarnessWorkspaceChanges(
         nativeHarnessManaged: true,
         harnessInvocationId: invocationId,
         ...(sourceTool ? { harnessToolName: sourceTool } : {}),
+        ...(sourceOperation?.operationId ? { bridgeOperationId: sourceOperation.operationId } : {}),
+        ...(sourceOperation?.operationType ? { bridgeOperationType: sourceOperation.operationType } : {}),
+        ...(sourceOperation?.bridgeOk !== undefined ? { bridgeOk: sourceOperation.bridgeOk } : {}),
+        ...(sourceOperation?.error ? { harnessToolError: sourceOperation.error } : {}),
         toolExecutedAt: now,
         changedPath: path,
         ...(playtest
@@ -138,18 +149,19 @@ export function recordHarnessWorkspaceChanges(
     };
     const stored = kernel.upsertArtifact(artifact);
     stored.metadata = artifact.metadata;
-    stored.status = playtest && playtest.verdict !== "pass" ? "change_requested" : "submitted";
+    stored.status = operationFailed || (playtest && playtest.verdict !== "pass") ? "change_requested" : "submitted";
     stored.updatedAt = file.updatedAt;
     kernel.recordArtifactMaterialization(stored.artifactId, {
       path,
       hash: file.hash,
       sizeBytes: file.sizeBytes,
-      materializedAt: file.updatedAt
+      materializedAt: file.updatedAt,
+      ...(sourceOperation?.directoryManifest ? { directoryManifest: sourceOperation.directoryManifest } : {})
     });
     artifactIds.add(stored.artifactId);
     toolExecutions.push({
       toolName: "write_artifact",
-      status: "completed",
+      status: operationFailed ? "failed" : "completed",
       path,
       artifactId: stored.artifactId,
       hash: file.hash,
@@ -180,11 +192,17 @@ export function attachHarnessEvidenceToMessage(message: StudioMessage, evidence:
 
 function walkDirectory(root: string, directory: string, files: WorkspaceSnapshot): void {
   for (const entry of readdirSync(directory, { withFileTypes: true })) {
-    if (entry.isSymbolicLink() || (entry.isDirectory() && ignoredDirectoryNames.has(entry.name))) {
+    if (entry.isSymbolicLink()) {
+      throw new Error(`Harness 工作区拒绝符号链接：${relative(root, directory).split(sep).join("/")}/${entry.name}`);
+    }
+    if (entry.isDirectory() && ignoredDirectoryNames.has(entry.name)) {
       continue;
     }
-    const absolutePath = resolve(directory, entry.name);
-    const path = relative(root, absolutePath).split(sep).join("/");
+    const path = relative(root, join(directory, entry.name)).split(sep).join("/");
+    const absolutePath = resolvePathWithinRoot(root, path, {
+      allowMissing: false,
+      label: "Harness 工作区路径"
+    }).absolutePath;
     if (entry.isDirectory()) {
       walkDirectory(root, absolutePath, files);
       continue;
@@ -218,28 +236,11 @@ function findArtifactForPath(kernel: StudioKernel, task: Task, path: string): Ar
     .find((artifact) => artifact && path.startsWith(`${artifact.path.replace(/\/+$/, "")}/`));
 }
 
-function isAllowedAgentPath(agent: AgentContract, path: string, expectedArtifacts: Artifact[]): boolean {
-  if (expectedArtifacts.some((artifact) => path === artifact.path || path === artifactFilePath(artifact).replaceAll("\\", "/") || path.startsWith(`${artifact.path.replace(/\/+$/, "")}/`))) {
+function isAllowedAgentPath(kernel: StudioKernel, task: Task, agent: AgentContract, path: string): boolean {
+  try {
+    assertAgentPathAuthorized(kernel, agent, task, path, "write");
     return true;
+  } catch {
+    return false;
   }
-  return allowedRootsForAgent(agent).some((root) => path === root || path.startsWith(`${root}/`));
-}
-
-export function allowedRootsForAgent(agent: AgentContract): string[] {
-  const ownWorkspace = agent.workspace.replace(/^\.\//, "").replace(/\/+$/, "");
-  const common: Record<string, string[]> = {
-    studio_orchestrator: ["shared/milestones", "docs/production"],
-    producer: ["agents/producer", "docs/production", "shared/milestones"],
-    game_designer: ["agents/design", "docs/design", "shared/milestones"],
-    art_director: ["agents/art", "assets/art", "docs/art", "artifacts", "intermediate"],
-    asset_production: ["agents/art/processed-assets", "assets/art", "artifacts", "intermediate"],
-    cocos_tech_lead: ["agents/engineering", "assets", "settings", "docs/engineering", "intermediate"],
-    gameplay_programmer: ["assets/scripts", "assets/resources", "docs/engineering", "intermediate"],
-    cocos_automation: ["agents/cocos-automation", "assets", "settings", "builds", "shared/build-artifacts", "artifacts/builds", "intermediate"],
-    qa_evaluator: ["agents/qa", "docs/qa", "artifacts", "outputs"],
-    wechat_platform: ["shared/build-artifacts", "builds", "outputs", "release", "docs/release"],
-    devops: ["agents/devops", "builds", "outputs", "release", "docs/release"],
-    liveops_analytics: ["shared/release-notes", "docs/liveops", "release"]
-  };
-  return [...new Set([ownWorkspace, ...(common[agent.agentId] ?? [])])].filter(Boolean);
 }

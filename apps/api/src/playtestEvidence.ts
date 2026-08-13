@@ -18,7 +18,34 @@ export interface PlaytestDefect {
   evidencePaths: string[];
 }
 
+export interface PlaytestContractEvidence {
+  schemaVersion: "1.0.0";
+  playtestId: string;
+  revision: number;
+  path: string;
+  hash: string;
+  sizeBytes: number;
+  runtimeProtocol: "1.0.0";
+  adapterMode: "runtime_adapter" | "legacy_yarn_v1";
+  runtimeContractHash?: string;
+  hashVerified: boolean;
+}
+
+export interface PlaytestContractScenarioEvidence {
+  scenarioId: string;
+  title: string;
+  required: boolean;
+  passed: boolean;
+  initialState: string;
+  finalState: string;
+  requiredStepIds: string[];
+  passedStepIds: string[];
+  evidencePaths: string[];
+  details: string;
+}
+
 export interface PlaytestReportEvidence {
+  schemaVersion?: 1 | 2;
   operationId: string;
   verdict: PlaytestVerdict;
   completedAt: string;
@@ -26,6 +53,8 @@ export interface PlaytestReportEvidence {
   checks: PlaytestCheckResult[];
   defects: PlaytestDefect[];
   evidencePaths: string[];
+  contract?: PlaytestContractEvidence;
+  scenarios?: PlaytestContractScenarioEvidence[];
   runtime: {
     initialState?: string;
     playingState?: string;

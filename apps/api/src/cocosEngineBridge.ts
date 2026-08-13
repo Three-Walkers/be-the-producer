@@ -3,15 +3,22 @@ import { spawnSync } from "node:child_process";
 import {
   copyFileSync,
   existsSync,
+  mkdtempSync,
   mkdirSync,
   readFileSync,
   readdirSync,
+  rmSync,
   statSync,
   writeFileSync
 } from "node:fs";
 import type { Stats } from "node:fs";
-import { basename, dirname, extname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
+import { tmpdir } from "node:os";
+import { basename, dirname, extname, join, relative, resolve, sep } from "node:path";
+import { ContractValidationError, parseSceneBlueprint } from "@game-pipeline/shared-schemas";
+import type { ArtifactDirectoryManifest, SceneBlueprint, SceneDefinition } from "@game-pipeline/shared-schemas";
 import type { CocosEngineConfig } from "./cocosEngineSettings.js";
+import { adaptLegacySceneBlueprint } from "./legacySceneBlueprintAdapter.js";
+import { normalizeRelativePathWithinRoot, resolvePathWithinRoot } from "./pathSafety.js";
 
 export interface CocosBridgeEvidence {
   path: string;
@@ -46,11 +53,61 @@ export interface CocosBuildInput {
   configPath?: string;
 }
 
+export function verifyCocosBuildManifest(projectRoot: string, manifest: ArtifactDirectoryManifest): boolean {
+  try {
+    if (manifest.schemaVersion !== 1 || manifest.files.length === 0) return false;
+    const files = [...manifest.files].sort((left, right) => left.path.localeCompare(right.path));
+    if (files.some((entry, index) => entry.path !== manifest.files[index]?.path)) return false;
+    const rootPath = normalizeRelativePath(manifest.rootPath).replace(/\/+$/, "");
+    if (files.some((entry) => !entry.path.startsWith(`${rootPath}/`))) return false;
+    const actualFiles = listProjectFiles(projectRoot, rootPath, (path, stats) =>
+      stats.isFile() && !path.endsWith("/.gitkeep") && !path.endsWith("/build-report.json")
+    );
+    if (actualFiles.length !== files.length || actualFiles.some((path, index) => path !== files[index]?.path)) return false;
+    const digest = createHash("sha256").update(canonicalManifestBytes(files)).digest("hex");
+    return digest === manifest.digest && files.every((expected) => {
+      const actual = fileEvidence(projectRoot, expected.path);
+      return actual.hash === expected.hash && actual.sizeBytes === expected.sizeBytes;
+    });
+  } catch {
+    return false;
+  }
+}
+
 interface ManifestAsset {
   id: string;
   runtimePath: string;
   sourcePath?: string;
   status?: string;
+}
+
+interface PreparedManifestAsset extends ManifestAsset {
+  sourceAbsolutePath: string;
+  destinationPath: string;
+  resourcePath: string;
+}
+
+interface AssetImportOutput {
+  destinationPath: string;
+  stagedPath?: string;
+  content?: string;
+}
+
+interface AssetImportMissingEntry {
+  id: string;
+  runtimePath: string;
+  reason: "file_not_found" | "not_a_file";
+}
+
+class AssetImportValidationError extends Error {
+  constructor(
+    message: string,
+    readonly issues: string[],
+    readonly missing: AssetImportMissingEntry[]
+  ) {
+    super(message);
+    this.name = "AssetImportValidationError";
+  }
 }
 
 interface ScriptComponent {
@@ -136,10 +193,12 @@ export class CocosEngineBridge {
 
   importAssets(input: CocosImportAssetsInput = {}): CocosBridgeResult {
     const operationId = createOperationId("import");
-    const manifestPath = normalizeRelativePath(input.manifestPath ?? defaultManifestPath);
+    const requestedManifestPath = input.manifestPath ?? defaultManifestPath;
+    let manifestPath = requestedManifestPath;
     const reportPath = `agents/cocos-automation/imports/${operationId}.json`;
     const evidence: CocosBridgeEvidence[] = [];
     try {
+      manifestPath = normalizeRelativePath(requestedManifestPath);
       const manifestAbsolutePath = resolveInsideProject(this.projectRoot, manifestPath);
       if (!existsSync(manifestAbsolutePath) || !statSync(manifestAbsolutePath).isFile()) {
         throw new Error(`资产清单不存在：${manifestPath}`);
@@ -149,81 +208,58 @@ export class CocosEngineBridge {
       if (assets.length === 0) {
         throw new Error(`资产清单中没有可导入的 runtimePath：${manifestPath}`);
       }
-
-      const imported: Array<Record<string, unknown>> = [];
-      const missing: Array<Record<string, unknown>> = [];
-      const assetMap: Record<string, string> = {};
-      for (const asset of assets) {
-        const runtimePath = normalizeRelativePath(asset.runtimePath);
-        const source = resolveInsideProject(this.projectRoot, runtimePath);
-        if (!existsSync(source) || !statSync(source).isFile()) {
-          missing.push({ id: asset.id, runtimePath, reason: "file_not_found" });
-          continue;
-        }
-        assertRuntimeAsset(source, runtimePath);
-        const extension = extname(runtimePath).toLowerCase();
-        const safeId = safeAssetId(asset.id || basename(runtimePath, extension));
-        const destinationPath = `assets/resources/btp-art/${safeId}${extension}`;
-        const destination = resolveInsideProject(this.projectRoot, destinationPath);
-        mkdirSync(dirname(destination), { recursive: true });
-        if (source !== destination) {
-          copyFileSync(source, destination);
-        }
-        const materialized = fileEvidence(this.projectRoot, destinationPath);
-        evidence.push(materialized);
-        assetMap[asset.id] = `btp-art/${safeId}`;
-        imported.push({
-          assetId: asset.id,
-          sourcePath: runtimePath,
-          cocosPath: destinationPath,
-          resourcePath: assetMap[asset.id],
-          hash: materialized.hash,
-          sizeBytes: materialized.sizeBytes
-        });
-      }
-
+      const preparedAssets = prepareManifestAssets(this.projectRoot, assets);
       const mapPath = "assets/resources/btp/asset-map.json";
-      evidence.push(this.writeJson(mapPath, { generatedBy: "Be The Producer Cocos Engine Bridge", manifestPath, assets: assetMap }));
-      const ok = missing.length === 0;
-      const report = this.writeReport(reportPath, {
+      const materialized = materializeAssetImport({
+        projectRoot: this.projectRoot,
         operationId,
-        operationType: "import_assets",
-        status: ok ? "completed" : "failed",
-        createdAt: new Date().toISOString(),
         manifestPath,
-        imported,
-        missing,
-        importMode: "copied_to_assets_resources",
-        note: "Cocos Creator AssetDB will perform the native import when the project is opened or built."
+        reportPath,
+        mapPath,
+        assets: preparedAssets
       });
-      evidence.push(report);
+      evidence.push(...materialized.evidence);
       return {
-        ok,
+        ok: true,
         operationId,
         operationType: "import_assets",
-        summary: ok ? `已物化 ${imported.length} 个 Cocos runtime 资产，等待 Creator AssetDB 原生导入。` : `资产导入校验失败：${missing.length} 个 runtime 文件不存在。`,
+        summary: `已物化 ${materialized.imported.length} 个 Cocos runtime 资产，等待 Creator AssetDB 原生导入。`,
         reportPath,
         evidence,
-        details: { manifestPath, imported, missing, assetMap },
-        ...(!ok ? { error: `以下 runtime 资产不存在：${missing.map((item) => item.runtimePath).join(", ")}` } : {})
+        details: {
+          manifestPath,
+          imported: materialized.imported,
+          missing: [],
+          assetMap: materialized.assetMap
+        }
       };
     } catch (error) {
+      const validationError = error instanceof AssetImportValidationError ? error : undefined;
       const failure = this.writeReport(reportPath, {
         operationId,
         operationType: "import_assets",
         status: "failed",
         createdAt: new Date().toISOString(),
         manifestPath,
+        ...(validationError ? { validationIssues: validationError.issues, missing: validationError.missing } : {}),
         error: errorMessage(error)
       });
       return {
         ok: false,
         operationId,
         operationType: "import_assets",
-        summary: "Cocos 资产导入失败，已保存失败报告。",
+        summary: validationError
+          ? `资产导入预检失败：${validationError.issues.length} 个问题；未物化任何 runtime 资产。`
+          : "Cocos 资产导入失败，已保存失败报告。",
         reportPath,
         evidence: [failure],
-        details: { manifestPath },
+        details: {
+          manifestPath,
+          imported: [],
+          missing: validationError?.missing ?? [],
+          assetMap: {},
+          ...(validationError ? { validationIssues: validationError.issues } : {})
+        },
         error: errorMessage(error)
       };
     }
@@ -240,20 +276,36 @@ export class CocosEngineBridge {
       if (!existsSync(blueprintAbsolutePath) || !statSync(blueprintAbsolutePath).isFile()) {
         throw new Error(`SceneBlueprint 不存在：${blueprintPath}`);
       }
-      const blueprint = readJsonFile(blueprintAbsolutePath);
-      const normalized = normalizeBlueprint(blueprint);
+      const blueprintDocument = readJsonFile(blueprintAbsolutePath);
+      const adapted = Object.prototype.hasOwnProperty.call(blueprintDocument, "kind")
+        ? blueprintDocument
+        : adaptLegacySceneBlueprint(blueprintDocument);
+      const normalized = parseSceneBlueprint(adapted);
+      const entryScene = requireEntryScene(normalized);
+      assertBridgeMaterializationSupported(normalized, entryScene);
       const scriptComponents = discoverScriptComponents(this.projectRoot);
+      validateBridgeComponents(normalized, scriptComponents);
+      const resolution = inferSceneResolution(entryScene);
       const scriptPath = "assets/scripts/btp/BtpRuntimeBootstrap.ts";
       const scriptUuid = deterministicUuid(`${scriptPath}:btp-cocos-bridge`);
-      const sceneUuid = deterministicUuid(`${scenePath}:${normalized.sceneName}`);
+      const sceneUuid = deterministicUuid(`${scenePath}:${normalized.blueprintId}:${normalized.revision}:${entryScene.sceneId}`);
       const descriptorPath = "assets/resources/btp/scene-blueprint.json";
       const scriptMetaPath = `${scriptPath}.meta`;
       const sceneMetaPath = `${scenePath}.meta`;
 
+      assertWritableProjectTargets(this.projectRoot, [
+        descriptorPath,
+        scriptPath,
+        scriptMetaPath,
+        scenePath,
+        sceneMetaPath,
+        reportPath
+      ]);
+
       evidence.push(this.writeJson(descriptorPath, normalized));
       evidence.push(this.writeText(scriptPath, renderRuntimeBootstrap(scriptComponents)));
       evidence.push(this.writeJson(scriptMetaPath, typescriptMeta(scriptUuid)));
-      evidence.push(this.writeJson(scenePath, createBootstrapScene(normalized, scriptUuid, sceneUuid)));
+      evidence.push(this.writeJson(scenePath, createBootstrapScene({ sceneName: entryScene.name, resolution }, scriptUuid, sceneUuid)));
       evidence.push(this.writeJson(sceneMetaPath, sceneMeta(sceneUuid)));
       const report = this.writeReport(reportPath, {
         operationId,
@@ -266,7 +318,10 @@ export class CocosEngineBridge {
         descriptorPath,
         scriptPath,
         scriptComponents,
-        nodeCount: countBlueprintNodes(normalized.root)
+        schemaVersion: normalized.schemaVersion,
+        blueprintId: normalized.blueprintId,
+        entrySceneId: normalized.entrySceneId,
+        nodeCount: entryScene.nodes.length
       });
       evidence.push(report);
       return {
@@ -283,7 +338,10 @@ export class CocosEngineBridge {
           descriptorPath,
           scriptPath,
           scriptComponents,
-          nodeCount: countBlueprintNodes(normalized.root)
+          schemaVersion: normalized.schemaVersion,
+          blueprintId: normalized.blueprintId,
+          entrySceneId: normalized.entrySceneId,
+          nodeCount: entryScene.nodes.length
         }
       };
     } catch (error) {
@@ -335,8 +393,19 @@ export class CocosEngineBridge {
       }
       const outputAbsolute = resolveInsideProject(this.projectRoot, outputDir);
       const logAbsolute = resolveInsideProject(this.projectRoot, logPath);
-      mkdirSync(outputAbsolute, { recursive: true });
-      mkdirSync(dirname(logAbsolute), { recursive: true });
+      assertWritableProjectTargets(this.projectRoot, [logPath, reportPath, operationReportPath]);
+      ensureDirectoryInsideProject(this.projectRoot, outputDir);
+      ensureDirectoryInsideProject(this.projectRoot, relative(this.projectRoot, dirname(logAbsolute)));
+      resolvePathWithinRoot(this.projectRoot, relative(this.projectRoot, outputAbsolute), {
+        allowMissing: false,
+        expectedKind: "directory",
+        label: "Cocos 构建输出目录"
+      });
+      resolvePathWithinRoot(this.projectRoot, logPath, {
+        allowMissing: true,
+        expectedKind: "file",
+        label: "Cocos 构建日志"
+      });
 
       const configPath = input.configPath?.trim() || this.config.buildConfigPath;
       const buildOptions = configPath
@@ -348,7 +417,7 @@ export class CocosEngineBridge {
         encoding: "utf8",
         timeout: this.config.timeoutMs,
         maxBuffer: 20 * 1024 * 1024,
-        env: process.env
+        env: minimalCreatorEnvironment(process.env)
       });
       const processOutput = `${processResult.stdout ?? ""}\n${processResult.stderr ?? ""}`.trim();
       const existingLog = existsSync(logAbsolute) && statSync(logAbsolute).isFile() ? readFileSync(logAbsolute, "utf8") : "";
@@ -356,12 +425,16 @@ export class CocosEngineBridge {
       evidence.push(fileEvidence(this.projectRoot, logPath));
 
       const exitSucceeded = processResult.status === 0 || processResult.status === 36;
-      const outputFiles = listProjectFiles(this.projectRoot, outputDir, (path, stats) =>
+      const newlyWrittenOutputFiles = listProjectFiles(this.projectRoot, outputDir, (path, stats) =>
         stats.isFile() && !path.endsWith("/.gitkeep") && !path.endsWith("/build-report.json") && stats.mtimeMs >= startedAtMs - 2_000
       );
-      const ok = !processResult.error && exitSucceeded && outputFiles.length > 0;
+      const ok = !processResult.error && exitSucceeded && newlyWrittenOutputFiles.length > 0;
       const failureReason = processResult.error?.message
-        ?? (!exitSucceeded ? `Creator 退出码 ${processResult.status ?? "unknown"}` : outputFiles.length === 0 ? "Creator 未生成新的构建文件" : "unknown");
+        ?? (!exitSucceeded ? `Creator 退出码 ${processResult.status ?? "unknown"}` : newlyWrittenOutputFiles.length === 0 ? "Creator 未生成新的构建文件" : "unknown");
+      const outputFiles = listProjectFiles(this.projectRoot, outputDir, (path, stats) =>
+        stats.isFile() && !path.endsWith("/.gitkeep") && !path.endsWith("/build-report.json")
+      );
+      const outputManifest = ok ? createDirectoryManifest(this.projectRoot, outputDir, outputFiles) : undefined;
       const reportDocument = {
         buildId: operationId,
         operationId,
@@ -380,6 +453,7 @@ export class CocosEngineBridge {
         exitCode: processResult.status,
         signal: processResult.signal,
         outputFiles,
+        ...(outputManifest ? { outputManifest } : {}),
         startedAt,
         completedAt: new Date().toISOString(),
         durationMs: Date.now() - startedAtMs,
@@ -441,8 +515,8 @@ export class CocosEngineBridge {
 
   private writeText(path: string, content: string): CocosBridgeEvidence {
     const relativePath = normalizeRelativePath(path);
+    ensureDirectoryInsideProject(this.projectRoot, dirname(relativePath));
     const absolutePath = resolveInsideProject(this.projectRoot, relativePath);
-    mkdirSync(dirname(absolutePath), { recursive: true });
     writeFileSync(absolutePath, content, "utf8");
     return fileEvidence(this.projectRoot, relativePath);
   }
@@ -515,7 +589,215 @@ function collectManifestAssets(value: unknown): ManifestAsset[] {
     Object.values(candidate).forEach(visit);
   };
   visit(value);
-  return [...new Map(assets.map((asset) => [`${asset.id}:${asset.runtimePath}`, asset])).values()];
+  return assets;
+}
+
+function prepareManifestAssets(projectRoot: string, assets: ManifestAsset[]): PreparedManifestAsset[] {
+  const prepared: PreparedManifestAsset[] = [];
+  const issues: string[] = [];
+  const missing: AssetImportMissingEntry[] = [];
+  const ids = new Map<string, number>();
+  const destinations = new Map<string, { assetId: string; index: number }>();
+
+  assets.forEach((asset, index) => {
+    const id = asset.id.trim();
+    const displayIndex = index + 1;
+    if (!id) {
+      issues.push(`资产清单第 ${displayIndex} 项缺少非空 id。`);
+    } else {
+      const previousIndex = ids.get(id);
+      if (previousIndex !== undefined) {
+        issues.push(`资产 id '${id}' 重复（第 ${previousIndex + 1}、${displayIndex} 项）。`);
+      } else {
+        ids.set(id, index);
+      }
+    }
+
+    let runtimePath: string;
+    try {
+      runtimePath = normalizeRelativePath(asset.runtimePath);
+    } catch (error) {
+      issues.push(`资产 '${id || `#${displayIndex}`}' 的 runtimePath 无效：${errorMessage(error)}`);
+      return;
+    }
+
+    let sourceAbsolutePath: string;
+    try {
+      sourceAbsolutePath = resolveInsideProject(projectRoot, runtimePath);
+    } catch (error) {
+      issues.push(`资产 '${id || `#${displayIndex}`}' 的 runtimePath 无效：${errorMessage(error)}`);
+      return;
+    }
+
+    if (!existsSync(sourceAbsolutePath)) {
+      missing.push({ id, runtimePath, reason: "file_not_found" });
+      issues.push(`runtime 资产不存在：${runtimePath}`);
+      return;
+    }
+    if (!statSync(sourceAbsolutePath).isFile()) {
+      missing.push({ id, runtimePath, reason: "not_a_file" });
+      issues.push(`runtime 资产不是普通文件：${runtimePath}`);
+      return;
+    }
+    try {
+      assertRuntimeAsset(sourceAbsolutePath, runtimePath);
+    } catch (error) {
+      issues.push(errorMessage(error));
+      return;
+    }
+
+    const extension = extname(runtimePath).toLowerCase();
+    const safeId = safeAssetId(id || basename(runtimePath, extension));
+    const destinationPath = `assets/resources/btp-art/${safeId}${extension}`;
+    let destinationAbsolutePath: string;
+    try {
+      destinationAbsolutePath = resolveInsideProject(projectRoot, destinationPath);
+    } catch (error) {
+      issues.push(`资产 '${id || `#${displayIndex}`}' 的目标路径无效：${errorMessage(error)}`);
+      return;
+    }
+    if (existsSync(destinationAbsolutePath) && !statSync(destinationAbsolutePath).isFile()) {
+      issues.push(`资产 '${id || `#${displayIndex}`}' 的目标路径不是普通文件：${destinationPath}`);
+      return;
+    }
+    const destinationKey = destinationPath.toLowerCase();
+    const existingDestination = destinations.get(destinationKey);
+    if (existingDestination) {
+      issues.push(
+        `资产 '${id || `#${displayIndex}`}' 与 '${existingDestination.assetId}' 产生重复目标路径 ${destinationPath}（第 ${existingDestination.index + 1}、${displayIndex} 项）。`
+      );
+      return;
+    }
+    destinations.set(destinationKey, { assetId: id || `#${displayIndex}`, index });
+    prepared.push({
+      ...asset,
+      id,
+      runtimePath,
+      sourceAbsolutePath,
+      destinationPath,
+      resourcePath: `btp-art/${safeId}`
+    });
+  });
+
+  if (issues.length > 0) {
+    throw new AssetImportValidationError(
+      `资产清单预检失败；未写入任何 runtime 资产：${issues.join("；")}`,
+      issues,
+      missing
+    );
+  }
+  return prepared;
+}
+
+function materializeAssetImport(input: {
+  projectRoot: string;
+  operationId: string;
+  manifestPath: string;
+  reportPath: string;
+  mapPath: string;
+  assets: PreparedManifestAsset[];
+}): {
+  imported: Array<Record<string, unknown>>;
+  assetMap: Record<string, string>;
+  evidence: CocosBridgeEvidence[];
+} {
+  const stagingRoot = mkdtempSync(join(tmpdir(), "btp-cocos-import-"));
+  try {
+    const assetMap: Record<string, string> = {};
+    const outputs: AssetImportOutput[] = [];
+    for (const [index, asset] of input.assets.entries()) {
+      const stagedPath = join(stagingRoot, `asset-${index}${extname(asset.destinationPath)}`);
+      copyFileSync(asset.sourceAbsolutePath, stagedPath);
+      outputs.push({ destinationPath: asset.destinationPath, stagedPath });
+      assetMap[asset.id] = asset.resourcePath;
+    }
+
+    const mapDocument = {
+      generatedBy: "Be The Producer Cocos Engine Bridge",
+      manifestPath: input.manifestPath,
+      assets: assetMap
+    };
+    outputs.push({ destinationPath: input.mapPath, content: `${JSON.stringify(mapDocument, null, 2)}\n` });
+
+    const imported = input.assets.map((asset) => {
+      const body = readFileSync(asset.sourceAbsolutePath);
+      return {
+        assetId: asset.id,
+        sourcePath: asset.runtimePath,
+        cocosPath: asset.destinationPath,
+        resourcePath: asset.resourcePath,
+        hash: createHash("sha256").update(body).digest("hex"),
+        sizeBytes: body.byteLength
+      };
+    });
+    const reportDocument = {
+      operationId: input.operationId,
+      operationType: "import_assets",
+      status: "completed",
+      createdAt: new Date().toISOString(),
+      manifestPath: input.manifestPath,
+      imported,
+      missing: [],
+      importMode: "copied_to_assets_resources",
+      note: "Cocos Creator AssetDB will perform the native import when the project is opened or built."
+    };
+    outputs.push({ destinationPath: input.reportPath, content: `${JSON.stringify(reportDocument, null, 2)}\n` });
+
+    // Validation and staging are complete before the first project file is touched.
+    const destinations = outputs.map((output, index) => {
+      const absolutePath = resolveInsideProject(input.projectRoot, output.destinationPath);
+      if (existsSync(absolutePath) && !statSync(absolutePath).isFile()) {
+        throw new Error(`Cocos 导入目标不是普通文件：${output.destinationPath}`);
+      }
+      const backupPath = existsSync(absolutePath) ? join(stagingRoot, `backup-${index}`) : undefined;
+      if (backupPath) {
+        copyFileSync(absolutePath, backupPath);
+      }
+      return { output, absolutePath, backupPath };
+    });
+
+    const touched: typeof destinations = [];
+    try {
+      for (const destination of destinations) {
+        ensureDirectoryInsideProject(input.projectRoot, dirname(destination.output.destinationPath));
+        const revalidated = resolveInsideProject(input.projectRoot, destination.output.destinationPath);
+        if (revalidated !== destination.absolutePath) {
+          throw new Error(`Cocos 导入目标在写入前发生变化：${destination.output.destinationPath}`);
+        }
+        touched.push(destination);
+        if (destination.output.stagedPath) {
+          copyFileSync(destination.output.stagedPath, destination.absolutePath);
+        } else {
+          writeFileSync(destination.absolutePath, destination.output.content ?? "", "utf8");
+        }
+      }
+    } catch (error) {
+      const rollbackErrors: string[] = [];
+      for (const destination of touched.reverse()) {
+        try {
+          if (destination.backupPath) {
+            copyFileSync(destination.backupPath, destination.absolutePath);
+          } else {
+            rmSync(destination.absolutePath, { force: true });
+          }
+        } catch (rollbackError) {
+          rollbackErrors.push(`${destination.output.destinationPath}: ${errorMessage(rollbackError)}`);
+        }
+      }
+      if (rollbackErrors.length > 0) {
+        throw new Error(`${errorMessage(error)}；回滚失败：${rollbackErrors.join("；")}`);
+      }
+      throw error;
+    }
+
+    return {
+      imported,
+      assetMap,
+      evidence: outputs.map((output) => fileEvidence(input.projectRoot, output.destinationPath))
+    };
+  } finally {
+    rmSync(stagingRoot, { recursive: true, force: true });
+  }
 }
 
 function assertRuntimeAsset(absolutePath: string, relativePath: string): void {
@@ -530,38 +812,75 @@ function assertRuntimeAsset(absolutePath: string, relativePath: string): void {
   }
 }
 
-function normalizeBlueprint(value: Record<string, unknown>): Record<string, unknown> & { sceneName: string; resolution: Record<string, unknown>; root: Record<string, unknown> } {
-  const scene = isRecord(value.scene) ? value.scene : {};
-  const sceneName = safeSceneName(stringValue(value.scene_name ?? value.sceneName ?? scene.name) || "MainGame");
-  const canvas = isRecord(value.canvas) ? value.canvas : isRecord(scene.canvas) ? scene.canvas : {};
-  const designResolution = isRecord(scene.designResolution) ? scene.designResolution : {};
-  const resolutionArray = Array.isArray(canvas.design_resolution) ? canvas.design_resolution : [];
-  const width = finiteNumber(designResolution.width ?? canvas.width ?? resolutionArray[0], 750);
-  const height = finiteNumber(designResolution.height ?? canvas.height ?? resolutionArray[1], 1334);
-  const hierarchy = isRecord(value.nodeHierarchy) ? value.nodeHierarchy : {};
-  const root = isRecord(hierarchy.root)
-    ? hierarchy.root
-    : isRecord(value.root)
-      ? value.root
-      : { name: "Canvas", children: Array.isArray(value.nodes) ? value.nodes : [] };
-  if (!stringValue(root.name)) {
-    root.name = "Canvas";
+function requireEntryScene(blueprint: SceneBlueprint): SceneDefinition {
+  const scene = blueprint.scenes.find((candidate) => candidate.sceneId === blueprint.entrySceneId);
+  if (!scene) {
+    throw new Error(`SceneBlueprint entrySceneId 无法解析：${blueprint.entrySceneId}`);
   }
-  return {
-    schemaVersion: 1,
-    generatedBy: "Be The Producer Cocos Engine Bridge",
-    sceneName,
-    resolution: {
-      width,
-      height,
-      fitWidth: booleanValue(designResolution.fitWidth ?? canvas.fit_width, true),
-      fitHeight: booleanValue(designResolution.fitHeight ?? canvas.fit_height, false)
-    },
-    root,
-    prefabs: value.prefabs ?? {},
-    scriptAttachmentMap: value.scriptAttachmentMap ?? value.scripts ?? {},
-    source: value
-  };
+  return scene;
+}
+
+function assertBridgeMaterializationSupported(blueprint: SceneBlueprint, entryScene: SceneDefinition): void {
+  const unsupported: string[] = [];
+  for (const node of entryScene.nodes) {
+    if (node.prefabId !== undefined) {
+      unsupported.push(
+        `entry scene '${entryScene.sceneId}' node '${node.nodeId}' uses prefabId '${node.prefabId}', but Prefab instantiation is not implemented`,
+      );
+    }
+    for (const component of node.components) {
+      for (const reference of component.references) {
+        const location = `${entryScene.sceneId}/${node.nodeId}/${component.componentId}.${reference.property}`;
+        if (reference.kind === "prefab") {
+          unsupported.push(
+            `entry scene reference '${location}' targets Prefab '${reference.prefabId}', but Prefab loading/binding is not implemented`,
+          );
+        } else if (reference.sceneId !== entryScene.sceneId) {
+          unsupported.push(
+            `entry scene reference '${location}' crosses into scene '${reference.sceneId}', but only the entry scene is materialized`,
+          );
+        }
+      }
+    }
+  }
+  if (blueprint.scenes.length !== 1) {
+    unsupported.push(
+      `blueprint declares ${blueprint.scenes.length} scenes; this bridge currently materializes exactly one entry scene`,
+    );
+  }
+  if (blueprint.prefabs.length > 0) {
+    unsupported.push(
+      `blueprint declares ${blueprint.prefabs.length} Prefab definition(s); Prefab import and instantiation are not implemented`,
+    );
+  }
+  if (unsupported.length > 0) {
+    throw new Error(
+      `SceneBlueprint 超出当前 Cocos Bridge 的可忠实物化边界，已 fail-closed：${unsupported.join("；")}。请先展开为单一 entry scene 的普通节点，或等待多场景/Prefab renderer。`,
+    );
+  }
+}
+
+function inferSceneResolution(scene: SceneDefinition): { width: number; height: number } {
+  const candidates = scene.nodes
+    .map((node) => node.transform.size)
+    .filter((size): size is [number, number] => Boolean(size && size[0] > 0 && size[1] > 0))
+    .sort((left, right) => right[0] * right[1] - left[0] * left[1]);
+  return { width: candidates[0]?.[0] ?? 750, height: candidates[0]?.[1] ?? 1334 };
+}
+
+function validateBridgeComponents(blueprint: SceneBlueprint, discovered: ScriptComponent[]): void {
+  const available = new Set(discovered.map((component) => component.className));
+  const builtIn = new Set(["Label", "Sprite", "Button", "AudioSource", "Camera", "UITransform"]);
+  for (const scene of blueprint.scenes) {
+    for (const node of scene.nodes) {
+      for (const component of node.components) {
+        const normalizedType = component.type.replace(/^cc\./, "");
+        if (!builtIn.has(normalizedType) && !available.has(component.type)) {
+          throw new Error(`SceneBlueprint 组件未在 assets/scripts 中发现：${scene.sceneId}/${node.nodeId}/${component.type}`);
+        }
+      }
+    }
+  }
 }
 
 function discoverScriptComponents(projectRoot: string): ScriptComponent[] {
@@ -590,13 +909,15 @@ function renderRuntimeBootstrap(components: ScriptComponent[]): string {
   const registry = components.map((component) => `  ${JSON.stringify(component.className)}: ${component.className},`).join("\n");
   return `import {
   _decorator,
+  AudioSource,
+  Button,
+  Camera,
   Color,
   Component,
   Graphics,
   JsonAsset,
   Label,
   Node,
-  Prefab,
   resources,
   Sprite,
   SpriteFrame,
@@ -610,51 +931,75 @@ ${imports}
 
 const { ccclass } = _decorator;
 
+type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
+
+interface BlueprintReference {
+  property: string;
+  kind: 'node' | 'component';
+  sceneId: string;
+  nodeId: string;
+  componentId?: string;
+}
+
+interface BlueprintBinding {
+  property: string;
+  source: {
+    type: 'input_action' | 'runtime_signal' | 'game_state';
+    ref: string;
+  };
+}
+
+interface BlueprintComponent {
+  componentId: string;
+  type: string;
+  properties: Record<string, JsonValue>;
+  bindings: BlueprintBinding[];
+  references: BlueprintReference[];
+}
+
 interface BlueprintNode {
-  name?: string;
-  id?: string;
-  type?: string;
-  text?: string;
-  active?: boolean;
-  asset_key?: string;
-  assetKey?: string;
-  components?: string[];
-  position?: { x?: number; y?: number } | [number, number];
-  size?: { width?: number; height?: number } | [number, number];
-  labelConfig?: { defaultText?: string; fontSize?: number; color?: string };
-  spriteConfig?: { defaultAsset?: string };
-  colorConfig?: { safe?: string; default?: string };
-  references?: Record<string, string>;
-  poolConfig?: { initialSize?: number; autoExpand?: boolean; expandIncrement?: number };
-  children?: BlueprintNode[];
+  nodeId: string;
+  testId: string;
+  name: string;
+  kind: 'container' | 'sprite' | 'label' | 'button' | 'camera' | 'audio' | 'custom';
+  parentNodeId?: string;
+  transform: {
+    position: [number, number];
+    rotation: number;
+    scale: [number, number];
+    size?: [number, number];
+  };
+  components: BlueprintComponent[];
+}
+
+interface BlueprintScene {
+  sceneId: string;
+  nodes: BlueprintNode[];
 }
 
 interface RuntimeBlueprint {
-  resolution?: { width?: number; height?: number; fitWidth?: boolean; fitHeight?: boolean };
-  root?: BlueprintNode;
+  entrySceneId: string;
+  scenes: BlueprintScene[];
 }
 
 const componentRegistry: Record<string, new () => Component> = {
 ${registry}
 };
 
-const assetAliases: Record<string, string> = {
-  background: 'background',
-  basket: 'basket_body',
-  basketrim: 'basket_body',
-  basketshadow: 'basket_shadow',
-  joystickbase: 'joystick_base',
-  joystickthumb: 'joystick_cap',
-  hud: 'hud_panel',
-  retrybutton: 'button_normal',
-  playagainbutton: 'button_normal',
-  yarnball: 'yarn_ball_base',
-  yarnballsprite: 'yarn_ball_base',
+const builtInRegistry: Record<string, new () => Component> = {
+  AudioSource,
+  Button,
+  Camera,
+  Label,
+  Sprite,
+  UITransform,
 };
 
 @ccclass('BtpRuntimeBootstrap')
 export class BtpRuntimeBootstrap extends Component {
-  private pendingBindings: Array<{ node: Node; spec: BlueprintNode; componentName: string; component: Component }> = [];
+  private readonly nodes = new Map<string, Node>();
+  private readonly attached = new Map<string, Component>();
+  private pendingBindings: Array<{ sceneId: string; spec: BlueprintComponent; component: Component }> = [];
 
   start(): void {
     resources.load('btp/scene-blueprint', JsonAsset, (error, asset) => {
@@ -663,17 +1008,32 @@ export class BtpRuntimeBootstrap extends Component {
         return;
       }
       const blueprint = asset.json as RuntimeBlueprint;
-      const resolution = blueprint.resolution ?? {};
-      view.setDesignResolutionSize(
-        resolution.width ?? 750,
-        resolution.height ?? 1334,
-        ResolutionPolicy.SHOW_ALL
-      );
-      this.pendingBindings.length = 0;
-      for (const child of blueprint.root?.children ?? []) {
-        this.materializeNode(child, this.node);
+      const scene = blueprint.scenes.find((candidate) => candidate.sceneId === blueprint.entrySceneId);
+      if (!scene) {
+        console.error('[BTP Bridge] entry scene missing', blueprint.entrySceneId);
+        return;
       }
-      this.wireRuntimeBindings();
+      const resolution = this.inferResolution(scene.nodes);
+      view.setDesignResolutionSize(resolution[0], resolution[1], ResolutionPolicy.SHOW_ALL);
+      this.nodes.clear();
+      this.attached.clear();
+      this.pendingBindings.length = 0;
+      const pending = [...scene.nodes];
+      while (pending.length > 0) {
+        const before = pending.length;
+        for (let index = pending.length - 1; index >= 0; index -= 1) {
+          const spec = pending[index];
+          const parent = spec.parentNodeId ? this.nodes.get(this.nodeKey(scene.sceneId, spec.parentNodeId)) : this.node;
+          if (!parent) continue;
+          this.materializeNode(scene.sceneId, spec, parent);
+          pending.splice(index, 1);
+        }
+        if (pending.length === before) {
+          console.error('[BTP Bridge] unresolved node parents', pending.map((candidate) => candidate.nodeId));
+          return;
+        }
+      }
+      this.applyRuntimeProperties();
       console.info('[BTP Bridge] scene blueprint materialized', {
         rootChildren: this.node.children.length,
         componentBindings: this.pendingBindings.length,
@@ -681,58 +1041,62 @@ export class BtpRuntimeBootstrap extends Component {
     });
   }
 
-  private materializeNode(spec: BlueprintNode, parent: Node): Node {
-    const node = new Node(spec.name ?? spec.id ?? 'Node');
+  private materializeNode(sceneId: string, spec: BlueprintNode, parent: Node): Node {
+    const node = new Node(spec.name);
     parent.addChild(node);
     node.layer = parent.layer;
-    node.active = spec.active !== false;
-    const [x, y] = Array.isArray(spec.position)
-      ? [Number(spec.position[0] ?? 0), Number(spec.position[1] ?? 0)]
-      : [Number(spec.position?.x ?? 0), Number(spec.position?.y ?? 0)];
+    const [x, y] = spec.transform.position;
     node.setPosition(new Vec3(x, y, 0));
-    const [width, height] = Array.isArray(spec.size)
-      ? [Number(spec.size[0] ?? 100), Number(spec.size[1] ?? 100)]
-      : [Number(spec.size?.width ?? 100), Number(spec.size?.height ?? 100)];
-    const transform = node.addComponent(UITransform);
-    transform.setContentSize(width, height);
-
-    const components = new Set(spec.components ?? []);
-    if (spec.type === 'Label' || components.has('cc.Label')) {
-      const label = node.addComponent(Label);
-      label.string = spec.text ?? spec.labelConfig?.defaultText ?? node.name;
-      label.color = this.parseColor(spec.labelConfig?.color, new Color(38, 42, 40, 255));
-      label.fontSize = Number(spec.labelConfig?.fontSize) || Math.max(20, Math.min(48, Math.round(height * 0.5)));
-      label.lineHeight = Math.round(label.fontSize * 1.2);
-    } else if (spec.type === 'Sprite' || components.has('cc.Sprite')) {
-      const sprite = node.addComponent(Sprite);
-      sprite.sizeMode = Sprite.SizeMode.CUSTOM;
-      const assetKey = this.resolveAssetKey(spec);
-      const fallback = this.createFallback(node, width, height, spec);
-      if (assetKey) {
-        this.loadTexture(assetKey, (error, texture) => {
-          if (!error && texture && sprite.isValid) {
-            const frame = new SpriteFrame();
-            frame.texture = texture;
-            sprite.spriteFrame = frame;
-            fallback.destroy();
-          } else {
-            console.warn('[BTP Bridge] sprite load failed, keeping fallback:', assetKey, error);
-          }
-        });
-      }
-    }
-
-    for (const componentName of components) {
-      const ComponentType = componentRegistry[componentName];
-      if (ComponentType && !node.getComponent(ComponentType)) {
-        const component = node.addComponent(ComponentType);
-        this.pendingBindings.push({ node, spec, componentName, component });
-      }
-    }
-    for (const child of spec.children ?? []) {
-      this.materializeNode(child, node);
-    }
+    node.setRotationFromEuler(0, 0, spec.transform.rotation);
+    node.setScale(new Vec3(spec.transform.scale[0], spec.transform.scale[1], 1));
+    const [width, height] = spec.transform.size ?? [100, 100];
+    node.addComponent(UITransform).setContentSize(width, height);
+    this.nodes.set(this.nodeKey(sceneId, spec.nodeId), node);
+    this.setNodeMetadata(node, spec.testId, spec.kind);
+    for (const componentSpec of spec.components) this.attachComponent(sceneId, spec.nodeId, node, componentSpec, width, height);
     return node;
+  }
+
+  private attachComponent(
+    sceneId: string,
+    nodeId: string,
+    node: Node,
+    spec: BlueprintComponent,
+    width: number,
+    height: number
+  ): void {
+    const normalizedType = spec.type.replace(/^cc\./, '');
+    const ComponentType = builtInRegistry[normalizedType] ?? componentRegistry[spec.type];
+    if (!ComponentType) {
+      console.error('[BTP Bridge] component is not registered', spec.type);
+      return;
+    }
+    const component = normalizedType === 'UITransform'
+      ? node.getComponent(UITransform) ?? node.addComponent(UITransform)
+      : node.getComponent(ComponentType) ?? node.addComponent(ComponentType);
+    if (component instanceof Sprite) {
+      component.sizeMode = Sprite.SizeMode.CUSTOM;
+      this.configureSprite(node, component, spec.properties, width, height);
+    }
+    this.attached.set(this.componentKey(sceneId, nodeId, spec.componentId), component);
+    this.pendingBindings.push({ sceneId, spec, component });
+  }
+
+  private configureSprite(node: Node, sprite: Sprite, properties: Record<string, JsonValue>, width: number, height: number): void {
+    const assetKey = typeof properties.assetKey === 'string' ? properties.assetKey : undefined;
+    const fallbackColor = typeof properties.fallbackColor === 'string' ? properties.fallbackColor : undefined;
+    const fallback = this.createFallback(node, width, height, fallbackColor);
+    if (!assetKey) return;
+    this.loadTexture(assetKey, (error, texture) => {
+      if (!error && texture && sprite.isValid) {
+        const frame = new SpriteFrame();
+        frame.texture = texture;
+        sprite.spriteFrame = frame;
+        fallback.destroy();
+      } else {
+        console.warn('[BTP Bridge] sprite load failed, keeping fallback:', assetKey, error);
+      }
+    });
   }
 
   private loadTexture(assetKey: string, done: (error: Error | null, texture?: Texture2D) => void): void {
@@ -752,103 +1116,80 @@ export class BtpRuntimeBootstrap extends Component {
     });
   }
 
-  private resolveAssetKey(spec: BlueprintNode): string | undefined {
-    const explicit = spec.asset_key ?? spec.assetKey ?? spec.spriteConfig?.defaultAsset;
-    if (explicit) {
-      const normalized = explicit.replace(/\\\\/g, '/').split('/').pop()?.replace(/\.[^.]+$/, '');
-      if (normalized) return normalized;
-    }
-    return assetAliases[(spec.name ?? spec.id ?? '').replace(/[^A-Za-z0-9]/g, '').toLowerCase()];
-  }
-
-  private createFallback(node: Node, width: number, height: number, spec: BlueprintNode): Node {
+  private createFallback(node: Node, width: number, height: number, color: string | undefined): Node {
     const fallback = new Node('__btp_fallback');
     node.addChild(fallback);
     fallback.layer = node.layer;
     fallback.addComponent(UITransform).setContentSize(width, height);
     const graphics = fallback.addComponent(Graphics);
-    const name = (spec.name ?? '').toLowerCase();
-    const defaultColor = name.includes('background')
-      ? new Color(255, 248, 240, 255)
-      : name.includes('basket')
-        ? new Color(191, 126, 79, 255)
-        : name.includes('joystick')
-          ? new Color(73, 144, 120, 150)
-          : name.includes('yarn')
-            ? new Color(242, 166, 184, 255)
-            : new Color(170, 170, 170, 220);
-    graphics.fillColor = this.parseColor(spec.colorConfig?.safe ?? spec.colorConfig?.default, defaultColor);
+    graphics.fillColor = this.parseColor(color, new Color(170, 170, 170, 220));
     graphics.roundRect(-width / 2, -height / 2, width, height, Math.min(18, width / 4, height / 4));
     graphics.fill();
     return fallback;
   }
 
-  private wireRuntimeBindings(): void {
+  private applyRuntimeProperties(): void {
     for (const binding of this.pendingBindings) {
       const target = binding.component as Component & Record<string, unknown>;
-      for (const [property, path] of Object.entries(binding.spec.references ?? {})) {
-        target[property] = this.findNode(path);
+      for (const [property, value] of Object.entries(binding.spec.properties)) {
+        if (property === 'assetKey' || property === 'fallbackColor') continue;
+        this.applyComponentProperty(target, property, value);
       }
-
-      if (binding.componentName === 'BasketController') {
-        target.basketRim = binding.node.getChildByName('BasketRim');
-      } else if (binding.componentName === 'JoystickInput') {
-        target.joystickBase = binding.node.getChildByName('JoystickBase');
-        target.joystickThumb = binding.node.getChildByName('JoystickThumb');
-        target._basketController = this.findNode('Canvas/GameLayer/Basket')?.getComponent(componentRegistry.BasketController);
-      } else if (binding.componentName === 'HUDManager') {
-        target.timerLabel = binding.node.getChildByName('TimerLabel')?.getComponent(Label);
-        target.interceptionLabel = binding.node.getChildByName('InterceptionCount')?.getComponent(Label);
-        target.phaseLabel = binding.node.getChildByName('PhaseIndicator')?.getComponent(Label);
-        const indicator = binding.node.getChildByName('ErrorIndicator');
-        target.errorDot1 = indicator?.getChildByName('ErrorDot1') ?? null;
-        target.errorDot2 = indicator?.getChildByName('ErrorDot2') ?? null;
-      } else if (binding.componentName === 'ObjectPool') {
-        const pool = binding.spec.poolConfig ?? {};
-        target.initialSize = Number(pool.initialSize) || 10;
-        target.autoExpand = pool.autoExpand !== false;
-        target.expandIncrement = Number(pool.expandIncrement) || 2;
-        target.yarnBallPrefab = this.createYarnBallPrefab(binding.node.layer);
-      } else if (binding.componentName === 'GameController') {
-        target.objectPoolNode = this.findNode('Canvas/Managers/ObjectPool');
-        target.audioManager = this.findNode('Canvas/Managers/AudioManager');
-        target.scoreManager = this.findNode('Canvas/Managers/ScoreManager');
-        const basketNode = target.basketNode as Node | null;
-        const objectPoolNode = target.objectPoolNode as Node | null;
-        target._basketController = basketNode?.getComponent(componentRegistry.BasketController) ?? null;
-        target._objectPool = objectPoolNode?.getComponent(componentRegistry.ObjectPool) ?? null;
+      for (const propertyBinding of binding.spec.bindings) {
+        target[propertyBinding.property] = propertyBinding.source.ref;
+      }
+      for (const reference of binding.spec.references) {
+        target[reference.property] = this.resolveReference(binding.sceneId, reference);
       }
     }
   }
 
-  private createYarnBallPrefab(layer: number): Prefab {
-    const template = new Node('YarnBall');
-    template.layer = layer;
-    template.addComponent(UITransform).setContentSize(56, 56);
-    const graphics = template.addComponent(Graphics);
-    graphics.fillColor = new Color(242, 166, 184, 255);
-    graphics.circle(0, 0, 28);
-    graphics.fill();
-    const ControllerType = componentRegistry.YarnBallController;
-    if (ControllerType) {
-      template.addComponent(ControllerType);
+  private applyComponentProperty(target: Component & Record<string, unknown>, property: string, value: JsonValue): void {
+    if (property === 'color' && typeof value === 'string') {
+      target[property] = this.parseColor(value, new Color(255, 255, 255, 255));
+      return;
     }
-    const prefab = new Prefab();
-    prefab.data = template;
-    return prefab;
+    target[property] = value;
   }
 
-  private findNode(path: string): Node | null {
-    const segments = path.replace(/\\\\/g, '/').split('/').filter(Boolean);
-    if (segments[0] === this.node.name || segments[0] === 'Canvas') {
-      segments.shift();
+  private resolveReference(currentSceneId: string, reference: BlueprintReference): Node | Component {
+    if (reference.sceneId !== currentSceneId) {
+      throw new Error('[BTP Bridge] cross-scene reference reached the single-scene runtime: ' + reference.sceneId);
     }
-    let current: Node | null = this.node;
-    for (const segment of segments) {
-      current = current?.getChildByName(segment) ?? null;
-      if (!current) return null;
+    if (reference.kind === 'node') {
+      const node = this.nodes.get(this.nodeKey(currentSceneId, reference.nodeId));
+      if (!node) throw new Error('[BTP Bridge] node reference was not materialized: ' + reference.nodeId);
+      return node;
     }
-    return current;
+    if (!reference.componentId) {
+      throw new Error('[BTP Bridge] component reference is missing componentId: ' + reference.nodeId);
+    }
+    const component = this.attached.get(this.componentKey(currentSceneId, reference.nodeId, reference.componentId));
+    if (!component) {
+      throw new Error('[BTP Bridge] component reference was not materialized: ' + reference.nodeId + '/' + reference.componentId);
+    }
+    return component;
+  }
+
+  private inferResolution(nodes: BlueprintNode[]): [number, number] {
+    return nodes
+      .map((candidate) => candidate.transform.size)
+      .filter((size): size is [number, number] => Boolean(size && size[0] > 0 && size[1] > 0))
+      .sort((left, right) => right[0] * right[1] - left[0] * left[1])[0] ?? [750, 1334];
+  }
+
+  private nodeKey(sceneId: string, nodeId: string): string {
+    return sceneId + '/' + nodeId;
+  }
+
+  private componentKey(sceneId: string, nodeId: string, componentId: string): string {
+    return sceneId + '/' + nodeId + '/' + componentId;
+  }
+
+  private setNodeMetadata(node: Node, testId: string, kind: BlueprintNode['kind']): void {
+    const metadataNode = node as Node & { __btpTestId?: string; __btpKind?: BlueprintNode['kind'] };
+    metadataNode.__btpTestId = testId;
+    metadataNode.__btpKind = kind;
   }
 
   private parseColor(value: string | undefined, fallback: Color): Color {
@@ -1048,7 +1389,7 @@ function buildOptionsInline(platform: string, debug: boolean, outputDir: string,
 }
 
 function buildOptionsFromConfig(projectRoot: string, configPath: string, logAbsolute: string): string {
-  const absoluteConfig = isAbsolute(configPath) ? resolve(configPath) : resolveInsideProject(projectRoot, configPath);
+  const absoluteConfig = resolveInsideProject(projectRoot, configPath);
   if (!existsSync(absoluteConfig) || !statSync(absoluteConfig).isFile()) {
     throw new Error(`Cocos 构建配置不存在：${configPath}`);
   }
@@ -1071,6 +1412,42 @@ function listProjectFiles(
     .sort();
 }
 
+function createDirectoryManifest(
+  projectRoot: string,
+  rootPath: string,
+  files: string[]
+): ArtifactDirectoryManifest {
+  const entries = files
+    .map((path) => fileEvidence(projectRoot, path))
+    .map(({ path, hash, sizeBytes }) => ({ path, hash, sizeBytes }))
+    .sort((left, right) => left.path.localeCompare(right.path));
+  return {
+    schemaVersion: 1,
+    rootPath: normalizeRelativePath(rootPath).replace(/\/+$/, ""),
+    files: entries,
+    digest: createHash("sha256").update(canonicalManifestBytes(entries)).digest("hex")
+  };
+}
+
+function canonicalManifestBytes(entries: Array<{ path: string; hash: string; sizeBytes: number }>): string {
+  return entries.map((entry) => `${entry.path}\0${entry.sizeBytes}\0${entry.hash}\n`).join("");
+}
+
+/**
+ * Child processes only receive operating-system essentials. Project/model/API
+ * secrets (BTP_*, *_TOKEN, *_KEY, *_SECRET, credentials) are intentionally not
+ * inherited by Creator or project-controlled build hooks.
+ */
+export function minimalCreatorEnvironment(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const environment: NodeJS.ProcessEnv = {};
+  for (const key of ["PATH", "HOME", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "USERPROFILE", "SystemRoot", "WINDIR"]) {
+    const value = source[key];
+    if (value) environment[key] = value;
+  }
+  environment.CI = "1";
+  return environment;
+}
+
 function listAbsoluteFiles(root: string): string[] {
   if (!existsSync(root)) {
     return [];
@@ -1081,7 +1458,10 @@ function listAbsoluteFiles(root: string): string[] {
   const files: string[] = [];
   const visit = (directory: string): void => {
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
-      if (entry.isSymbolicLink() || [".git", ".be-the-producer", "node_modules", "library", "temp"].includes(entry.name)) {
+      if (entry.isSymbolicLink()) {
+        throw new Error(`Cocos 项目枚举拒绝符号链接：${join(directory, entry.name)}`);
+      }
+      if ([".git", ".be-the-producer", "node_modules", "library", "temp"].includes(entry.name)) {
         continue;
       }
       const path = join(directory, entry.name);
@@ -1098,20 +1478,42 @@ function listAbsoluteFiles(root: string): string[] {
 
 function resolveInsideProject(projectRoot: string, path: string): string {
   const relativePath = normalizeRelativePath(path);
-  const absolutePath = resolve(projectRoot, relativePath);
-  const inside = relative(projectRoot, absolutePath);
-  if (inside.startsWith("..") || isAbsolute(inside)) {
-    throw new Error(`路径超出 Cocos 项目根目录：${path}`);
-  }
-  return absolutePath;
+  return resolvePathWithinRoot(projectRoot, relativePath, {
+    allowMissing: true,
+    label: "Cocos 项目路径"
+  }).absolutePath;
 }
 
 function normalizeRelativePath(path: string): string {
-  const cleaned = normalize(path.trim().replace(/^\.\/+/, ""));
-  if (!cleaned || isAbsolute(cleaned) || cleaned === ".." || cleaned.startsWith(`..${sep}`) || cleaned.includes(`${sep}..${sep}`)) {
-    throw new Error(`不安全的 Cocos 项目路径：${path}`);
+  return normalizeRelativePathWithinRoot(path, { label: "Cocos 项目路径" });
+}
+
+function ensureDirectoryInsideProject(projectRoot: string, path: string): string {
+  const relativePath = path === "." ? "." : normalizeRelativePath(path);
+  let resolved = resolvePathWithinRoot(projectRoot, relativePath, {
+    allowMissing: true,
+    allowRoot: true,
+    expectedKind: "directory",
+    label: "Cocos 项目目录"
+  });
+  mkdirSync(resolved.absolutePath, { recursive: true });
+  resolved = resolvePathWithinRoot(projectRoot, relativePath, {
+    allowMissing: false,
+    allowRoot: true,
+    expectedKind: "directory",
+    label: "Cocos 项目目录"
+  });
+  return resolved.absolutePath;
+}
+
+function assertWritableProjectTargets(projectRoot: string, paths: string[]): void {
+  for (const path of paths) {
+    resolvePathWithinRoot(projectRoot, normalizeRelativePath(path), {
+      allowMissing: true,
+      expectedKind: "file",
+      label: "Cocos 写入目标"
+    });
   }
-  return cleaned.split(sep).join("/");
 }
 
 function normalizeScenePath(path: string): string {
@@ -1163,11 +1565,6 @@ function compressUuid(uuid: string): string {
   return output;
 }
 
-function countBlueprintNodes(root: Record<string, unknown>): number {
-  const children = Array.isArray(root.children) ? root.children.filter(isRecord) : [];
-  return 1 + children.reduce((total, child) => total + countBlueprintNodes(child), 0);
-}
-
 function nestedString(value: Record<string, unknown>, path: string[]): string {
   let current: unknown = value;
   for (const segment of path) {
@@ -1176,20 +1573,12 @@ function nestedString(value: Record<string, unknown>, path: string[]): string {
   return stringValue(current);
 }
 
-function safeSceneName(value: string): string {
-  return value.replace(/[^A-Za-z0-9_-]/g, "_").replace(/^_+|_+$/g, "").slice(0, 64) || "MainGame";
-}
-
 function safeAssetId(value: string): string {
   return value.replace(/[^A-Za-z0-9_-]/g, "_").replace(/^_+|_+$/g, "").slice(0, 96) || "asset";
 }
 
 function finiteNumber(value: unknown, fallback: number): number {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
-}
-
-function booleanValue(value: unknown, fallback: boolean): boolean {
-  return typeof value === "boolean" ? value : fallback;
 }
 
 function stringValue(value: unknown): string {
@@ -1201,6 +1590,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function errorMessage(error: unknown): string {
+  if (error instanceof ContractValidationError) {
+    return `${error.message}：${error.issues.slice(0, 12).map((issue) => `${issue.path} ${issue.message}`).join("；")}`;
+  }
   return error instanceof Error ? error.message : String(error);
 }
 

@@ -9,6 +9,22 @@ const root = mkdtempSync(join(tmpdir(), "btp-asset-raster-"));
 const sourcePath = "assets/art/source.svg";
 const outputPath = "assets/art/source.png";
 const operationLog = join(root, "operations.jsonl");
+const authorization = {
+  mode: "task",
+  taskId: "task_asset_raster",
+  inputArtifactIds: ["artifact_svg"],
+  outputArtifactIds: [],
+  artifacts: [{
+    artifactId: "artifact_svg",
+    type: "asset",
+    path: sourcePath,
+    ownerAgentId: "asset_production",
+    sourceTaskId: "task_asset_raster"
+  }],
+  readRoots: [],
+  serviceReadPaths: [],
+  serviceWritePaths: [outputPath]
+};
 mkdirSync(join(root, "assets/art"), { recursive: true });
 writeFileSync(
   join(root, sourcePath),
@@ -20,8 +36,8 @@ const child = spawn(process.execPath, [resolve("apps/api/dist/harnessMcpServer.j
     ...process.env,
     BTP_PROJECT_ROOT: root,
     BTP_AGENT_ID: "asset_production",
-    BTP_ALLOWED_ROOTS: JSON.stringify(["assets/art"]),
-    BTP_EXPECTED_PATHS: "[]",
+    BTP_TOOL_MODE: "task",
+    BTP_AUTHORIZATION: JSON.stringify(authorization),
     BTP_OPERATION_LOG_PATH: operationLog
   },
   stdio: ["pipe", "pipe", "pipe"]

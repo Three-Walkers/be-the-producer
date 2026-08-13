@@ -1,5 +1,13 @@
-import { createRestartedStudioKernel, createStudioKernel, defaultAgentContracts, LocalAgentRuntime, type StudioKernel } from "@game-pipeline/agent-runtime";
+import {
+  createRestartedStudioKernel,
+  createStudioKernel,
+  defaultAgentContracts,
+  LocalAgentRuntime,
+  type GateEvidencePolicy,
+  type StudioKernel
+} from "@game-pipeline/agent-runtime";
 import type { AgentId, AgentLoopState, MessageType, Room, RoomKind, StudioMessage } from "@game-pipeline/shared-schemas";
+import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { dirname } from "node:path";
 import { verifyProjectClaims } from "./claimVerifier.js";
@@ -8,8 +16,9 @@ import { migrateLegacyClaimRepairStorm } from "./claimRepairMigration.js";
 import { AgentLoopService } from "./agentLoop.js";
 import { finalizeMessageActivity, recordServerToolActivity } from "./agentActivity.js";
 import { ModelAgentRuntime } from "./modelAgentRuntime.js";
-import { ProjectPersistenceStore, type ProjectSummary } from "./projectPersistence.js";
+import { ProjectPersistenceStore, type ProjectStateRepository, type ProjectSummary } from "./projectPersistence.js";
 import { reconcileQaPlaytestResults } from "./qaResultIngestion.js";
+import { apiGateEvidencePolicy } from "./gateEvidencePolicy.js";
 import { executeAgentToolRequests } from "./toolExecutor.js";
 import {
   deleteProjectWorkspace,
@@ -39,14 +48,25 @@ export interface PostMessageInput {
   mentions?: string[];
 }
 
+export interface StudioProjectStoreDependencies {
+  persistence?: ProjectStateRepository;
+  localRuntime?: LocalAgentRuntime;
+  modelRuntime?: ModelAgentRuntime;
+}
+
 export class StudioProjectStore {
   private readonly projects = new Map<string, StudioKernel>();
-  private readonly runtime = new LocalAgentRuntime();
-  private readonly modelRuntime = new ModelAgentRuntime();
-  private readonly persistence = new ProjectPersistenceStore();
+  private readonly runtime: LocalAgentRuntime;
+  private readonly modelRuntime: ModelAgentRuntime;
+  private readonly persistence: ProjectStateRepository;
   private readonly agentLoop: AgentLoopService;
+  private readonly gateEvidencePolicy: GateEvidencePolicy;
 
-  constructor() {
+  constructor(dependencies: StudioProjectStoreDependencies = {}) {
+    this.gateEvidencePolicy = apiGateEvidencePolicy;
+    this.runtime = dependencies.localRuntime ?? new LocalAgentRuntime({ gateEvidencePolicy: this.gateEvidencePolicy });
+    this.modelRuntime = dependencies.modelRuntime ?? new ModelAgentRuntime();
+    this.persistence = dependencies.persistence ?? new ProjectPersistenceStore();
     this.agentLoop = new AgentLoopService({
       getKernel: (projectId) => this.getKernel(projectId),
       checkpoint: (kernel) => {
@@ -89,7 +109,7 @@ export class StudioProjectStore {
     workspace: WorkspaceSyncResult;
     bootstrap?: ReturnType<LocalAgentRuntime["handleProducerMessage"]>;
   } {
-    const projectId = `game_${Date.now().toString(36)}`;
+    const projectId = `game_${Date.now().toString(36)}_${randomUUID().slice(0, 8)}`;
     const kernel = createStudioKernel(projectId, input.name, input.producerId ?? "producer_local", input.idea);
     this.projects.set(projectId, kernel);
     this.persistence.save(kernel);
@@ -319,6 +339,7 @@ export class StudioProjectStore {
 
     const runtimeOptions = {
       scriptedReplies: options.scriptedReplies,
+      gateEvidencePolicy: this.gateEvidencePolicy,
       ...(options.protocolFlows === undefined ? {} : { protocolFlows: options.protocolFlows }),
       ...(options.bootstrapProjectState === undefined ? {} : { bootstrapProjectState: options.bootstrapProjectState })
     };
