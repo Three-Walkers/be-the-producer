@@ -1,10 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
-import { dirname, extname, join, normalize, relative, resolve, sep } from "node:path";
+import { dirname, extname, join, resolve } from "node:path";
 import { chromium, type Browser, type Page } from "playwright-core";
 import { CocosEngineBridge, type CocosBridgeEvidence } from "./cocosEngineBridge.js";
 import type { CocosEngineConfig } from "./cocosEngineSettings.js";
+import { loadPlaytestContract, type LoadedPlaytestContract } from "./playtestContractLoader.js";
+import { runPlaytestContract, type PlaytestContractRunResult } from "./playtestContractRunner.js";
 import {
   renderPlaytestMarker,
   type PlaytestCheckResult,
@@ -13,6 +15,10 @@ import {
   type PlaytestVerdict
 } from "./playtestEvidence.js";
 import { writeQaPlaytestReceipt } from "./qaPlaytestReceipt.js";
+import { BrowserRuntimeAdapter } from "./runtimeAdapterBrowser.js";
+import { BTP_PLAYTEST_PROTOCOL_VERSION } from "./runtimeAdapter.js";
+import type { ArtifactInputProvenance } from "@game-pipeline/shared-schemas";
+import { normalizeRelativePathWithinRoot, resolvePathWithinRoot } from "./pathSafety.js";
 
 export interface CocosPlaytestInput {
   previewUrl?: string;
@@ -20,6 +26,9 @@ export interface CocosPlaytestInput {
   maxDurationSec?: number;
   viewport?: { width: number; height: number };
   reportPath?: string;
+  playtestContractPath?: string;
+  adapterMode?: "auto" | "contract" | "legacy_yarn_v1";
+  taskInputEvidence?: ArtifactInputProvenance[];
 }
 
 export interface CocosPlaytestResult extends PlaytestReportEvidence {
@@ -82,8 +91,19 @@ export class CocosPlaytestHarness {
     let playing: RuntimeSnapshot | undefined;
     let terminal: RuntimeSnapshot | undefined;
     let restarted: RuntimeSnapshot | undefined;
+    let loadedContract: LoadedPlaytestContract | undefined;
+
+    if (input.adapterMode !== "legacy_yarn_v1" && (!input.taskInputEvidence || input.taskInputEvidence.length === 0)) {
+      throw new Error("生产 Playtest 必须携带由 Orchestrator 冻结的当前 task input receipt；仅 legacy_yarn_v1 fixture 可省略。");
+    }
 
     try {
+      loadedContract = input.adapterMode === "legacy_yarn_v1"
+        ? undefined
+        : loadPlaytestContract(this.projectRoot, input.playtestContractPath);
+      if (input.adapterMode === "contract" && !loadedContract) {
+        throw new Error("已要求 contract 模式，但项目没有 PlaytestContract。");
+      }
       let previewUrl = input.previewUrl?.trim();
       if (!input.skipBuild) {
         const outputDir = `shared/build-artifacts/playtest/${operationId}`;
@@ -123,6 +143,26 @@ export class CocosPlaytestHarness {
       }, undefined, { timeout: 30_000 });
       await page.waitForTimeout(1_000);
 
+      if (loadedContract) {
+        return await this.runContractMode({
+          page,
+          loadedContract,
+          operationId,
+          reportPath,
+          runRoot,
+          startedAt,
+          ...(buildOperationId ? { buildOperationId } : {}),
+          evidencePaths,
+          checks,
+          defects,
+          consoleLines,
+          taskInputEvidence: input.taskInputEvidence ?? []
+        });
+      }
+
+      // Explicit legacy adapter for pre-contract yarn defence projects. Any
+      // present contract always takes the path above; handshake errors never
+      // fall through to this compatibility implementation.
       initial = await captureRuntimeSnapshot(page);
       evidencePaths.push(await captureScreenshot(page, this.projectRoot, `${runRoot}/01-initial.png`));
       addCheck(checks, "launch", "游戏可启动", "passed", `Cocos 场景已加载，初始状态为 ${initial.state ?? "unknown"}。`);
@@ -272,7 +312,7 @@ export class CocosPlaytestHarness {
         reportPath,
         evidence
       };
-      writeQaPlaytestReceipt(this.projectRoot, reportPath, machineResult, evidence);
+      writeQaPlaytestReceipt(this.projectRoot, reportPath, machineResult, evidence, input.taskInputEvidence ?? []);
       return result;
     } catch (error) {
       const completedAt = new Date().toISOString();
@@ -288,7 +328,21 @@ export class CocosPlaytestHarness {
       });
       defects.push(blockedDefect);
       checks.push({ checkId: "playtest_infrastructure", label: "试玩基础设施可用", status: "blocked", details });
+      const blockedContract = loadedContract
+        ? {
+            schemaVersion: "1.0.0" as const,
+            playtestId: loadedContract.contract.playtestId,
+            revision: loadedContract.contract.revision,
+            path: loadedContract.path,
+            hash: loadedContract.hash,
+            sizeBytes: loadedContract.sizeBytes,
+            runtimeProtocol: BTP_PLAYTEST_PROTOCOL_VERSION,
+            adapterMode: "runtime_adapter" as const,
+            hashVerified: false
+          }
+        : undefined;
       const machineResult: PlaytestReportEvidence = {
+        ...(blockedContract ? { schemaVersion: 2 as const } : {}),
         operationId,
         verdict: "blocked",
         completedAt,
@@ -296,6 +350,7 @@ export class CocosPlaytestHarness {
         checks,
         defects,
         evidencePaths,
+        ...(blockedContract ? { contract: blockedContract, scenarios: [] } : {}),
         runtime: { consoleErrorCount: 0, durationMs: Date.now() - startedAt }
       };
       writeTextEvidence(this.projectRoot, reportPath, renderMarkdownReport(machineResult));
@@ -307,7 +362,7 @@ export class CocosPlaytestHarness {
         reportPath,
         evidence
       };
-      writeQaPlaytestReceipt(this.projectRoot, reportPath, machineResult, evidence);
+      writeQaPlaytestReceipt(this.projectRoot, reportPath, machineResult, evidence, input.taskInputEvidence ?? []);
       return result;
     } finally {
       await browser?.close().catch(() => undefined);
@@ -315,6 +370,260 @@ export class CocosPlaytestHarness {
         await new Promise<void>((resolveClose) => staticServer?.close(() => resolveClose()));
       }
     }
+  }
+
+  private async runContractMode(input: {
+    page: Page;
+    loadedContract: LoadedPlaytestContract;
+    operationId: string;
+    reportPath: string;
+    runRoot: string;
+    startedAt: number;
+    buildOperationId?: string;
+    evidencePaths: string[];
+    checks: PlaytestCheckResult[];
+    defects: PlaytestDefect[];
+    consoleLines: string[];
+    taskInputEvidence: ArtifactInputProvenance[];
+  }): Promise<CocosPlaytestResult> {
+    const adapter = await BrowserRuntimeAdapter.connect(input.page);
+    addCheck(input.checks, "launch", "游戏可启动", "passed", "Cocos 场景已加载并发现 Playtest Runtime Adapter。");
+
+    let run: PlaytestContractRunResult;
+    try {
+      run = await runPlaytestContract({
+        contract: input.loadedContract.contract,
+        contractHash: input.loadedContract.hash,
+        adapter,
+        observer: {
+          onScenarioCompleted: async ({ scenario, scenarioIndex }) => {
+            if (!scenario.requiredArtifacts.includes("screenshot")) return [];
+            const path = `${input.runRoot}/${String(scenarioIndex + 1).padStart(2, "0")}-${safeEvidenceName(scenario.scenarioId)}.png`;
+            input.evidencePaths.push(await captureScreenshot(input.page, this.projectRoot, path));
+            return [path];
+          }
+        }
+      });
+      addCheck(
+        input.checks,
+        "adapter_handshake",
+        "运行时适配器与 PlaytestContract 握手",
+        "passed",
+        `协议 ${run.handshake.protocolVersion}，${run.handshake.playtestId}@${run.handshake.revision}；契约 hash 已校验。`
+      );
+    } catch (error) {
+      const details = error instanceof Error ? error.message : String(error);
+      throw new Error(`PlaytestContract 或 Runtime Adapter 握手失败，禁止回退 legacy：${details}`);
+    }
+
+    for (const scenario of run.scenarios) {
+      addCheck(
+        input.checks,
+        `scenario:${scenario.scenarioId}`,
+        `契约场景：${scenario.title}`,
+        scenario.passed ? "passed" : "failed",
+        scenario.details,
+        input.defects,
+        scenario.passed || !scenario.required ? undefined : defect({
+          operationId: input.operationId,
+          category: "coverage",
+          severity: "blocker",
+          title: `必需试玩场景未通过：${scenario.title}`,
+          details: scenario.details,
+          ownerAgentId: "gameplay_programmer",
+          evidencePaths: scenario.evidencePaths
+        })
+      );
+      for (const step of scenario.steps) {
+        addCheck(
+          input.checks,
+          `step:${scenario.scenarioId}:${step.stepId}`,
+          `契约步骤：${scenario.title} / ${step.stepId}`,
+          step.passed ? "passed" : "failed",
+          step.details,
+          input.defects,
+          step.passed || !scenario.required || !step.required ? undefined : defect({
+            operationId: input.operationId,
+            category: "interaction",
+            severity: "critical",
+            title: `必需试玩步骤未通过：${step.stepId}`,
+            details: step.details,
+            ownerAgentId: "gameplay_programmer",
+            evidencePaths: scenario.evidencePaths
+          })
+        );
+      }
+    }
+    for (const gate of run.qualityGates) {
+      addCheck(
+        input.checks,
+        `quality_gate:${gate.gateId}`,
+        `契约质量门禁：${gate.gateId}`,
+        gate.passed ? "passed" : "failed",
+        gate.details,
+        input.defects,
+        gate.passed ? undefined : defect({
+          operationId: input.operationId,
+          category: "dynamic_value",
+          severity: "major",
+          title: `契约质量门禁未通过：${gate.gateId}`,
+          details: gate.details,
+          ownerAgentId: "gameplay_programmer",
+          evidencePaths: []
+        })
+      );
+    }
+    const runtimeTracePath = writeJsonEvidence(this.projectRoot, `${input.runRoot}/runtime-trace.json`, run.snapshots);
+    input.evidencePaths.push(runtimeTracePath);
+    const consolePath = writeTextEvidence(this.projectRoot, `${input.runRoot}/console.log`, `${input.consoleLines.join("\n")}\n`);
+    input.evidencePaths.push(consolePath);
+    const metricsPath = writeJsonEvidence(this.projectRoot, `${input.runRoot}/metrics.json`, {
+      samples: run.snapshots.map((snapshot) => ({
+        sequence: snapshot.sequence,
+        timestampMs: snapshot.timestampMs,
+        state: snapshot.state,
+        signals: snapshot.signals
+      }))
+    });
+    input.evidencePaths.push(metricsPath);
+    for (const [scenarioIndex, scenario] of run.scenarios.entries()) {
+      const contractScenario = input.loadedContract.contract.scenarios[scenarioIndex];
+      if (!contractScenario) continue;
+      const artifactPaths: Partial<Record<(typeof contractScenario.requiredArtifacts)[number], string>> = {
+        runtime_trace: runtimeTracePath,
+        console_log: consolePath,
+        metrics: metricsPath
+      };
+      for (const artifactKind of contractScenario.requiredArtifacts) {
+        const path = artifactKind === "screenshot"
+          ? scenario.evidencePaths.find((candidate) => candidate.toLowerCase().endsWith(".png"))
+          : artifactKind === "video"
+            ? scenario.evidencePaths.find((candidate) => /\.(?:mp4|webm)$/i.test(candidate))
+            : artifactPaths[artifactKind];
+        if (path && !scenario.evidencePaths.includes(path)) scenario.evidencePaths.push(path);
+        const passed = Boolean(path);
+        if (!passed && scenario.required) {
+          scenario.passed = false;
+          scenario.details = `${scenario.details} 缺少契约要求的 ${artifactKind} 证据。`;
+        }
+        addCheck(
+          input.checks,
+          `artifact:${scenario.scenarioId}:${artifactKind}`,
+          `契约证据：${scenario.title} / ${artifactKind}`,
+          passed ? "passed" : "failed",
+          passed ? `已生成机器证据：${path}` : `Harness 尚未生成契约要求的 ${artifactKind} 证据。`,
+          input.defects,
+          passed || !scenario.required ? undefined : defect({
+            operationId: input.operationId,
+            category: "coverage",
+            severity: "major",
+            title: `缺少契约要求的试玩证据：${artifactKind}`,
+            details: `${scenario.title} 要求 ${artifactKind}，本轮未生成。`,
+            ownerAgentId: "cocos_automation",
+            evidencePaths: scenario.evidencePaths
+          })
+        );
+      }
+    }
+    const contractPassed = run.scenarios.every((scenario) => !scenario.required || scenario.passed) &&
+      run.qualityGates.every((gate) => gate.passed);
+    addCheck(
+      input.checks,
+      "contract_conformance",
+      "PlaytestContract 全部必需项通过",
+      contractPassed ? "passed" : "failed",
+      contractPassed ? "全部 required 场景、步骤、证据及质量门禁通过。" : "至少一个 required 场景、步骤、证据或质量门禁失败。"
+    );
+    const consoleErrors = input.consoleLines.filter((line) => /^\[(?:error|pageerror)\]/.test(line));
+    addCheck(
+      input.checks,
+      "console_errors",
+      "运行时无控制台错误",
+      consoleErrors.length === 0 ? "passed" : "failed",
+      consoleErrors.length === 0 ? "未捕获 console.error 或 pageerror。" : `捕获 ${consoleErrors.length} 条运行时错误。`,
+      input.defects,
+      consoleErrors.length === 0 ? undefined : defect({
+        operationId: input.operationId,
+        category: "console",
+        severity: "critical",
+        title: "试玩期间出现运行时错误",
+        details: consoleErrors.slice(0, 5).join("；"),
+        ownerAgentId: "gameplay_programmer",
+        evidencePaths: [consolePath]
+      })
+    );
+
+    const seriousDefects = input.defects.some((item) => ["blocker", "critical", "major"].includes(item.severity));
+    const verdict: PlaytestVerdict = contractPassed && !seriousDefects && consoleErrors.length === 0 ? "pass" : "fail";
+    const completedAt = new Date().toISOString();
+    const firstScenario = run.scenarios[0];
+    const lastScenario = run.scenarios.at(-1);
+    const machineResult: PlaytestReportEvidence = {
+      schemaVersion: 2,
+      operationId: input.operationId,
+      verdict,
+      completedAt,
+      ...(input.buildOperationId ? { buildOperationId: input.buildOperationId } : {}),
+      checks: input.checks,
+      defects: input.defects,
+      evidencePaths: input.evidencePaths,
+      contract: {
+        schemaVersion: "1.0.0",
+        playtestId: input.loadedContract.contract.playtestId,
+        revision: input.loadedContract.contract.revision,
+        path: input.loadedContract.path,
+        hash: input.loadedContract.hash,
+        sizeBytes: input.loadedContract.sizeBytes,
+        runtimeProtocol: BTP_PLAYTEST_PROTOCOL_VERSION,
+        adapterMode: "runtime_adapter",
+        ...(run.handshake.contractHash ? { runtimeContractHash: run.handshake.contractHash } : {}),
+        hashVerified: run.hashVerified
+      },
+      scenarios: run.scenarios.map((scenario) => ({
+        scenarioId: scenario.scenarioId,
+        title: scenario.title,
+        required: scenario.required,
+        passed: scenario.passed,
+        initialState: scenario.initialState,
+        finalState: scenario.finalState,
+        requiredStepIds: scenario.steps.filter((step) => step.required).map((step) => step.stepId),
+        passedStepIds: scenario.steps.filter((step) => step.passed).map((step) => step.stepId),
+        evidencePaths: scenario.evidencePaths,
+        details: scenario.details
+      })),
+      runtime: {
+        ...(firstScenario ? { initialState: firstScenario.initialState } : {}),
+        ...(lastScenario ? { terminalState: lastScenario.finalState } : {}),
+        consoleErrorCount: consoleErrors.length,
+        durationMs: Date.now() - input.startedAt
+      }
+    };
+    const resultPath = writeJsonEvidence(this.projectRoot, `${input.runRoot}/result.json`, machineResult);
+    input.evidencePaths.push(resultPath);
+    machineResult.evidencePaths = input.evidencePaths;
+    writeTextEvidence(this.projectRoot, input.reportPath, renderMarkdownReport(machineResult));
+    const evidencePaths = [...new Set([input.reportPath, ...input.evidencePaths])];
+    const evidence = evidencePaths.map((path) => fileEvidence(this.projectRoot, path));
+    const result: CocosPlaytestResult = {
+      ...machineResult,
+      ok: true,
+      summary: verdict === "pass"
+        ? `PlaytestContract ${input.loadedContract.contract.playtestId}@${input.loadedContract.contract.revision} 全部必需项通过。`
+        : `PlaytestContract 试玩未通过，发现 ${input.defects.length} 个缺陷。`,
+      reportPath: input.reportPath,
+      evidence
+    };
+    try {
+      writeQaPlaytestReceipt(this.projectRoot, input.reportPath, machineResult, evidence, input.taskInputEvidence);
+    } catch (error) {
+      machineResult.verdict = "blocked";
+      result.verdict = "blocked";
+      result.ok = false;
+      result.summary = `PlaytestContract 证据在收据提交前发生变化：${error instanceof Error ? error.message : String(error)}`;
+      writeTextEvidence(this.projectRoot, input.reportPath, renderMarkdownReport(machineResult));
+      result.evidence = [...new Set([input.reportPath, ...input.evidencePaths])].map((path) => fileEvidence(this.projectRoot, path));
+    }
+    return result;
   }
 }
 
@@ -713,8 +1022,8 @@ async function clickRuntimeBox(page: Page, box: { x: number; y: number; width: n
 }
 
 async function captureScreenshot(page: Page, projectRoot: string, path: string): Promise<string> {
+  ensureDirectoryInsideProject(projectRoot, dirname(path));
   const absolutePath = resolveInsideProject(projectRoot, path);
-  mkdirSync(dirname(absolutePath), { recursive: true });
   await page.locator("canvas").first().screenshot({ path: absolutePath });
   return path;
 }
@@ -725,6 +1034,29 @@ function renderMarkdownReport(result: PlaytestReportEvidence): string {
     ? result.defects.map((item) => `- **${item.severity} / ${item.category}** ${item.title}：${item.details}（责任角色：${item.ownerAgentId}）`).join("\n")
     : "- 无阻断性缺陷。";
   const evidence = result.evidencePaths.map((path) => `- \`${path}\``).join("\n") || "- 无";
+  const contract = result.contract
+    ? [
+        "## PlaytestContract",
+        "",
+        `- 契约：\`${result.contract.playtestId}@${result.contract.revision}\``,
+        `- 路径：\`${result.contract.path}\``,
+        `- SHA-256：\`${result.contract.hash}\``,
+        `- 运行时协议：\`${result.contract.runtimeProtocol}\``,
+        `- 适配器：\`${result.contract.adapterMode}\``,
+        `- hash 握手：${result.contract.hashVerified ? "已验证" : "未验证"}`,
+        ""
+      ]
+    : [];
+  const scenarios = result.scenarios
+    ? [
+        "## 契约场景",
+        "",
+        ...result.scenarios.map((scenario) =>
+          `- **${scenario.passed ? "PASS" : "FAIL"}** \`${scenario.scenarioId}\`：${scenario.initialState} -> ${scenario.finalState}；${scenario.details}`
+        ),
+        ""
+      ]
+    : [];
   return [
     "# Cocos 首个可玩自动试玩报告",
     "",
@@ -733,6 +1065,8 @@ function renderMarkdownReport(result: PlaytestReportEvidence): string {
     `- 完成时间：${result.completedAt}`,
     `- 状态路径：${[result.runtime.initialState, result.runtime.playingState, result.runtime.terminalState, result.runtime.restartedState].filter(Boolean).join(" -> ") || "未建立"}`,
     "",
+    ...contract,
+    ...scenarios,
     "## 硬性检查",
     "",
     "| 检查 | 状态 | 证据说明 |",
@@ -752,19 +1086,37 @@ function renderMarkdownReport(result: PlaytestReportEvidence): string {
   ].join("\n");
 }
 
+function safeEvidenceName(value: string): string {
+  return value.replace(/[^A-Za-z0-9._-]/g, "-").replace(/^-+|-+$/g, "").slice(0, 80) || "scenario";
+}
+
 async function startStaticServer(root: string): Promise<{ server: Server; url: string }> {
-  if (!existsSync(join(root, "index.html"))) {
+  const index = resolvePathWithinRoot(root, "index.html", {
+    allowMissing: true,
+    expectedKind: "file",
+    label: "QA 静态文件"
+  });
+  if (!index.exists) {
     throw new Error(`QA Web 构建缺少 index.html：${root}`);
   }
   const server = createServer((request, response) => {
-    const pathname = decodeURIComponent((request.url ?? "/").split("?")[0] ?? "/");
-    const requested = pathname === "/" ? "/index.html" : pathname;
-    const target = resolve(root, `.${normalize(requested)}`);
-    if (target !== root && !target.startsWith(`${root}${sep}`)) {
+    let target: string;
+    let targetExists = false;
+    try {
+      const pathname = decodeURIComponent((request.url ?? "/").split("?")[0] ?? "/");
+      const requested = pathname === "/" ? "index.html" : pathname.replace(/^\/+/, "");
+      const safeTarget = resolvePathWithinRoot(root, requested, {
+        allowMissing: true,
+        expectedKind: "file",
+        label: "QA 静态文件"
+      });
+      target = safeTarget.absolutePath;
+      targetExists = safeTarget.exists;
+    } catch {
       response.writeHead(403).end("Forbidden");
       return;
     }
-    if (!existsSync(target) || !statSync(target).isFile()) {
+    if (!targetExists) {
       response.writeHead(404).end("Not Found");
       return;
     }
@@ -798,8 +1150,8 @@ function discoverChromeExecutable(): string {
 }
 
 function writeTextEvidence(projectRoot: string, path: string, content: string): string {
+  ensureDirectoryInsideProject(projectRoot, dirname(path));
   const absolutePath = resolveInsideProject(projectRoot, path);
-  mkdirSync(dirname(absolutePath), { recursive: true });
   writeFileSync(absolutePath, content, "utf8");
   return path;
 }
@@ -815,12 +1167,29 @@ function fileEvidence(projectRoot: string, path: string): CocosBridgeEvidence {
 }
 
 function resolveInsideProject(projectRoot: string, path: string): string {
-  const root = resolve(projectRoot);
-  const target = resolve(root, path);
-  if (target !== root && !target.startsWith(`${root}${sep}`)) {
-    throw new Error(`试玩证据路径越界：${path}`);
-  }
-  return target;
+  const relativePath = normalizeRelativePathWithinRoot(path, { label: "试玩证据路径" });
+  return resolvePathWithinRoot(projectRoot, relativePath, {
+    allowMissing: true,
+    label: "试玩证据路径"
+  }).absolutePath;
+}
+
+function ensureDirectoryInsideProject(projectRoot: string, path: string): string {
+  const relativePath = path === "." ? "." : normalizeRelativePathWithinRoot(path, { label: "试玩证据目录" });
+  let resolved = resolvePathWithinRoot(projectRoot, relativePath, {
+    allowMissing: true,
+    allowRoot: true,
+    expectedKind: "directory",
+    label: "试玩证据目录"
+  });
+  mkdirSync(resolved.absolutePath, { recursive: true });
+  resolved = resolvePathWithinRoot(projectRoot, relativePath, {
+    allowMissing: false,
+    allowRoot: true,
+    expectedKind: "directory",
+    label: "试玩证据目录"
+  });
+  return resolved.absolutePath;
 }
 
 function mimeType(path: string): string {
