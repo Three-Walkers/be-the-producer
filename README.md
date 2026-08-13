@@ -41,6 +41,7 @@ This system is not a single black-box chatbot that generates a pile of code. It 
 ### Outputs
 
 - Game Design Document (GDD).
+- Versioned GameContract, SceneBlueprint, and PlaytestContract artifacts.
 - Art Bible and asset production plan.
 - Runtime-ready 2D assets, UI assets, animations, audio references, and asset manifest.
 - Cocos Creator project.
@@ -58,13 +59,13 @@ The product is organized as a role-based multi-agent studio. Each agent owns a c
 | --- | --- | --- |
 | Studio Orchestrator | Controls workflow state, routing, task creation, phase gates, and cross-agent coordination. | Stage plan, task graph, decision requests, project status. |
 | Producer Agent | Converts producer intent into scope, schedule, risks, and milestone reviews. | Production plan, backlog, risk log, review agenda, decision log. |
-| Game Designer Agent | Designs core loop, rules, progression, levels, balance, and player goals. | GDD, core loop spec, level specs, economy and balance specs. |
+| Game Designer Agent | Designs core loop, rules, progression, levels, balance, and player goals. | GDD, GameContract, level specs, economy and balance specs. |
 | Art Director Agent | Defines visual style, UI direction, readability rules, color palette, animation tone, and asset quality bar. | Art Bible, style board, UI visual spec, asset review notes. |
 | Asset Production Agent | Produces, normalizes, packages, and version-controls game assets. | Sprites, UI assets, sprite sheets, animation strips, asset manifest. |
-| Cocos Tech Lead Agent | Owns Cocos architecture, scene structure, prefab strategy, asset loading, performance budget, and technical standards. | Technical design, scene blueprint, module plan, performance checklist. |
+| Cocos Tech Lead Agent | Owns Cocos architecture, scene structure, prefab strategy, asset loading, performance budget, and technical standards. | Technical design, SceneBlueprint, module plan, performance checklist. |
 | Gameplay Programmer Agent | Implements game systems, UI logic, gameplay rules, data loading, and integration code. | TypeScript code, Cocos components, implementation notes, code change log. |
 | Cocos Automation Agent | Operates Cocos through an engine bridge or MCP layer. | Scene operations, prefab updates, asset imports, build logs, editor snapshots. |
-| Game Evaluator / QA Agent | Evaluates the actual game experience, not only unit tests. | Playtest reports, visual QA, bug reports, release gate assessment. |
+| Game Evaluator / QA Agent | Evaluates the actual game experience, not only unit tests. | PlaytestContract, playtest evidence, bug reports, release gate assessment. |
 | WeChat Platform Agent | Handles WeChat mini-game packaging, platform constraints, preview, upload, and platform readiness. | WeChat build config, preview package, upload report, package-size report. |
 | DevOps Agent | Handles server deployment, environment setup, logs, rollback, and production readiness. | Deployment plan, release record, rollback plan, server health report. |
 | LiveOps / Analytics Agent | Tracks post-release data and plans continuous improvement. | Analytics plan, event schema, iteration backlog, tuning plans. |
@@ -247,6 +248,9 @@ Project layout:
       vector-index-metadata.json
     decisions/
     milestones/
+    workflow/
+      workflow.json
+      events.json
     build-artifacts/
     release-notes/
 
@@ -490,7 +494,7 @@ flowchart TB
 
 ## Product Capability Modules
 
-Game Pipeline Agents is implemented as a complete production system made of connected capability modules:
+The target Game Pipeline Agents product is composed of connected capability modules:
 
 | Module | Responsibility |
 | --- | --- |
@@ -512,4 +516,4 @@ The architecture uses Clowder-style multi-agent rooms, agent registries, message
 
 ## Current Status
 
-This repository contains the product specification for Game Pipeline Agents. The implementation scope covers the complete product system described above: studio collaboration, agent execution, production memory, role workspaces, Cocos automation, QA evaluation, release operations, and continuous iteration.
+This repository is currently a local vertical MVP. Versioned GameContract, SceneBlueprint, and PlaytestContract artifacts have strict validation and cross-contract gates; the Cocos Bridge is declarative and genre-neutral, and QA executes contract scenarios against public runtime facts with bound evidence. A replayable Workflow Aggregate now owns reviews, producer decisions, changes, waivers, rollbacks, and LiveOps iterations. Tool execution is bound to the Agent, current task, immutable artifact identity, and path; Claude MCP room sessions are read-only. The Artifact Ledger freezes input versions and hashes, builds carry complete file manifests, and stale builds, stale QA, external tampering, or symlink traversal fail before consumption. Local project state uses atomic replacement, a last-known-good backup, and corruption isolation. Non-loopback API binding requires a Bearer token and adds origin controls, body limits, and baseline security headers. Automated tap-defense, puzzle, runner, and endless fixtures prove that the core layers no longer depend on one sample, but three real Cocos games have not yet completed end-to-end delivery. A production database and distributed invocation queue/leases, Secret Vault, isolated build workers, real WeChat release, generated-game Runtime Adapters, real prefab materialization, and the production LiveOps loop remain under construction, so this is not yet the complete product system described above.
