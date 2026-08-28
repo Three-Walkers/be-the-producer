@@ -1,14 +1,23 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { CocosEngineBridge, minimalCreatorEnvironment, verifyCocosBuildManifest } from "../apps/api/dist/cocosEngineBridge.js";
+import {
+  CocosEngineBridge,
+  minimalCreatorEnvironment,
+  verifyCocosBuildImportReceipt,
+  verifyCocosBuildManifest
+} from "../apps/api/dist/cocosEngineBridge.js";
 import { CocosEngineSettingsStore } from "../apps/api/dist/cocosEngineSettings.js";
+import { artifactReadyForConsumption } from "../apps/api/dist/taskOutputEvidence.js";
+import { createStudioKernel } from "../packages/agent-runtime/dist/index.js";
 
 const root = mkdtempSync(join(tmpdir(), "btp-cocos-bridge-"));
 const projectRoot = join(root, "project");
 const settingsRoot = join(root, "settings");
+process.env.STUDIO_WORKSPACE_ROOT = root;
 mkdirSync(join(projectRoot, "assets", "art"), { recursive: true });
 mkdirSync(join(projectRoot, "assets", "scripts", "gameplay"), { recursive: true });
 mkdirSync(join(projectRoot, "settings"), { recursive: true });
@@ -159,6 +168,20 @@ const imported = bridge.importAssets();
 assert.equal(imported.ok, true, imported.error);
 assert.equal(existsSync(join(projectRoot, "assets", "resources", "btp-art", "ball.png")), true);
 assert.equal(existsSync(join(projectRoot, "assets", "resources", "btp", "asset-map.json")), true);
+const currentReceiptPath = join(projectRoot, "agents", "cocos-automation", "imports", "current.json");
+assert.equal(existsSync(currentReceiptPath), true);
+const initialReceipt = JSON.parse(readFileSync(currentReceiptPath, "utf8"));
+assert.equal(initialReceipt.kind, "cocos_asset_import_receipt");
+assert.equal(initialReceipt.schemaVersion, 1);
+assert.equal(initialReceipt.manifest.path, "agents/art/asset-manifest.json");
+assert.equal(initialReceipt.imported.length, 1);
+assert.deepEqual(initialReceipt.imported[0].source, {
+  path: "assets/art/ball.png",
+  hash: initialReceipt.imported[0].destination.hash,
+  sizeBytes: initialReceipt.imported[0].destination.sizeBytes
+});
+assert.equal(initialReceipt.imported[0].destination.path, "assets/resources/btp-art/ball.png");
+assert.match(initialReceipt.importedDigest, /^[a-f0-9]{64}$/);
 const stableAssetMap = readFileSync(join(projectRoot, "assets", "resources", "btp", "asset-map.json"), "utf8");
 
 writeFileSync(
@@ -211,11 +234,15 @@ assert.equal(
 );
 
 writeFileSync(
+  join(projectRoot, "assets", "art", "ball-alt.png"),
+  readFileSync(join(projectRoot, "assets", "art", "ball.png"))
+);
+writeFileSync(
   join(projectRoot, "agents", "art", "duplicate-target-manifest.json"),
   JSON.stringify({
     assets: [
       { id: "same/target", runtimePath: "assets/art/ball.png" },
-      { id: "same?target", runtimePath: "assets/art/ball.png" }
+      { id: "same?target", runtimePath: "assets/art/ball-alt.png" }
     ]
   }, null, 2)
 );
@@ -423,17 +450,129 @@ const readyValidation = bridge.validateProject();
 assert.equal(readyValidation.ok, true, readyValidation.error);
 assert.equal(readyValidation.details.buildReady, true);
 
+// A was imported. Change both the canonical manifest and source bytes to B;
+// build must refuse to run Creator until B receives a fresh import receipt.
+const ballPath = join(projectRoot, "assets", "art", "ball.png");
+writeFileSync(ballPath, Buffer.concat([readFileSync(ballPath), Buffer.from("runtime-variant-b")]));
+writeFileSync(
+  join(projectRoot, "agents", "art", "asset-manifest.json"),
+  JSON.stringify({ schemaVersion: 1, revision: 2, assets: { sprites: [{ id: "ball", runtimePath: "assets/art/ball.png", status: "ready" }] } }, null, 2)
+);
+const staleImportBuild = bridge.build();
+assert.equal(staleImportBuild.ok, false);
+assert.match(staleImportBuild.error, /导入收据|重新导入|asset manifest/);
+assert.equal(
+  existsSync(join(projectRoot, "shared", "build-artifacts", "wechat", "dev", "game.js")),
+  false,
+  "Creator must not run when manifest/source B is newer than import A"
+);
+
+const importedB = bridge.importAssets();
+assert.equal(importedB.ok, true, importedB.error);
+const buildB = bridge.build();
+assert.equal(buildB.ok, true, buildB.error);
+const buildBReport = JSON.parse(readFileSync(join(projectRoot, "shared", "build-artifacts", "wechat", "dev", "build-report.json"), "utf8"));
+assert.equal(buildBReport.importReceipt.operationId, importedB.operationId);
+assert.equal(buildBReport.importReceipt.receipt.path, "agents/cocos-automation/imports/current.json");
+assert.equal(buildBReport.importReceipt.importedDigest, importedB.details.importReceipt.importedDigest);
+assert.equal(verifyCocosBuildImportReceipt(projectRoot, buildBReport.importReceipt), true);
+
+// Destination bytes are part of the receipt too; a post-import mutation must
+// invalidate build even while manifest and source remain unchanged.
+const importedDestination = join(projectRoot, "assets", "resources", "btp-art", "ball.png");
+writeFileSync(importedDestination, Buffer.concat([readFileSync(importedDestination), Buffer.from("tampered-destination")]));
+assert.equal(
+  verifyCocosBuildImportReceipt(projectRoot, buildBReport.importReceipt),
+  false,
+  "a destination mutation must invalidate the successful build's import provenance"
+);
+const tamperedDestinationBuild = bridge.build();
+assert.equal(tamperedDestinationBuild.ok, false);
+assert.match(tamperedDestinationBuild.error, /导入目标已变化|相同字节|重新导入/);
+
+const repairedImport = bridge.importAssets();
+assert.equal(repairedImport.ok, true, repairedImport.error);
+assert.equal(
+  verifyCocosBuildImportReceipt(projectRoot, buildBReport.importReceipt),
+  false,
+  "a newer successful import must invalidate a build bound to the previous receipt operation"
+);
 const build = bridge.build();
 assert.equal(build.ok, true, build.error);
 assert.equal(existsSync(join(projectRoot, "shared", "build-artifacts", "wechat", "dev", "game.js")), true);
 const report = JSON.parse(readFileSync(join(projectRoot, "shared", "build-artifacts", "wechat", "dev", "build-report.json"), "utf8"));
 assert.equal(report.status, "success");
+assert.equal(verifyCocosBuildImportReceipt(projectRoot, report.importReceipt), true);
 assert.equal(report.exitCode, 36);
 assert.ok(report.outputFiles.includes("shared/build-artifacts/wechat/dev/game.js"));
 assert.equal(report.outputManifest.schemaVersion, 1);
 assert.ok(report.outputManifest.files.some((entry) => entry.path.endsWith("/game.js") && entry.hash && entry.sizeBytes > 0));
 assert.match(report.outputManifest.digest, /^[a-f0-9]{64}$/);
 assert.equal(verifyCocosBuildManifest(projectRoot, report.outputManifest), true);
+
+// The artifact gate must consume the same binding from build-report.json and
+// must invalidate this build as soon as a newer import receipt replaces it.
+const provenanceKernel = createStudioKernel("project", "Cocos receipt provenance", "producer_test", "receipt gate");
+const provenanceNow = new Date().toISOString();
+provenanceKernel.addTask({
+  taskId: "task_stage_2_cocos_build",
+  projectId: provenanceKernel.project.projectId,
+  stageId: provenanceKernel.project.currentStage,
+  roomId: provenanceKernel.getRoom("engineering-room").roomId,
+  taskLevel: "task",
+  ownerAgentId: "cocos_automation",
+  title: "Cocos build receipt fixture",
+  description: "Verify current import provenance",
+  status: "doing",
+  priority: 1,
+  sortOrder: 1,
+  progressPercent: 50,
+  childrenSummary: { doing: 0, blocked: 0, todo: 0, done: 0, cancelled: 0 },
+  inputArtifacts: [],
+  outputArtifacts: ["artifact_wechat_dev_build"],
+  acceptanceCriteria: [],
+  blockers: [],
+  createdAt: provenanceNow,
+  updatedAt: provenanceNow
+});
+provenanceKernel.addArtifact({
+  artifactId: "artifact_wechat_dev_build",
+  projectId: provenanceKernel.project.projectId,
+  type: "build",
+  path: "shared/build-artifacts/wechat/dev",
+  ownerAgentId: "cocos_automation",
+  stageId: provenanceKernel.project.currentStage,
+  status: "submitted",
+  version: 1,
+  sourceTaskId: "task_stage_2_cocos_build",
+  sourceDecisionIds: [],
+  metadata: {
+    toolName: "cocos_build",
+    toolExecutedAt: provenanceNow,
+    bridgeOperationId: build.operationId,
+    bridgeOperationType: "build",
+    bridgeOk: true
+  },
+  createdAt: provenanceNow,
+  updatedAt: provenanceNow
+});
+const buildReportBytes = readFileSync(join(projectRoot, "shared", "build-artifacts", "wechat", "dev", "build-report.json"));
+provenanceKernel.recordArtifactMaterialization("artifact_wechat_dev_build", {
+  path: "shared/build-artifacts/wechat/dev/build-report.json",
+  hash: createHash("sha256").update(buildReportBytes).digest("hex"),
+  sizeBytes: statSync(join(projectRoot, "shared", "build-artifacts", "wechat", "dev", "build-report.json")).size,
+  materializedAt: provenanceNow,
+  directoryManifest: report.outputManifest
+});
+assert.equal(artifactReadyForConsumption(provenanceKernel, "artifact_wechat_dev_build"), true);
+const newerImport = bridge.importAssets();
+assert.equal(newerImport.ok, true, newerImport.error);
+assert.equal(
+  artifactReadyForConsumption(provenanceKernel, "artifact_wechat_dev_build"),
+  false,
+  "a newer canonical import receipt must make the previous build artifact stale"
+);
+
 writeFileSync(join(projectRoot, "shared", "build-artifacts", "wechat", "dev", "game.js"), "tampered");
 assert.equal(verifyCocosBuildManifest(projectRoot, report.outputManifest), false, "bundle bytes changed while report remains untouched");
 writeFileSync(join(projectRoot, "shared", "build-artifacts", "wechat", "dev", "game.js"), "window.__BTP_COCOS_BUILD__ = true;\n");
