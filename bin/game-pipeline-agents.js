@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { exec } from "node:child_process";
+import { exec, execFile } from "node:child_process";
 import { spawnSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -19,8 +19,13 @@ process.env.PORT = port;
 process.env.HOST = host;
 process.env.INIT_CWD = process.env.INIT_CWD ?? repoRoot;
 
-const build = spawnSync("npm", ["run", "build"], {
+// On Windows, npm is exposed as npm.cmd rather than an executable named npm.
+// Calling npm.cmd explicitly keeps this launcher working from PowerShell and cmd.
+const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
+const build = spawnSync(npmCommand, ["run", "build"], {
   cwd: repoRoot,
+  // Node requires a shell to launch .cmd shims on Windows.
+  shell: process.platform === "win32",
   stdio: "inherit"
 });
 
@@ -33,7 +38,15 @@ serverModule.startServer(Number(port), host);
 
 if (shouldOpen) {
   const url = `http://localhost:${port}`;
-  exec(`open ${JSON.stringify(url)}`);
+  if (process.platform === "win32") {
+    // `start` is a cmd builtin; the empty title prevents the URL from being
+    // interpreted as a window title.
+    exec(`start "" ${JSON.stringify(url)}`);
+  } else if (process.platform === "darwin") {
+    execFile("open", [url]);
+  } else {
+    execFile("xdg-open", [url]);
+  }
 }
 
 function readArgValue(values, name) {
