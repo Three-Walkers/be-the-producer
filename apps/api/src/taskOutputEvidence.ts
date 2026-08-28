@@ -1,11 +1,23 @@
-import type { StudioKernel } from "@game-pipeline/agent-runtime";
-import type { ArtifactDirectoryManifest, ArtifactInputProvenance, Task } from "@game-pipeline/shared-schemas";
+import {
+  createStudioKernelFromSnapshot,
+  getStageOneArtifactContracts,
+  type StudioKernel
+} from "@game-pipeline/agent-runtime";
+import type { Artifact, ArtifactDirectoryManifest, ArtifactInputProvenance, Task } from "@game-pipeline/shared-schemas";
 import { createHash } from "node:crypto";
-import { readArtifactContentForModel } from "./workspaceWriter.js";
+import { readFileSync } from "node:fs";
+import { readArtifactContentForModel, resolveProjectWorkspaceRoot } from "./workspaceWriter.js";
 import { hashWorkspaceFile, readWorkspaceTree, resolveWorkspacePathTarget } from "./workspaceWriter.js";
+import { verifyCocosBuildImportReceipt } from "./cocosEngineBridge.js";
 import type { PlaytestReportEvidence } from "./playtestEvidence.js";
 import { isContractArtifactType, parseContractArtifactText } from "./contractArtifacts.js";
 import { projectContractArtifactIsCompatible } from "./projectContracts.js";
+import {
+  parseQualityReviewText,
+  qualityReviewReadyForGate
+} from "./qualityReviewArtifacts.js";
+import { validateManifestRuntimeAssetAlphaPolicies } from "./imageAssetValidation.js";
+import { hasCurrentGenerateRasterAssetReceipt } from "./mediaArtifactEvidence.js";
 
 const requiredLegacyPlaytestChecks = [
   "launch",
@@ -22,6 +34,37 @@ const requiredLegacyPlaytestChecks = [
   "restart_flow",
   "console_errors"
 ];
+
+/**
+ * Stage 1 IDs are protocol identities, not aliases for arbitrary verified files.
+ * Returning a mismatch here prevents a wrong type from bypassing strict-contract
+ * parsing and prevents a valid ledger at a non-canonical path/owner/task from
+ * satisfying either downstream task inputs or producer gates.
+ */
+export function stageOneCanonicalArtifactIdentityMismatch(
+  kernel: StudioKernel,
+  artifactId: string
+): string | undefined {
+  const expected = getStageOneArtifactContracts().find((contract) => contract.artifactId === artifactId);
+  if (!expected) {
+    return undefined;
+  }
+  const artifact = kernel.listArtifacts().find((candidate) => candidate.artifactId === artifactId);
+  if (!artifact) {
+    return "artifact missing";
+  }
+  const mismatches = [
+    artifact.type === expected.type ? undefined : `type=${artifact.type}, expected=${expected.type}`,
+    artifact.path === expected.path ? undefined : `path=${artifact.path}, expected=${expected.path}`,
+    artifact.ownerAgentId === expected.ownerAgentId
+      ? undefined
+      : `owner=${artifact.ownerAgentId}, expected=${expected.ownerAgentId}`,
+    artifact.sourceTaskId === expected.sourceTaskId
+      ? undefined
+      : `sourceTask=${artifact.sourceTaskId ?? "missing"}, expected=${expected.sourceTaskId}`
+  ].filter((value): value is string => Boolean(value));
+  return mismatches.length > 0 ? mismatches.join("; ") : undefined;
+}
 
 export function requiredRuntimePngPaths(kernel: StudioKernel, task: Task): string[] {
   if (task.ownerAgentId !== "asset_production") {
@@ -57,6 +100,9 @@ export function taskOutputsVerified(kernel: StudioKernel, task: Task): boolean {
   if (task.taskId.startsWith("task_qa_repair_")) {
     return qaRepairOutputsVerified(kernel, task);
   }
+  if (task.taskId === "task_stage_2_asset_pipeline" && !assetProductionOutputsVerified(kernel, task)) {
+    return false;
+  }
 
   const runtimePngPaths = requiredRuntimePngPaths(kernel, task);
   if (runtimePngPaths.length === 0) {
@@ -81,16 +127,30 @@ export function artifactReadyForConsumption(kernel: StudioKernel, artifactId: st
   const artifact = kernel.listArtifacts().find((candidate) => candidate.artifactId === artifactId);
   const evidence = kernel.listArtifactLedger().find((candidate) => candidate.artifactId === artifactId);
   if (
+    stageOneCanonicalArtifactIdentityMismatch(kernel, artifactId) !== undefined ||
     !artifact?.metadata.toolExecutedAt ||
     evidence?.status !== "verified" ||
     ["change_requested", "rejected", "superseded"].includes(artifact.status)
   ) {
     return false;
   }
-  // A failed bridge operation still produces a useful, hash-verified report.
-  // That report is failure evidence, not a consumable scene/build deliverable.
-  if (artifact.metadata.bridgeOperationId && artifact.metadata.bridgeOk !== true) {
+  // Cocos bridge evidence is consumable only after an explicit successful
+  // result. Harness media operations also carry an operation id, but prove
+  // success through stricter provider/vision receipts instead of bridgeOk.
+  if (artifact.metadata.bridgeOperationId && artifact.metadata.bridgeOk === false) {
     return false;
+  }
+  if (artifact.metadata.bridgeOperationId && artifact.metadata.bridgeOk !== true) {
+    const verifiedMediaOperation =
+      artifact.metadata.bridgeOperationType === "image_generation" &&
+      hasCurrentGenerateRasterAssetReceipt(kernel, artifact) &&
+      workspaceArtifactHasPngSignature(kernel, artifact);
+    const verifiedReviewOperation =
+      artifact.type === "quality_review" &&
+      artifact.metadata.bridgeOperationType === "quality_review_with_vision";
+    if (!verifiedMediaOperation && !verifiedReviewOperation) {
+      return false;
+    }
   }
   if (!artifactMatchesLedger(kernel, artifact.artifactId, evidence.path)) {
     return false;
@@ -98,8 +158,19 @@ export function artifactReadyForConsumption(kernel: StudioKernel, artifactId: st
   if (!artifactInputProvenanceIsCurrent(kernel, artifact.artifactId)) {
     return false;
   }
-  if (artifact.type === "build" && !directoryManifestIsCurrent(kernel, evidence.directoryManifest)) {
-    return false;
+  if (artifact.type === "build") {
+    if (!directoryManifestIsCurrent(kernel, evidence.directoryManifest)) {
+      return false;
+    }
+    const requiresCocosImportReceipt =
+      artifact.sourceTaskId === "task_stage_2_cocos_build" ||
+      artifact.metadata.bridgeOperationType === "build";
+    if (requiresCocosImportReceipt && !cocosBuildImportReceiptIsCurrent(kernel, artifact)) {
+      return false;
+    }
+  }
+  if (artifact.type === "quality_review") {
+    return qualityReviewReadyForTaskCompletion(kernel, artifact.artifactId);
   }
   if (!isContractArtifactType(artifact.type)) {
     return true;
@@ -109,6 +180,154 @@ export function artifactReadyForConsumption(kernel: StudioKernel, artifactId: st
   try {
     parseContractArtifactText(artifact.type, content);
     return projectContractArtifactIsCompatible(kernel, artifact);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A Cocos build remains consumable only while the import receipt frozen into
+ * its report is still the canonical current receipt and all imported source /
+ * destination bytes continue to match it.
+ */
+export function cocosBuildImportReceiptIsCurrent(kernel: StudioKernel, artifact: Artifact): boolean {
+  if (artifact.type !== "build") return false;
+  const content = readArtifactContentForModel(kernel.project.projectId, artifact, 2_000_000);
+  if (!content) return false;
+  try {
+    const report = JSON.parse(content) as unknown;
+    if (!isRecord(report) || report.status !== "success") return false;
+    return verifyCocosBuildImportReceipt(
+      resolveProjectWorkspaceRoot(kernel.project.projectId),
+      report.importReceipt
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Reviewer work is complete when it produced either a passing review or a
+ * grounded change request. A blocked receipt remains incomplete. The feedback
+ * path marks reviewed artifacts change_requested immediately, so a narrow
+ * projection restores only statuses changed by this exact review before
+ * reusing the strict quality-review validator.
+ */
+function qualityReviewReadyForTaskCompletion(kernel: StudioKernel, artifactId: string): boolean {
+  let result = qualityReviewReadyForGate(kernel, artifactId, false);
+  if (!result.ok) {
+    const reviewArtifact = kernel.listArtifacts().find((artifact) => artifact.artifactId === artifactId);
+    const content = reviewArtifact
+      ? readArtifactContentForModel(kernel.project.projectId, reviewArtifact, 2_000_000)
+      : undefined;
+    if (!reviewArtifact || !content) return false;
+    let review;
+    try {
+      review = parseQualityReviewText(content);
+    } catch {
+      return false;
+    }
+    if (review.verdict !== "change_requested") return false;
+
+    const snapshot = structuredClone(kernel.toSnapshot());
+    let projectedFeedbackStatus = false;
+    for (const target of review.targets) {
+      const targetArtifact = snapshot.artifacts.find((artifact) => artifact.artifactId === target.artifactId);
+      if (!targetArtifact || targetArtifact.status !== "change_requested") continue;
+      if (
+        targetArtifact.metadata.qualityChangeReviewId !== review.reviewId ||
+        targetArtifact.metadata.qualityChangeReviewArtifactId !== artifactId
+      ) {
+        return false;
+      }
+      targetArtifact.status = "submitted";
+      projectedFeedbackStatus = true;
+    }
+    if (!projectedFeedbackStatus) return false;
+    try {
+      result = qualityReviewReadyForGate(createStudioKernelFromSnapshot(snapshot), artifactId, false);
+    } catch {
+      return false;
+    }
+  }
+  return Boolean(result.ok && result.review && ["pass", "change_requested"].includes(result.review.verdict));
+}
+
+/**
+ * Production art cannot be satisfied by a manifest/contact sheet pair alone or
+ * by SVG rasterization. At least one task-owned runtime PNG must carry a
+ * server-generated generate_raster_asset receipt, and every manifest runtimePath
+ * must resolve to current PNG evidence.
+ */
+export function assetProductionOutputsVerified(kernel: StudioKernel, task: Task): boolean {
+  if (task.taskId !== "task_stage_2_asset_pipeline") return true;
+  if (task.ownerAgentId !== "asset_production") return false;
+  const artifacts = kernel.listArtifacts();
+  const outputArtifacts = task.outputArtifacts
+    .map((artifactId) => artifacts.find((artifact) => artifact.artifactId === artifactId))
+    .filter((artifact): artifact is Artifact => Boolean(artifact));
+  const manifest = outputArtifacts.find((artifact) => artifact.artifactId === "artifact_asset_manifest_draft");
+  const contactSheet = outputArtifacts.find((artifact) => artifact.artifactId === "artifact_asset_contact_sheet");
+  if (
+    !manifest ||
+    manifest.type !== "asset_manifest" ||
+    manifest.path !== "agents/art/asset-manifest.json" ||
+    manifest.ownerAgentId !== "asset_production" ||
+    manifest.sourceTaskId !== task.taskId ||
+    !contactSheet ||
+    contactSheet.type !== "asset" ||
+    contactSheet.path !== "agents/art/processed-assets/first-playable-contact-sheet.png" ||
+    contactSheet.ownerAgentId !== "asset_production" ||
+    contactSheet.sourceTaskId !== task.taskId ||
+    contactSheet.metadata.mediaRole !== "asset_contact_sheet" ||
+    !artifactReadyForConsumption(kernel, manifest.artifactId) ||
+    !artifactReadyForConsumption(kernel, contactSheet.artifactId) ||
+    !workspaceArtifactHasPngSignature(kernel, contactSheet)
+  ) {
+    return false;
+  }
+
+  const manifestContent = readArtifactContentForModel(kernel.project.projectId, manifest, 1_000_000);
+  if (!manifestContent) return false;
+  let manifestValue: unknown;
+  try {
+    manifestValue = JSON.parse(manifestContent);
+  } catch {
+    return false;
+  }
+  let runtimePaths: string[];
+  try {
+    const alphaReceipts = validateManifestRuntimeAssetAlphaPolicies(kernel.project.projectId, manifestValue);
+    runtimePaths = alphaReceipts.map((receipt) => receipt.runtimePath);
+  } catch {
+    return false;
+  }
+  if (runtimePaths.length === 0) return false;
+
+  const runtimeArtifacts = runtimePaths.map((path) => artifacts.find((artifact) => artifact.path === path));
+  if (runtimeArtifacts.some((artifact) => !artifact)) return false;
+  const currentRuntimePngs = runtimeArtifacts.filter((artifact): artifact is Artifact => Boolean(artifact)).filter((artifact) =>
+    task.outputArtifacts.includes(artifact.artifactId) &&
+    artifact.sourceTaskId === task.taskId &&
+    artifact.ownerAgentId === "asset_production" &&
+    artifact.type === "asset" &&
+    artifact.artifactId !== contactSheet.artifactId &&
+    artifact.metadata.mediaRole !== "asset_contact_sheet" &&
+    artifact.path.toLowerCase().endsWith(".png") &&
+    artifactReadyForConsumption(kernel, artifact.artifactId) &&
+    workspaceArtifactHasPngSignature(kernel, artifact)
+  );
+  if (currentRuntimePngs.length !== runtimePaths.length) return false;
+  return currentRuntimePngs.some((artifact) => hasCurrentGenerateRasterAssetReceipt(kernel, artifact));
+}
+
+function workspaceArtifactHasPngSignature(kernel: StudioKernel, artifact: Artifact): boolean {
+  if (!artifact.path.toLowerCase().endsWith(".png")) return false;
+  try {
+    const target = resolveWorkspacePathTarget(kernel.project.projectId, artifact.path);
+    if (!target.exists || target.type !== "file" || (target.sizeBytes ?? 0) < 8) return false;
+    const signature = readFileSync(target.absolutePath).subarray(0, 8);
+    return signature.equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
   } catch {
     return false;
   }
@@ -191,6 +410,10 @@ export function directoryManifestIsCurrent(kernel: StudioKernel, manifest: Artif
       return false;
     }
   });
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 export function readTaskPlaytestEvidence(kernel: StudioKernel, task: Task): PlaytestReportEvidence | undefined {

@@ -92,9 +92,37 @@ export const defaultAgentContracts: AgentContract[] = [
     },
     tools: ["read_artifact", "write_artifact", "create_decision_request", "create_task", "update_task"],
     forbiddenActions: ["write_gameplay_code", "make_final_art_direction", "deploy_release", "read_secret_plaintext"],
-    handoffTargets: ["producer", "art_director", "cocos_tech_lead", "gameplay_programmer", "qa_evaluator"],
+    handoffTargets: ["producer", "design_quality_reviewer", "art_director", "cocos_tech_lead", "gameplay_programmer", "qa_evaluator"],
     messageTypes: ["plan_submission", "decision_request", "progress_update", "change_request", "handoff"],
     progressKeywords: ["玩法", "机制", "gdd", "数值", "关卡", "核心循环", "世界观"]
+  },
+  {
+    agentId: "design_quality_reviewer",
+    displayName: "Game Design Quality Director",
+    roleScope: "Independently reviews GDD and GameContract quality as a senior mobile-game design director, covering core-loop clarity, player tension and feedback, balance assumptions, edge cases, MVP scope, platform feasibility, cross-artifact consistency, and testability.",
+    roomMemberships: ["studio-main", "design-room", "qa-room"],
+    stageLeads: ["concept_discussion", "concept_review"],
+    modelProfile: {
+      capability: "evaluation",
+      costTier: "premium",
+      contextPolicy: "project_pack"
+    },
+    workspace: "agents/review/design/",
+    memoryScopes: {
+      read: ["project", "decision", "artifact", "qa", "producer_preference", "knowledge"],
+      write: ["role", "artifact", "knowledge"]
+    },
+    tools: ["read_artifact", "write_artifact"],
+    forbiddenActions: [
+      "modify_reviewed_artifacts",
+      "approve_producer_gate",
+      "review_own_work",
+      "waive_major_quality_issue",
+      "read_secret_plaintext"
+    ],
+    handoffTargets: ["game_designer", "producer", "qa_evaluator"],
+    messageTypes: ["review", "change_request", "progress_update", "blocker", "handoff"],
+    progressKeywords: ["策划审查", "设计质量", "核心循环", "数值", "范围", "一致性", "可测试性"]
   },
   {
     agentId: "art_director",
@@ -112,9 +140,9 @@ export const defaultAgentContracts: AgentContract[] = [
       read: ["project", "decision", "producer_preference", "artifact", "qa"],
       write: ["role", "artifact", "decision", "knowledge"]
     },
-    tools: ["read_artifact", "write_artifact", "create_asset_spec", "review_asset", "create_task"],
+    tools: ["read_artifact", "write_artifact", "generate_raster_asset", "create_asset_spec", "create_task"],
     forbiddenActions: ["write_gameplay_code", "edit_cocos_scene_directly", "deploy_release", "read_secret_plaintext"],
-    handoffTargets: ["asset_production", "cocos_automation", "qa_evaluator", "producer"],
+    handoffTargets: ["visual_quality_reviewer", "asset_production", "cocos_automation", "qa_evaluator", "producer"],
     messageTypes: ["plan_submission", "asset_review", "decision_request", "progress_update", "handoff"],
     progressKeywords: ["美术", "风格", "art bible", "资产", "色板", "ui", "视觉"]
   },
@@ -134,11 +162,40 @@ export const defaultAgentContracts: AgentContract[] = [
       read: ["project", "decision", "artifact", "producer_preference"],
       write: ["role", "artifact", "knowledge"]
     },
-    tools: ["generate_image", "render_svg_to_png", "postprocess_asset", "write_asset_manifest", "create_task"],
+    tools: ["generate_raster_asset", "generate_image", "render_svg_to_png", "postprocess_asset", "write_asset_manifest", "create_task"],
     forbiddenActions: ["decide_art_direction", "write_gameplay_code", "read_provider_api_key", "deploy_release"],
-    handoffTargets: ["art_director", "cocos_automation", "qa_evaluator"],
+    handoffTargets: ["art_director", "visual_quality_reviewer", "cocos_automation", "qa_evaluator"],
     messageTypes: ["deliverable", "asset_review", "progress_update", "blocker", "handoff"],
     progressKeywords: ["资产", "sprite", "图集", "manifest", "图片", "动画", "生成"]
+  },
+  {
+    agentId: "visual_quality_reviewer",
+    displayName: "Principal Visual Quality Director",
+    roleScope: "Independently reviews actual rendered pixels as a principal 2D game art director and mobile technical artist, covering style consistency, silhouette and small-screen readability, contrast and UI hierarchy, transparent edges, animation continuity, runtime budgets, Art Bible compliance, and IP/safety risk.",
+    roomMemberships: ["studio-main", "art-room", "qa-room"],
+    stageLeads: ["concept_discussion", "concept_review", "production", "first_playable_review"],
+    modelProfile: {
+      capability: "vision",
+      costTier: "premium",
+      contextPolicy: "project_pack"
+    },
+    workspace: "agents/review/art/",
+    memoryScopes: {
+      read: ["project", "decision", "artifact", "qa", "producer_preference", "knowledge"],
+      write: ["role", "artifact", "knowledge"]
+    },
+    tools: ["read_artifact", "inspect_visual_assets", "write_artifact"],
+    forbiddenActions: [
+      "modify_reviewed_artifacts",
+      "generate_reviewed_assets",
+      "approve_producer_gate",
+      "review_own_work",
+      "waive_major_quality_issue",
+      "read_secret_plaintext"
+    ],
+    handoffTargets: ["art_director", "asset_production", "producer", "qa_evaluator"],
+    messageTypes: ["asset_review", "review", "change_request", "progress_update", "blocker", "handoff"],
+    progressKeywords: ["视觉审查", "像素", "可读性", "轮廓", "透明边缘", "技术美术", "美术质量"]
   },
   {
     agentId: "cocos_tech_lead",

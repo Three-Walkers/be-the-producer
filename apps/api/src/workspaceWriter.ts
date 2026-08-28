@@ -1,7 +1,16 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, extname, join, relative, sep } from "node:path";
-import type { Artifact, MemoryRecord, StudioMessage, Task } from "@game-pipeline/shared-schemas";
+import type {
+  Artifact,
+  MemoryRecord,
+  ProductionAuditFinding,
+  ProductionAuditRun,
+  ProductionEvidenceBundle,
+  StudioMessage,
+  Task,
+  TaskEpisode
+} from "@game-pipeline/shared-schemas";
 import type { StudioKernel } from "@game-pipeline/agent-runtime";
 import {
   assertSafePathSegment,
@@ -57,6 +66,15 @@ export interface ToolArtifactWriteResult {
   relativePath: string;
   absolutePath: string;
   content: string;
+  hash: string;
+  sizeBytes: number;
+  materializedAt: string;
+}
+
+export interface ToolArtifactBinaryWriteResult {
+  projectRoot: string;
+  relativePath: string;
+  absolutePath: string;
   hash: string;
   sizeBytes: number;
   materializedAt: string;
@@ -146,6 +164,12 @@ export function syncProjectWorkspace(kernel: StudioKernel, workspaceRoot = defau
   writeJson(projectRoot, "shared/claims/claim-verifications.json", kernel.listClaimVerifications(), filesWritten);
   writeJson(projectRoot, "shared/claims/claim-repairs.json", claimRepairs, filesWritten);
   writeJson(projectRoot, "shared/audit/audit-events.json", kernel.listAuditEvents(), filesWritten);
+  writeJson(projectRoot, "shared/audit/task-episodes.json", kernel.listTaskEpisodes(), filesWritten);
+  writeJson(projectRoot, "shared/audit/evidence-bundles.json", kernel.listEvidenceBundles(), filesWritten);
+  writeJson(projectRoot, "shared/audit/findings.json", kernel.listProductionAuditFindings(), filesWritten);
+  writeJson(projectRoot, "shared/audit/intervention-ledger.json", kernel.listInterventionLedger(), filesWritten);
+  writeJson(projectRoot, "shared/audit/audit-runs.json", kernel.listProductionAuditRuns(), filesWritten);
+  writeProductionAuditRuns(projectRoot, kernel, filesWritten);
 
   return {
     projectRoot,
@@ -219,6 +243,42 @@ export function writeToolArtifactContent(
     hash,
     sizeBytes: stats.size,
     materializedAt
+  };
+}
+
+export function writeToolArtifactBinaryContent(
+  kernel: StudioKernel,
+  artifact: Artifact,
+  content: Buffer,
+  workspaceRoot = defaultWorkspaceRoot()
+): ToolArtifactBinaryWriteResult {
+  if (!Buffer.isBuffer(content) || content.byteLength === 0) {
+    throw new Error("二进制交付物内容不能为空。");
+  }
+  const projectRoot = ensureProjectWorkspaceRoot(kernel.project.projectId, workspaceRoot);
+  const filesWritten: string[] = [];
+  writeCocosProjectScaffold(projectRoot, kernel, filesWritten);
+  const relativePath = safeWorkspacePath(artifactFilePath(artifact));
+  let resolved = resolvePathWithinRoot(projectRoot, relativePath, {
+    allowMissing: true,
+    expectedKind: "file",
+    label: "二进制交付物路径"
+  });
+  ensureSafeDirectory(projectRoot, dirname(relativePath), "二进制交付物父目录");
+  resolved = resolvePathWithinRoot(projectRoot, relativePath, {
+    allowMissing: true,
+    expectedKind: "file",
+    label: "二进制交付物路径"
+  });
+  writeFileSync(resolved.absolutePath, content, { mode: 0o600 });
+  const stats = statSync(resolved.absolutePath);
+  return {
+    projectRoot,
+    relativePath: relative(projectRoot, resolved.absolutePath).split(sep).join("/"),
+    absolutePath: resolved.absolutePath,
+    hash: hashWorkspaceFile(resolved.absolutePath),
+    sizeBytes: stats.size,
+    materializedAt: stats.mtime.toISOString()
   };
 }
 
@@ -494,6 +554,215 @@ function writeJsonLines(projectRoot: string, path: string, records: MemoryRecord
   writeText(projectRoot, path, `${records.map((record) => JSON.stringify(record)).join("\n")}\n`, filesWritten);
 }
 
+function writeProductionAuditRuns(projectRoot: string, kernel: StudioKernel, filesWritten: string[]): void {
+  const episodes = new Map(kernel.listTaskEpisodes().map((episode) => [episode.episodeId, episode] as const));
+  const bundles = new Map(kernel.listEvidenceBundles().map((bundle) => [bundle.bundleId, bundle] as const));
+  const runs = kernel.listProductionAuditRuns();
+  for (const run of runs) {
+    const hasFrozenSnapshots = Boolean(run.episodeSnapshot && run.evidenceBundleSnapshot);
+    if (!hasFrozenSnapshots && validateSealedLegacyAuditRun(projectRoot, run)) {
+      continue;
+    }
+    const episode = run.episodeSnapshot ?? episodes.get(run.episodeId);
+    const bundle = run.evidenceBundleSnapshot ?? bundles.get(run.bundleId);
+    if (!episode || !bundle) continue;
+    const documents = auditRunDocuments(run, episode, bundle);
+    for (const document of documents) {
+      writeImmutableText(projectRoot, document.path, document.content, filesWritten);
+    }
+    const manifest = {
+      schemaVersion: 1,
+      kind: "production_audit_manifest",
+      auditRunId: run.auditRunId,
+      projectId: run.projectId,
+      episodeId: run.episodeId,
+      evidenceDigest: run.evidenceDigest,
+      immutable: true,
+      files: documents.map((document) => ({
+        path: document.path,
+        sha256: createHash("sha256").update(document.content).digest("hex"),
+        sizeBytes: Buffer.byteLength(document.content, "utf8")
+      })),
+      createdAt: run.createdAt
+    };
+    writeImmutableText(projectRoot, run.reportPaths.manifest, `${JSON.stringify(manifest, null, 2)}\n`, filesWritten);
+  }
+  const latest = runs.at(-1);
+  if (latest) {
+    writeJson(projectRoot, "shared/audit/latest.json", latest, filesWritten);
+  }
+}
+
+function validateSealedLegacyAuditRun(projectRoot: string, run: ProductionAuditRun): boolean {
+  const manifestPath = safeWorkspacePath(run.reportPaths.manifest);
+  const manifestTarget = resolvePathWithinRoot(projectRoot, manifestPath, {
+    allowMissing: true,
+    expectedKind: "file",
+    label: "历史审计清单"
+  }).absolutePath;
+  if (!existsSync(manifestTarget)) return false;
+  if (!statSync(manifestTarget).isFile()) {
+    throw new Error(`历史审计清单不是文件：${manifestPath}`);
+  }
+
+  let manifest: unknown;
+  try {
+    manifest = JSON.parse(readFileSync(manifestTarget, "utf8"));
+  } catch {
+    throw new Error(`历史审计清单无法解析：${manifestPath}`);
+  }
+  if (!isAuditManifest(manifest) || manifest.auditRunId !== run.auditRunId || manifest.immutable !== true) {
+    throw new Error(`历史审计清单身份无效：${manifestPath}`);
+  }
+  for (const entry of manifest.files) {
+    const path = safeWorkspacePath(entry.path);
+    const target = resolvePathWithinRoot(projectRoot, path, {
+      allowMissing: true,
+      expectedKind: "file",
+      label: "历史审计文件"
+    }).absolutePath;
+    if (!existsSync(target) || !statSync(target).isFile()) {
+      throw new Error(`历史审计文件缺失：${path}`);
+    }
+    const content = readFileSync(target);
+    const hash = createHash("sha256").update(content).digest("hex");
+    if (hash !== entry.sha256 || content.byteLength !== entry.sizeBytes) {
+      throw new Error(`历史审计文件校验失败：${path}`);
+    }
+  }
+  return true;
+}
+
+function isAuditManifest(value: unknown): value is {
+  auditRunId: string;
+  immutable: boolean;
+  files: Array<{ path: string; sha256: string; sizeBytes: number }>;
+} {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    typeof record.auditRunId === "string" &&
+    typeof record.immutable === "boolean" &&
+    Array.isArray(record.files) &&
+    record.files.every((entry) => {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) return false;
+      const file = entry as Record<string, unknown>;
+      return typeof file.path === "string" && typeof file.sha256 === "string" && typeof file.sizeBytes === "number";
+    })
+  );
+}
+
+function auditRunDocuments(
+  run: ProductionAuditRun,
+  episode: TaskEpisode,
+  bundle: ProductionEvidenceBundle
+): Array<{ path: string; content: string }> {
+  const episodeJson = `${JSON.stringify(episode, null, 2)}\n`;
+  const bundleJson = `${JSON.stringify(bundle, null, 2)}\n`;
+  const findingsJson = `${JSON.stringify(run.findings, null, 2)}\n`;
+  const markdown = renderProductionAuditMarkdown(run, episode, bundle);
+  const html = renderProductionAuditHtml(run, episode, bundle);
+  return [
+    { path: run.reportPaths.episode, content: episodeJson },
+    { path: run.reportPaths.evidenceBundle, content: bundleJson },
+    { path: run.reportPaths.findings, content: findingsJson },
+    { path: run.reportPaths.markdown, content: markdown },
+    { path: run.reportPaths.html, content: html }
+  ];
+}
+
+function renderProductionAuditMarkdown(
+  run: ProductionAuditRun,
+  episode: TaskEpisode,
+  bundle: ProductionEvidenceBundle
+): string {
+  const laneSections = bundle.lanes.map((lane) => [
+    `### ${auditLaneLabel(lane.kind)} · ${lane.status}`,
+    "",
+    ...(lane.facts.length > 0 ? lane.facts.map((fact) => `- [${fact.status}] ${fact.summary} (${fact.ref})`) : ["- 无已观察证据"]),
+    ...(lane.missing.length > 0 ? ["", "缺口：", ...lane.missing.map((missing) => `- ${missing}`)] : [])
+  ].join("\n")).join("\n\n");
+  const findingSections = run.findings.length > 0
+    ? run.findings.map(renderAuditFindingMarkdown).join("\n\n")
+    : "没有开放 Finding。";
+  return [
+    `# 生产审计 ${run.auditRunId}`,
+    "",
+    `- 状态：${run.status}`,
+    `- 触发：${run.trigger} / ${run.triggerRef}`,
+    `- 阶段：${run.stageId}`,
+    `- Evidence Bundle：${run.bundleId}`,
+    `- Evidence Digest：${run.evidenceDigest}`,
+    `- 创建时间：${run.createdAt}`,
+    "",
+    "## Task Episode",
+    "",
+    `目标：${episode.goal}`,
+    "",
+    "验收边界：",
+    ...episode.acceptanceBoundary.map((item) => `- ${item}`),
+    "",
+    "## 独立证据通道",
+    "",
+    laneSections,
+    "",
+    "## Findings",
+    "",
+    findingSections,
+    ""
+  ].join("\n");
+}
+
+function renderAuditFindingMarkdown(finding: ProductionAuditFinding): string {
+  return [
+    `### [${finding.severity}] ${finding.title}`,
+    "",
+    `- 责任角色：${finding.ownerAgentId}`,
+    `- 维度：${finding.dimension}`,
+    `- 原因：${finding.reason}`,
+    `- 预期结果：${finding.expectedOutcome}`,
+    `- 修复边界：${finding.repairBoundary}`,
+    `- 证据：${finding.evidenceRefs.join("、") || "unavailable"}`,
+    `- 复验：${finding.acceptanceChecks.join("；")}`
+  ].join("\n");
+}
+
+function renderProductionAuditHtml(
+  run: ProductionAuditRun,
+  episode: TaskEpisode,
+  bundle: ProductionEvidenceBundle
+): string {
+  const lanes = bundle.lanes.map((lane) => `<section>
+    <header><h2>${escapeAuditHtml(auditLaneLabel(lane.kind))}</h2><span class="pill ${escapeAuditHtml(lane.status)}">${escapeAuditHtml(lane.status)}</span></header>
+    <ul>${lane.facts.map((fact) => `<li><b>${escapeAuditHtml(fact.status)}</b> ${escapeAuditHtml(fact.summary)} <code>${escapeAuditHtml(fact.ref)}</code></li>`).join("") || "<li>无已观察证据</li>"}</ul>
+    ${lane.missing.length ? `<div class="missing"><strong>证据缺口</strong><ul>${lane.missing.map((item) => `<li>${escapeAuditHtml(item)}</li>`).join("")}</ul></div>` : ""}
+  </section>`).join("");
+  const findings = run.findings.map((finding) => `<article class="finding ${escapeAuditHtml(finding.severity)}">
+    <header><h3>${escapeAuditHtml(finding.title)}</h3><span class="pill">${escapeAuditHtml(finding.severity)}</span></header>
+    <p>${escapeAuditHtml(finding.reason)}</p>
+    <dl><dt>责任角色</dt><dd>${escapeAuditHtml(finding.ownerAgentId)}</dd><dt>预期结果</dt><dd>${escapeAuditHtml(finding.expectedOutcome)}</dd><dt>修复边界</dt><dd>${escapeAuditHtml(finding.repairBoundary)}</dd><dt>证据</dt><dd>${escapeAuditHtml(finding.evidenceRefs.join("、") || "unavailable")}</dd></dl>
+  </article>`).join("") || "<p>没有开放 Finding。</p>";
+  return `<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>生产审计 ${escapeAuditHtml(run.auditRunId)}</title>
+<style>body{margin:0;background:#f5f7f4;color:#202723;font:15px/1.6 system-ui,-apple-system,sans-serif}main{max-width:1040px;margin:auto;padding:32px}h1,h2,h3{margin:0}header{display:flex;justify-content:space-between;gap:16px;align-items:center}.summary,section,.finding{margin:16px 0;border:1px solid #d6ded8;background:#fff;padding:18px;border-radius:8px}.meta{color:#66716a}.pill{display:inline-block;border-radius:999px;background:#e7f3ee;color:#17684f;padding:3px 10px;font-weight:700}.partial,.high{background:#fff1d7;color:#9a5c00}.failed,.blocked,.critical{background:#fde8e7;color:#a8322f}.missing{border-left:3px solid #c47b16;padding-left:12px;color:#765019}code{font-size:12px;color:#17684f;word-break:break-all}dt{font-weight:700}dd{margin:0 0 8px}</style></head>
+<body><main><header><div><p class="meta">Be The Producer · Production Audit</p><h1>${escapeAuditHtml(run.auditRunId)}</h1></div><span class="pill ${escapeAuditHtml(run.status)}">${escapeAuditHtml(run.status)}</span></header>
+<div class="summary"><p><b>Task Episode</b> ${escapeAuditHtml(episode.episodeId)}</p><p>${escapeAuditHtml(episode.goal)}</p><p class="meta">${escapeAuditHtml(run.trigger)} · ${escapeAuditHtml(run.triggerRef)} · ${escapeAuditHtml(run.createdAt)}</p></div>
+<h2>独立证据通道</h2>${lanes}<h2>Findings</h2>${findings}</main></body></html>\n`;
+}
+
+function auditLaneLabel(kind: ProductionEvidenceBundle["lanes"][number]["kind"]): string {
+  return {
+    session: "会话与意图证据",
+    artifact: "产物与物化证据",
+    validation: "独立验证证据",
+    decision_delivery: "决策、交接与交付证据"
+  }[kind];
+}
+
+function escapeAuditHtml(value: string): string {
+  return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#039;");
+}
+
 function writeCocosProjectScaffold(projectRoot: string, kernel: StudioKernel, filesWritten: string[]): void {
   const now = new Date().toISOString();
   const packageName = sanitizePackageName(kernel.project.name, kernel.project.projectId);
@@ -637,6 +906,20 @@ function writeTextIfMissing(projectRoot: string, path: string, content: string, 
   writeText(projectRoot, path, content, filesWritten);
 }
 
+function writeImmutableText(projectRoot: string, path: string, content: string, filesWritten: string[]): void {
+  const safePath = safeWorkspacePath(path);
+  const absolutePath = resolvePathWithinRoot(projectRoot, safePath, {
+    allowMissing: true,
+    expectedKind: "file",
+    label: "不可变审计文件"
+  }).absolutePath;
+  if (existsSync(absolutePath)) {
+    if (statSync(absolutePath).isFile() && readFileSync(absolutePath, "utf8") === content) return;
+    throw new Error(`不可变审计文件内容冲突：${safePath}`);
+  }
+  writeText(projectRoot, safePath, content, filesWritten);
+}
+
 function writeText(projectRoot: string, path: string, content: string, filesWritten: string[]): void {
   const safePath = safeWorkspacePath(path);
   let resolved = resolvePathWithinRoot(projectRoot, safePath, {
@@ -672,6 +955,38 @@ function writeArtifactFile(
   const sourceMemory = memory.filter((record) => record.sourceArtifactId === artifact.artifactId || record.ownerAgent === artifact.ownerAgentId);
   const artifactDocument = artifactDocumentView(artifact);
   const toolContent = typeof artifact.metadata.toolContent === "string" ? artifact.metadata.toolContent : undefined;
+  const strictContract =
+    artifact.type === "game_contract" ||
+    artifact.type === "scene_blueprint" ||
+    artifact.type === "playtest_contract" ||
+    artifact.type === "asset_manifest" ||
+    artifact.type === "quality_review";
+
+  if (strictContract && toolContent === undefined) {
+    const absolutePath = resolvePathWithinRoot(projectRoot, safeWorkspacePath(targetPath), {
+      allowMissing: true,
+      expectedKind: "file",
+      label: "严格契约交付路径"
+    }).absolutePath;
+    const strictFileExists = existsSync(absolutePath) && statSync(absolutePath).isFile();
+    if (
+      strictFileExists &&
+      isGeneratedArtifactPlaceholder(artifact, readFileSync(absolutePath, "utf8"))
+    ) {
+      const ledger = kernel.listArtifactLedger().find((entry) => entry.artifactId === artifact.artifactId);
+      if (ledger?.status === "verified") {
+        invalidateGeneratedPlaceholderEvidence(kernel, artifact);
+      }
+      unlinkSync(absolutePath);
+      return;
+    }
+    // A registry record and pending ledger are the placeholder. Writing a JSON
+    // wrapper to the canonical contract path would look like malformed source
+    // input to the model and to every strict consumer.
+    if (!strictFileExists || artifact.metadata.nativeHarnessManaged !== true) {
+      return;
+    }
+  }
 
   if (artifact.metadata.nativeHarnessManaged === true) {
     const absolutePath = resolvePathWithinRoot(projectRoot, safeWorkspacePath(targetPath), {
@@ -680,6 +995,21 @@ function writeArtifactFile(
       label: "Harness 交付物路径"
     }).absolutePath;
     if (existsSync(absolutePath) && statSync(absolutePath).isFile()) {
+      const content = readFileSync(absolutePath, "utf8");
+      if (isGeneratedArtifactPlaceholder(artifact, content)) {
+        const ledger = kernel.listArtifactLedger().find((entry) => entry.artifactId === artifact.artifactId);
+        if (ledger?.status === "verified") {
+          invalidateGeneratedPlaceholderEvidence(kernel, artifact);
+        }
+        return;
+      }
+      // A native file is evidence only when an authorized Harness operation
+      // stamped the current artifact version. Evidence reconciliation clears
+      // this timestamp after external mutation; workspace sync must not bless
+      // the remaining bytes again without a fresh Agent tool operation.
+      if (!artifact.metadata.toolExecutedAt) {
+        return;
+      }
       recordArtifactFileEvidence(projectRoot, kernel, artifact, targetPath);
       return;
     }
@@ -691,12 +1021,70 @@ function writeArtifactFile(
     return;
   }
 
-  if (targetPath.endsWith(".json")) {
-    writeJson(projectRoot, targetPath, { artifact: artifactDocument, sourceTask, relatedMemory: sourceMemory }, filesWritten);
+  // Binary deliverables are represented by a pending registry/ledger entry
+  // until a privileged media tool writes real bytes. A Markdown placeholder at
+  // a .png path would look like a materialized image to downstream tooling.
+  if (/\.(?:png|jpe?g|webp)$/i.test(targetPath)) {
     return;
   }
 
-  writeText(projectRoot, targetPath, renderArtifactMarkdown(artifact, sourceTask, sourceMemory), filesWritten);
+  if (targetPath.endsWith(".json")) {
+    writeTextIfMissing(
+      projectRoot,
+      targetPath,
+      `${JSON.stringify({ artifact: artifactDocument, sourceTask, relatedMemory: sourceMemory }, null, 2)}\n`,
+      filesWritten
+    );
+    return;
+  }
+
+  // Registry placeholders are useful orientation, but they are not source-of-truth
+  // deliverables. Never overwrite a file that a task Harness may have written
+  // between its tool event and the later evidence-capture checkpoint.
+  writeTextIfMissing(projectRoot, targetPath, renderArtifactMarkdown(artifact, sourceTask, sourceMemory), filesWritten);
+}
+
+function isGeneratedArtifactPlaceholder(artifact: Artifact, content: string): boolean {
+  if (artifactFilePath(artifact).endsWith(".json")) {
+    try {
+      const value = JSON.parse(content) as Record<string, unknown>;
+      const artifactDocument = value.artifact;
+      return (
+        Object.keys(value).length === 3 &&
+        "sourceTask" in value &&
+        "relatedMemory" in value &&
+        typeof artifactDocument === "object" &&
+        artifactDocument !== null &&
+        !Array.isArray(artifactDocument) &&
+        (artifactDocument as Record<string, unknown>).artifactId === artifact.artifactId
+      );
+    } catch {
+      return false;
+    }
+  }
+  return (
+    content.startsWith(`# ${artifact.artifactId}\n\nType: ${artifact.type}\n\nOwner: ${artifact.ownerAgentId}\n\nStage: `) &&
+    content.includes("\n## Source Task\n") &&
+    content.includes("\n## Metadata\n")
+  );
+}
+
+function invalidateGeneratedPlaceholderEvidence(kernel: StudioKernel, artifact: Artifact): void {
+  const now = new Date().toISOString();
+  const issue =
+    `系统撤销了 ${artifact.path} 的 verified 证据：该文件是工作区注册表占位内容，不是真实 Harness 交付物。` +
+    "任务状态不会跨阶段自动回退；继续执行前需要当前工作流显式处理此证据缺口。";
+  kernel.upsertArtifact({
+    ...artifact,
+    status: "change_requested",
+    version: artifact.version + 1,
+    metadata: {
+      ...artifact.metadata,
+      generatedPlaceholderEvidenceInvalidatedAt: now,
+      generatedPlaceholderEvidenceIssue: issue
+    },
+    updatedAt: now
+  });
 }
 
 function artifactDocumentView(artifact: Artifact): Artifact {

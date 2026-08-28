@@ -38,8 +38,8 @@ try {
     outputArtifacts: ["artifact_playtest_contract"]
   });
 
-  // Workspace scaffolds are useful navigation aids, but must never count as
-  // materialized production evidence.
+  // The registry is the navigation aid for pending strict contracts. Their
+  // canonical path must remain absent until a validated tool materializes it.
   kernel.addArtifact({
     artifactId: "artifact_placeholder_contract",
     projectId,
@@ -57,7 +57,7 @@ try {
   });
   syncProjectWorkspace(kernel);
   const placeholderPath = resolveWorkspacePathTarget(projectId, "agents/design/contracts/placeholder-game-contract.json");
-  assert.equal(placeholderPath.exists, true, "workspace sync should create a navigable placeholder");
+  assert.equal(placeholderPath.exists, false, "workspace sync must not create malformed strict-contract placeholder JSON");
   assert.equal(
     kernel.listArtifactLedger().find((entry) => entry.artifactId === "artifact_placeholder_contract")?.status,
     "pending",

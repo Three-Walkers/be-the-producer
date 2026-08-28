@@ -302,17 +302,30 @@ function inputArtifactsVerified(kernel: StudioKernel, task: Task): boolean {
 function advanceVerifiedTasksToReview(kernel: StudioKernel): void {
   const executionStages = taskExecutionStages(kernel);
   for (const task of kernel.listTasks()) {
-    if (
-      executionStages.has(task.stageId) &&
-      task.taskLevel !== "task_group" &&
-      ["todo", "doing"].includes(task.status) &&
-      taskOutputsVerified(kernel, task)
-    ) {
+    if (!executionStages.has(task.stageId) || task.taskLevel === "task_group" || !taskOutputsVerified(kernel, task)) {
+      continue;
+    }
+    const now = new Date().toISOString();
+    const advancedToReview = ["todo", "doing"].includes(task.status);
+    if (advancedToReview) {
       kernel.updateTask(task.taskId, {
         status: "review",
         progressPercent: 90,
         blockers: [],
-        updatedAt: new Date().toISOString()
+        updatedAt: now
+      });
+    }
+    const agentState = kernel.getAgentLoopState().agents[task.ownerAgentId];
+    if (
+      (advancedToReview || ["review", "done"].includes(task.status)) &&
+      agentState?.taskId === task.taskId &&
+      agentState.status !== "working"
+    ) {
+      kernel.updateAgentLoopAgent(task.ownerAgentId, {
+        status: "waiting",
+        taskId: task.taskId,
+        lastError: undefined,
+        updatedAt: now
       });
     }
   }
@@ -378,7 +391,9 @@ function applyTaskOutcome(
   const control = readLoopControl(message);
   const toolResults = readToolResults(message);
   const successfulTools = toolResults.filter((result) => result.status === "completed");
-  const failedTools = toolResults.filter((result) => result.status === "failed");
+  const failedTools = toolResults.filter(
+    (result) => result.status === "failed" && !toolFailureWasSuperseded(result, successfulTools)
+  );
   const now = new Date().toISOString();
 
   if (message.metadata.failure === true) {
@@ -635,6 +650,23 @@ function readLoopControl(message: StudioMessage): AgentLoopControl | undefined {
 
 function readToolResults(message: StudioMessage): ToolExecutionResult[] {
   return Array.isArray(message.metadata.toolExecutions) ? (message.metadata.toolExecutions as ToolExecutionResult[]) : [];
+}
+
+function toolFailureWasSuperseded(
+  failure: ToolExecutionResult,
+  successfulTools: ToolExecutionResult[]
+): boolean {
+  if (
+    !failure.path ||
+    (failure.toolName !== "write_artifact" && failure.toolName !== "append_document")
+  ) {
+    return false;
+  }
+  return successfulTools.some(
+    (success) =>
+      success.path === failure.path &&
+      (success.toolName === "write_artifact" || success.toolName === "append_document")
+  );
 }
 
 function mergeBlockers(current: string[], blocker: string): string[] {

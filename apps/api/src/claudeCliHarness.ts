@@ -1,11 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, type Dirent } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AgentContract, AgentLoopControl } from "@game-pipeline/shared-schemas";
 import type { AgentHarness, AgentHarnessProgressEvent, AgentHarnessRunInput, AgentHarnessRunResult, AgentHarnessStatus, AgentHarnessToolOperation } from "./agentHarness.js";
 import { cocosEngineSettingsStore } from "./cocosEngineSettings.js";
+import { modelSettingsStore } from "./modelSettings.js";
 
 const defaultTimeoutMs = 20 * 60 * 1000;
 const defaultInitialProgressTimeoutMs = 3 * 60 * 1000;
@@ -41,6 +42,47 @@ export class ClaudeCliTimeoutError extends Error {
     this.kind = kind;
     this.timeoutMs = timeoutMs;
   }
+}
+
+export type ClaudeCliProcessFailureKind =
+  | "provider_terminated"
+  | "provider_rate_limited"
+  | "provider_overloaded"
+  | "provider_timeout"
+  | "authentication"
+  | "session"
+  | "process_exit";
+
+export class ClaudeCliProcessError extends Error {
+  readonly exitCode: number | null;
+  readonly signal: NodeJS.Signals | null;
+  readonly kind: ClaudeCliProcessFailureKind;
+  readonly retryable: boolean;
+  readonly detail: string;
+
+  constructor(input: {
+    exitCode: number | null;
+    signal: NodeJS.Signals | null;
+    kind: ClaudeCliProcessFailureKind;
+    retryable: boolean;
+    detail: string;
+  }) {
+    const exit = input.exitCode === null ? "未知退出码" : `退出码 ${input.exitCode}`;
+    const signal = input.signal ? `，信号 ${input.signal}` : "";
+    super(`Claude CLI 会话失败（${exit}${signal}）：${input.detail}`);
+    this.name = "ClaudeCliProcessError";
+    this.exitCode = input.exitCode;
+    this.signal = input.signal;
+    this.kind = input.kind;
+    this.retryable = input.retryable;
+    this.detail = input.detail;
+  }
+}
+
+export interface ClaudeCliFailureDiagnosis {
+  kind: ClaudeCliProcessFailureKind;
+  retryable: boolean;
+  detail: string;
 }
 
 export class ClaudeCliHarness implements AgentHarness {
@@ -107,7 +149,7 @@ export class ClaudeCliHarness implements AgentHarness {
       claudeToolsForAgent(input.agent, input.toolMode ?? "task").join(","),
       "--strict-mcp-config",
       "--mcp-config",
-      mcpConfig(input, controlPath, operationLogPath),
+      mcpConfig(input, controlPath, operationLogPath, invocationId),
       "--model",
       input.model,
       "--name",
@@ -149,7 +191,8 @@ export class ClaudeCliHarness implements AgentHarness {
                 operationLogPath,
                 projectRoot: input.projectRoot,
                 expectedPaths: input.expectedPaths ?? [],
-                initialProgressTimeoutMs: this.options.initialProgressTimeoutMs ?? defaultInitialProgressTimeoutMs,
+                initialProgressTimeoutMs:
+                  input.initialProgressTimeoutMs ?? this.options.initialProgressTimeoutMs ?? defaultInitialProgressTimeoutMs,
                 idleAfterProgressMs: this.options.idleAfterProgressMs ?? defaultIdleAfterProgressMs,
                 settleAfterExpectedOutputsMs: this.options.settleAfterExpectedOutputsMs ?? defaultSettleAfterExpectedOutputsMs,
                 onOperation: (operation) => {
@@ -169,7 +212,9 @@ export class ClaudeCliHarness implements AgentHarness {
                 }
               }
             }),
-        ...(input.abortSignal ? { abortSignal: input.abortSignal } : {})
+        ...(input.abortSignal ? { abortSignal: input.abortSignal } : {}),
+        diagnosticConfigDir: configDir,
+        ...(input.sessionId ? { diagnosticSessionId: input.sessionId } : {})
       });
     } catch (error) {
       emitHarnessProgress(input, {
@@ -189,7 +234,13 @@ export class ClaudeCliHarness implements AgentHarness {
     const parsed = parseStreamJson(result.stdout);
     const loopControl = readLoopControl(controlPath);
     const toolOperations = readToolOperations(operationLogPath);
-    const changedPaths = [...new Set(toolOperations.map((operation) => operation.path))];
+    const changedPaths = [
+      ...new Set(
+        toolOperations
+          .filter((operation) => toolOperationSucceeded(operation) && operation.access !== "read")
+          .map((operation) => operation.path)
+      )
+    ];
     if (!parsed.content.trim() && !result.terminationReason) {
       const error = new Error(`Claude CLI 没有返回可读取内容。${compactProcessError(result.stderr)}`);
       emitHarnessProgress(input, {
@@ -271,6 +322,10 @@ function claudeToolsForAgent(agent: AgentContract, mode: "conversation" | "task"
   ];
   if (["art_director", "asset_production"].includes(agent.agentId)) {
     tools.push("mcp__btp_workspace__render_svg_to_png");
+    tools.push("mcp__btp_workspace__generate_raster_asset");
+  }
+  if (agent.agentId === "visual_quality_reviewer") {
+    tools.push("mcp__btp_workspace__inspect_visual_assets");
   }
   if (agent.agentId === "qa_evaluator") {
     tools.push("mcp__btp_workspace__run_playtest");
@@ -286,8 +341,18 @@ function claudeToolsForAgent(agent: AgentContract, mode: "conversation" | "task"
   return tools;
 }
 
-function mcpConfig(input: AgentHarnessRunInput, controlPath: string, operationLogPath: string): string {
+function mcpConfig(
+  input: AgentHarnessRunInput,
+  controlPath: string,
+  operationLogPath: string,
+  invocationId: string
+): string {
   const cocosConfig = cocosEngineSettingsStore.getResolvedConfig();
+  const mediaEnabled =
+    input.authorization.mode === "task" &&
+    ["art_director", "asset_production", "visual_quality_reviewer"].includes(input.agent.agentId);
+  const mediaProvider = mediaEnabled ? modelSettingsStore.getProviderConfig("dashscope") : undefined;
+  const mediaOrigin = mediaProvider?.baseUrl ? new URL(mediaProvider.baseUrl).origin : undefined;
   return JSON.stringify({
     mcpServers: {
       btp_workspace: {
@@ -304,6 +369,22 @@ function mcpConfig(input: AgentHarnessRunInput, controlPath: string, operationLo
           BTP_TASK_INPUT_EVIDENCE: JSON.stringify(input.taskInputEvidence ?? []),
           BTP_CONTROL_PATH: controlPath,
           BTP_OPERATION_LOG_PATH: operationLogPath,
+          BTP_PROVIDER_ID: input.provider.providerId,
+          BTP_MODEL: input.model,
+          BTP_HARNESS_INVOCATION_ID: invocationId,
+          ...(mediaProvider?.apiKey
+            ? {
+                BTP_MULTIMODAL_API_KEY: mediaProvider.apiKey,
+                BTP_IMAGE_GENERATION_ENDPOINT:
+                  process.env.BTP_IMAGE_GENERATION_ENDPOINT ??
+                  `${mediaOrigin}/api/v1/services/aigc/multimodal-generation/generation`,
+                BTP_VISION_REVIEW_ENDPOINT:
+                  process.env.BTP_VISION_REVIEW_ENDPOINT ??
+                  `${mediaProvider.baseUrl.replace(/\/+$/, "")}/chat/completions`,
+                BTP_IMAGE_GENERATION_MODEL: process.env.BTP_IMAGE_GENERATION_MODEL ?? "wan2.7-image-pro",
+                BTP_VISION_REVIEW_MODEL: process.env.BTP_VISION_REVIEW_MODEL ?? "qwen3.8-max"
+              }
+            : {}),
           BTP_COCOS_EXECUTABLE: cocosConfig.executablePath,
           BTP_COCOS_VERSION: cocosConfig.version,
           BTP_COCOS_PLATFORM: cocosConfig.platform,
@@ -344,6 +425,7 @@ function parseToolOperations(operationLogPath: string): AgentHarnessToolOperatio
         return [{
           toolName: parsed.toolName,
           path: parsed.path.trim(),
+          ...(parsed.access === "read" || parsed.access === "write" ? { access: parsed.access } : {}),
           ...(parsed.status === "completed" || parsed.status === "failed" ? { status: parsed.status } : {}),
           ...(typeof parsed.bridgeOk === "boolean" ? { bridgeOk: parsed.bridgeOk } : {}),
           ...(typeof parsed.operationId === "string" ? { operationId: parsed.operationId } : {}),
@@ -352,12 +434,74 @@ function parseToolOperations(operationLogPath: string): AgentHarnessToolOperatio
           ...(typeof parsed.error === "string" ? { error: parsed.error } : {}),
           ...(typeof parsed.hash === "string" ? { hash: parsed.hash } : {}),
           ...(typeof parsed.sizeBytes === "number" ? { sizeBytes: parsed.sizeBytes } : {}),
+          ...(typeof parsed.providerId === "string" ? { providerId: parsed.providerId } : {}),
+          ...(typeof parsed.model === "string" ? { model: parsed.model } : {}),
+          ...(typeof parsed.requestId === "string" ? { requestId: parsed.requestId } : {}),
+          ...(typeof parsed.promptHash === "string" ? { promptHash: parsed.promptHash } : {}),
+          ...(typeof parsed.negativePromptHash === "string"
+            ? { negativePromptHash: parsed.negativePromptHash }
+            : {}),
+          ...(typeof parsed.seed === "number" ? { seed: parsed.seed } : {}),
+          ...(typeof parsed.width === "number" ? { width: parsed.width } : {}),
+          ...(typeof parsed.height === "number" ? { height: parsed.height } : {}),
+          ...(typeof parsed.mime === "string" ? { mime: parsed.mime } : {}),
+          ...(typeof parsed.endpointFingerprint === "string"
+            ? { endpointFingerprint: parsed.endpointFingerprint }
+            : {}),
+          ...(typeof parsed.latencyMs === "number" ? { latencyMs: parsed.latencyMs } : {}),
+          ...(Array.isArray(parsed.inspectedPaths) && parsed.inspectedPaths.every((path) => typeof path === "string")
+            ? { inspectedPaths: parsed.inspectedPaths as string[] }
+            : {}),
+          ...(isInspectedEvidence(parsed.inspectedEvidence)
+            ? { inspectedEvidence: parsed.inspectedEvidence }
+            : {}),
+          ...(typeof parsed.visionResponseHash === "string"
+            ? { visionResponseHash: parsed.visionResponseHash }
+            : {}),
+          ...(typeof parsed.visionSemanticHash === "string"
+            ? { visionSemanticHash: parsed.visionSemanticHash }
+            : {}),
+          ...(isRecord(parsed.visionSemanticResult)
+            ? {
+                visionSemanticResult:
+                  parsed.visionSemanticResult as unknown as NonNullable<AgentHarnessToolOperation["visionSemanticResult"]>
+              }
+            : {}),
+          ...(Array.isArray(parsed.authoritativeContextEvidence)
+            ? {
+                authoritativeContextEvidence:
+                  parsed.authoritativeContextEvidence as NonNullable<AgentHarnessToolOperation["authoritativeContextEvidence"]>
+              }
+            : {}),
+          ...(typeof parsed.authoritativeContextHash === "string"
+            ? { authoritativeContextHash: parsed.authoritativeContextHash }
+            : {}),
+          ...(typeof parsed.requestSemanticHash === "string"
+            ? { requestSemanticHash: parsed.requestSemanticHash }
+            : {}),
+          ...(Array.isArray(parsed.visionSemanticReceipts)
+            ? {
+                visionSemanticReceipts:
+                  parsed.visionSemanticReceipts as NonNullable<AgentHarnessToolOperation["visionSemanticReceipts"]>
+              }
+            : {}),
           ...(typeof parsed.recordedAt === "string" ? { recordedAt: parsed.recordedAt } : {})
         } satisfies AgentHarnessToolOperation];
       } catch {
         return [];
       }
     });
+}
+
+function isInspectedEvidence(value: unknown): value is Array<{ path: string; hash: string; sizeBytes: number }> {
+  return Array.isArray(value) && value.every((entry) =>
+    typeof entry === "object" &&
+    entry !== null &&
+    !Array.isArray(entry) &&
+    typeof (entry as { path?: unknown }).path === "string" &&
+    typeof (entry as { hash?: unknown }).hash === "string" &&
+    typeof (entry as { sizeBytes?: unknown }).sizeBytes === "number"
+  );
 }
 
 function isDirectoryManifest(value: unknown): value is import("@game-pipeline/shared-schemas").ArtifactDirectoryManifest {
@@ -518,6 +662,8 @@ interface ProcessOptions {
   idleTimeoutMs?: number;
   abortSignal?: AbortSignal;
   onOutputActivity?: () => void;
+  diagnosticConfigDir?: string;
+  diagnosticSessionId?: string;
   progress?: {
     operationLogPath: string;
     projectRoot: string;
@@ -702,7 +848,16 @@ function runProcess(
           resolve({ stdout, stderr, terminationReason: "process_exit_with_progress", ...(firstOutputMs !== undefined ? { firstOutputMs } : {}) });
           return;
         }
-        reject(new Error(`Claude CLI 退出异常（code=${code ?? "null"}, signal=${signal ?? "none"}）：${compactProcessError(stderr || stdout)}`));
+        const sessionLog = readClaudeSessionLogTail(
+          options.diagnosticConfigDir,
+          options.diagnosticSessionId ?? parseStreamJson(stdout).sessionId
+        );
+        const diagnosis = diagnoseClaudeCliFailure({ stdout, stderr, sessionLog });
+        reject(new ClaudeCliProcessError({
+          exitCode: code,
+          signal,
+          ...diagnosis
+        }));
       });
     });
     options.abortSignal?.addEventListener("abort", abort, { once: true });
@@ -731,14 +886,168 @@ function expectedOutputsExist(progress: NonNullable<ProcessOptions["progress"]>)
   const operations = parseToolOperations(progress.operationLogPath);
   return progress.expectedPaths.every((path) =>
     operations.some((operation) =>
-      operation.status !== "failed" && operation.bridgeOk !== false &&
+      toolOperationSucceeded(operation) &&
       (operation.path === path || operation.path.startsWith(`${path.replace(/\/+$/, "")}/`))
     )
   );
 }
 
+function toolOperationSucceeded(operation: AgentHarnessToolOperation): boolean {
+  return operation.status !== "failed" && operation.bridgeOk !== false;
+}
+
 function compactProcessError(value: string): string {
   return value.replace(/\s+/g, " ").trim().slice(0, 500);
+}
+
+export function diagnoseClaudeCliFailure(input: {
+  stdout?: string;
+  stderr?: string;
+  sessionLog?: string;
+}): ClaudeCliFailureDiagnosis {
+  const structuredCandidates = [input.sessionLog ?? "", input.stdout ?? ""]
+    .flatMap((source) => extractStructuredFailureCandidates(source))
+    .reverse();
+  const stderrCandidate = extractPlainFailureCandidate(input.stderr ?? "");
+  const rawDetail = structuredCandidates.find(Boolean) ?? stderrCandidate;
+  return classifyClaudeCliFailure(rawDetail);
+}
+
+function extractStructuredFailureCandidates(source: string): string[] {
+  const candidates: string[] = [];
+  for (const line of source.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    let event: unknown;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (!isRecord(event)) continue;
+    const type = typeof event.type === "string" ? event.type : "";
+    const subtype = typeof event.subtype === "string" ? event.subtype : "";
+    const explicitFailure = event.is_error === true
+      || type === "error"
+      || /error|failed|failure/i.test(subtype)
+      || (type === "assistant" && typeof event.error === "string");
+    if (!explicitFailure) continue;
+
+    const textParts = extractTextParts(event.message);
+    const values = [
+      ...textParts,
+      typeof event.result === "string" ? event.result : "",
+      typeof event.error === "string" && event.error !== "unknown" ? event.error : "",
+      typeof event.message === "string" ? event.message : ""
+    ];
+    const candidate = values.find((value) => /API Error|error|terminated|timeout|timed out|rate.?limit|overload|unauthor|forbidden|session/i.test(value))
+      ?? values.find((value) => value.trim());
+    if (candidate) candidates.push(candidate);
+  }
+  return candidates;
+}
+
+function extractPlainFailureCandidate(source: string): string | undefined {
+  const lines = source
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !/^\{.*"type"\s*:\s*"system".*"subtype"\s*:\s*"init"/.test(line));
+  return lines.reverse().find((line) => /error|terminated|timeout|timed out|rate.?limit|overload|unauthor|forbidden|session/i.test(line))
+    ?? lines[0];
+}
+
+function classifyClaudeCliFailure(rawDetail: string | undefined): ClaudeCliFailureDiagnosis {
+  const detail = sanitizeClaudeCliFailureDetail(rawDetail ?? "");
+  if (/API Error:\s*terminated|\bterminated\b/i.test(detail)) {
+    return {
+      kind: "provider_terminated",
+      retryable: true,
+      detail: "上游模型在生成过程中终止了请求（API Error: terminated）。CLI 与工作区工具已完成初始化，本次没有形成可验收结果；可以安全重试。"
+    };
+  }
+  if (/rate.?limit|too many requests|\b429\b/i.test(detail)) {
+    return {
+      kind: "provider_rate_limited",
+      retryable: true,
+      detail: "上游模型服务触发限流，请稍后重试。"
+    };
+  }
+  if (/overload|\b529\b/i.test(detail)) {
+    return {
+      kind: "provider_overloaded",
+      retryable: true,
+      detail: "上游模型服务当前过载，请稍后重试。"
+    };
+  }
+  if (/timeout|timed out|超时/i.test(detail)) {
+    return {
+      kind: "provider_timeout",
+      retryable: true,
+      detail: "上游模型请求超时，本次没有形成可验收结果；可以安全重试。"
+    };
+  }
+  if (/authentication|unauthor|forbidden|invalid.{0,20}api.?key|\b401\b|\b403\b/i.test(detail)) {
+    return {
+      kind: "authentication",
+      retryable: false,
+      detail: "模型服务认证失败，请检查该角色绑定的 Provider、API Key 和 Base URL。"
+    };
+  }
+  if (/(?:resume|session|conversation).{0,100}(?:not found|does not exist|cannot be resumed|invalid|expired)|(?:找不到|不存在|失效|无法恢复).{0,40}(?:会话|session)/i.test(detail)) {
+    return {
+      kind: "session",
+      retryable: true,
+      detail: "原 Claude CLI 会话无法恢复，调度器将创建新的 task child session 后重试。"
+    };
+  }
+  return {
+    kind: "process_exit",
+    retryable: true,
+    detail: detail
+      ? `Claude CLI 未正常完成：${detail}`
+      : "Claude CLI 未正常完成，且没有返回可识别的错误详情；可以重试，若持续发生请查看服务端日志。"
+  };
+}
+
+function sanitizeClaudeCliFailureDetail(value: string): string {
+  return value
+    .replace(/sk-[A-Za-z0-9_-]+/g, "[redacted]")
+    .replace(/\/Users\/[^\s"']+/g, "[local-path]")
+    .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/gi, "[session]")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 240);
+}
+
+function readClaudeSessionLogTail(configDir: string | undefined, sessionId: string | undefined): string {
+  if (!configDir || !sessionId) return "";
+  const projectsRoot = join(configDir, "projects");
+  const logPath = findFileByName(projectsRoot, `${sessionId}.jsonl`, 3);
+  if (!logPath) return "";
+  try {
+    return readFileSync(logPath, "utf8").slice(-256 * 1024);
+  } catch {
+    return "";
+  }
+}
+
+function findFileByName(root: string, fileName: string, depth: number): string | undefined {
+  if (depth < 0 || !existsSync(root)) return undefined;
+  let entries: Dirent<string>[];
+  try {
+    entries = readdirSync(root, { withFileTypes: true });
+  } catch {
+    return undefined;
+  }
+  for (const entry of entries) {
+    const path = join(root, entry.name);
+    if (entry.isFile() && entry.name === fileName) return path;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const found = findFileByName(join(root, entry.name), fileName, depth - 1);
+    if (found) return found;
+  }
+  return undefined;
 }
 
 function formatTimeout(timeoutMs: number): string {

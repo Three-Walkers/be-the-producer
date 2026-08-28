@@ -1,14 +1,30 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
   createStudioKernel,
   createStudioKernelFromSnapshot,
+  getQualityReviewArtifactContracts,
   IllegalWorkflowStageTransitionError,
-  LocalAgentRuntime
+  LocalAgentRuntime,
+  reconcileLocalRuntimeProjectState
 } from "../packages/agent-runtime/dist/index.js";
+import {
+  hashArtVisionRequestSemantics,
+  hashArtVisionSemanticResult
+} from "../apps/api/dist/multimodalArtProvider.js";
+import { buildCurrentVisionReviewAuthoritativeContext } from "../apps/api/dist/qualityReviewArtifacts.js";
+import {
+  bindMediaGenerationArtifactMetadata,
+  mediaGenerationOperationMetadata
+} from "../apps/api/dist/mediaArtifactEvidence.js";
+
+const PNG = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+  "base64"
+);
 
 const kernel = createStudioKernel("game_room_gate_test", "Room gate test", "producer_test", "test idea");
 const designRoom = kernel.getRoom("design-room");
@@ -91,14 +107,19 @@ try {
   rmSync(policyTempRoot, { recursive: true, force: true });
 }
 
+const gateTempRoot = mkdtempSync(join(tmpdir(), "game-room-gate-evidence-"));
+process.env.STUDIO_WORKSPACE_ROOT = gateTempRoot;
 const gateKernel = createStudioKernel("game_gate_test", "Gate test", "producer_test", "test idea");
-const runtime = new LocalAgentRuntime();
+const runtime = new LocalAgentRuntime({ gateEvidencePolicy: apiGateEvidencePolicy });
 const first = runtime.handleProducerMessage(
   gateKernel,
   producerMessage(gateKernel, gateKernel.getRoom("studio-main").roomId, "发起立项阶段的门禁评审"),
   { scriptedReplies: false }
 );
-assert.ok(first.agentMessages.some((message) => message.messageType === "blocker" && message.content.includes("缺少已验证产物证据")));
+assert.ok(first.agentMessages.some((message) =>
+  message.messageType === "blocker" &&
+  /canonical 产物身份不匹配|独立质量审查|缺少当前且可消费的产物证据/.test(message.content)
+));
 assert.equal(gateKernel.project.currentStage, "concept_discussion", "missing evidence must not freeze work in review");
 assert.equal(gateKernel.getWorkflowSnapshot().activeGateId, null);
 assert.deepEqual(gateKernel.listWorkflowEvents(), []);
@@ -119,19 +140,8 @@ assert.ok(!second.agentMessages.some((message) => message.content.includes("二�
 assert.equal(gateKernel.project.currentStage, "concept_discussion");
 assert.equal(gateKernel.getWorkflowSnapshot().decisions.length, 0);
 
-materializeGateArtifact(gateKernel, "artifact_gdd_baseline_draft", "gdd", "agents/design/gdd/00_overview.md");
-materializeGateArtifact(
-  gateKernel,
-  "artifact_game_contract_draft",
-  "game_contract",
-  "agents/design/contracts/game-contract.json"
-);
-materializeGateArtifact(
-  gateKernel,
-  "artifact_art_bible_baseline_draft",
-  "art_bible",
-  "agents/art/art-bible/00_overview.md"
-);
+reconcileLocalRuntimeProjectState(gateKernel);
+materializePassingStageOneEvidence(gateKernel);
 const readyReview = runtime.handleProducerMessage(
   gateKernel,
   producerMessage(gateKernel, gateKernel.getRoom("studio-main").roomId, "发起立项阶段的门禁评审"),
@@ -231,6 +241,7 @@ deploymentKernel.executeWorkflow({
 assert.equal(deploymentKernel.project.currentStage, "liveops");
 assert.equal(deploymentKernel.listWorkflowEvents().at(-1)?.trigger, "operational_transition");
 
+rmSync(gateTempRoot, { recursive: true, force: true });
 console.log("Room membership and natural-language gate smoke passed");
 
 function producerMessage(targetKernel, roomId, content, mentions = []) {
@@ -250,6 +261,314 @@ function producerMessage(targetKernel, roomId, content, mentions = []) {
   };
 }
 
+function materializePassingStageOneEvidence(targetKernel) {
+  materializeRegisteredArtifact(
+    targetKernel,
+    "artifact_gdd_baseline_draft",
+    Buffer.from("# Gate-ready GDD\n\nA clear tap loop, public progress signal, mobile feedback and bounded MVP scope.\n"),
+    { toolName: "write_artifact" }
+  );
+  materializeRegisteredArtifact(
+    targetKernel,
+    "artifact_game_contract_draft",
+    Buffer.from(`${JSON.stringify(gameContractFixture(), null, 2)}\n`),
+    { toolName: "write_artifact" }
+  );
+  materializeRegisteredArtifact(
+    targetKernel,
+    "artifact_art_bible_baseline_draft",
+    Buffer.from("# Gate-ready Art Bible\n\nRounded silhouettes, restrained warm palette, high-contrast mobile UI and a 1024px source budget.\n"),
+    { toolName: "write_artifact" }
+  );
+  const board = materializeRegisteredArtifact(
+    targetKernel,
+    "artifact_art_direction_board",
+    PNG,
+    {
+      generatedBy: "dashscope_multimodal_art_provider",
+      toolName: "generate_raster_asset",
+      mediaProvider: "dashscope",
+      mediaModel: "wan2.7-image-pro",
+      mediaRequestId: "room-gate-art-direction-board",
+      mediaPromptHash: sha256("room gate art direction board prompt"),
+      mediaMime: "image/png",
+      mediaWidth: 1,
+      mediaHeight: 1,
+      mediaRole: "art_direction_board"
+    }
+  );
+
+  const designReview = passingQualityReview(targetKernel, "artifact_stage_1_design_quality_review");
+  materializeRegisteredArtifact(
+    targetKernel,
+    "artifact_stage_1_design_quality_review",
+    Buffer.from(`${JSON.stringify(designReview, null, 2)}\n`),
+    qualityReviewMetadata(designReview)
+  );
+  const visualReview = passingQualityReview(targetKernel, "artifact_stage_1_visual_quality_review");
+  const visionResult = {
+    schemaVersion: "1.0.0",
+    rubricId: visualReview.rubric.rubricId,
+    rubricVersion: visualReview.rubric.version,
+    passThreshold: visualReview.rubric.passThreshold,
+    criteria: structuredClone(visualReview.criteria),
+    scoreTotal: visualReview.scoreTotal,
+    verdict: visualReview.verdict
+  };
+  const visionResponseHash = sha256("room-gate-canonical-vision-response");
+  const visualContract = getQualityReviewArtifactContracts().find(
+    (contract) => contract.artifactId === "artifact_stage_1_visual_quality_review"
+  );
+  assert.ok(visualContract);
+  const authoritativeContext = buildCurrentVisionReviewAuthoritativeContext(targetKernel, visualContract);
+  const requestSemanticHash = hashArtVisionRequestSemantics(visualContract.rubric, authoritativeContext.hash);
+  const visionReceipt = {
+    invocationId: visualReview.modelTrace.invocationId,
+    operationId: "room-gate-vision-inspection",
+    providerId: "dashscope",
+    model: "qwen3.8-max",
+    paths: [board.artifact.path],
+    evidence: [{
+      path: board.artifact.path,
+      hash: board.ledger.hash,
+      sizeBytes: board.ledger.sizeBytes
+    }],
+    responseHash: visionResponseHash,
+    authoritativeContextEvidence: authoritativeContext.evidence,
+    authoritativeContextHash: authoritativeContext.hash,
+    requestSemanticHash,
+    result: visionResult
+  };
+  materializeRegisteredArtifact(
+    targetKernel,
+    "artifact_stage_1_visual_quality_review",
+    Buffer.from(`${JSON.stringify(visualReview, null, 2)}\n`),
+    {
+      ...qualityReviewMetadata(visualReview),
+      visionInspectionOperationId: "room-gate-vision-inspection",
+      visionInspectionProvider: "dashscope",
+      visionInspectionModel: "qwen3.8-max",
+      visionInspectionInvocationId: visualReview.modelTrace.invocationId,
+      visionInspectionResponseHash: visionResponseHash,
+      visionInspectionSemanticHash: hashArtVisionSemanticResult(visionResult),
+      visionAuthoritativeContextEvidence: authoritativeContext.evidence,
+      visionAuthoritativeContextHash: authoritativeContext.hash,
+      visionRequestSemanticHash: requestSemanticHash,
+      visionInspectionSemanticResult: visionResult,
+      visionInspectionSemanticReceipts: [visionReceipt],
+      visionInspectedPaths: [board.artifact.path],
+      visionInspectedEvidence: [{
+        path: board.artifact.path,
+        hash: board.ledger.hash,
+        sizeBytes: board.ledger.sizeBytes
+      }],
+      visionInspectedAt: new Date().toISOString()
+    }
+  );
+}
+
+function materializeRegisteredArtifact(targetKernel, artifactId, content, metadata) {
+  const existing = targetKernel.listArtifacts().find((artifact) => artifact.artifactId === artifactId);
+  assert.ok(existing, `fixture requires canonical artifact ${artifactId}`);
+  assert.ok(existing.sourceTaskId && targetKernel.findTask(existing.sourceTaskId), `${artifactId} must retain its canonical source task`);
+  const now = new Date().toISOString();
+  const absolutePath = join(process.env.STUDIO_WORKSPACE_ROOT, targetKernel.project.projectId, existing.path);
+  mkdirSync(dirname(absolutePath), { recursive: true });
+  writeFileSync(absolutePath, content);
+  let artifact = targetKernel.upsertArtifact({
+    ...existing,
+    status: "submitted",
+    version: existing.version + 1,
+    metadata: {
+      ...existing.metadata,
+      generatedBy: metadata.generatedBy ?? "room_gate_strict_fixture",
+      ...metadata,
+      toolExecutedAt: now
+    },
+    updatedAt: now
+  });
+  const stats = statSync(absolutePath);
+  const hash = sha256(content);
+  const genuineGenerate = metadata.toolName === "generate_raster_asset";
+  const ledger = targetKernel.recordArtifactMaterialization(artifact.artifactId, {
+    path: artifact.path,
+    hash,
+    sizeBytes: stats.size,
+    materializedAt: stats.mtime.toISOString(),
+    ...(genuineGenerate
+      ? {
+          operationMetadata: mediaGenerationOperationMetadata({
+            hash,
+            sizeBytes: stats.size,
+            provider: metadata.mediaProvider,
+            model: metadata.mediaModel,
+            requestId: metadata.mediaRequestId,
+            promptHash: metadata.mediaPromptHash
+          })
+        }
+      : {})
+  });
+  if (genuineGenerate) {
+    artifact = targetKernel.upsertArtifact({
+      ...artifact,
+      metadata: bindMediaGenerationArtifactMetadata(
+        artifact.metadata,
+        ledger.sourceOperationId,
+        { hash, sizeBytes: stats.size }
+      ),
+      updatedAt: stats.mtime.toISOString()
+    });
+  }
+  assert.equal(ledger.status, "verified", `${artifactId} fixture evidence must be verified`);
+  assert.ok(ledger.hash && ledger.sizeBytes !== undefined);
+  return { artifact, ledger };
+}
+
+function passingQualityReview(targetKernel, artifactId) {
+  const contract = getQualityReviewArtifactContracts().find((candidate) => candidate.artifactId === artifactId);
+  assert.ok(contract, `missing canonical quality review contract ${artifactId}`);
+  const targets = contract.subjectArtifactIds.map((subjectArtifactId) => {
+    const artifact = targetKernel.listArtifacts().find((candidate) => candidate.artifactId === subjectArtifactId);
+    const ledger = targetKernel.listArtifactLedger().find((candidate) => candidate.artifactId === subjectArtifactId);
+    assert.ok(artifact && ledger?.status === "verified" && ledger.hash && ledger.sizeBytes !== undefined);
+    return {
+      artifactId: artifact.artifactId,
+      version: artifact.version,
+      path: artifact.path,
+      ledgerHash: ledger.hash,
+      sizeBytes: ledger.sizeBytes
+    };
+  });
+  const criteria = contract.rubric.criteria.map((criterion, index) => {
+    const evidenceRef = contract.domain === "design"
+      ? index % 2 === 0
+        ? `${targets.find((target) => target.artifactId === "artifact_gdd_baseline_draft").path}#L1-L3`
+        : `${targets.find((target) => target.artifactId === "artifact_game_contract_draft").path}#/coreLoop`
+      : `${targets.find((target) => target.artifactId === "artifact_art_direction_board").path}#pixel:full-frame`;
+    return {
+      criterionId: criterion.criterionId,
+      label: criterion.label,
+      weight: criterion.weight,
+      score: 90,
+      status: "pass",
+      findings: [{
+        issueCode: `${criterion.criterionId}.positive_evidence`,
+        severity: "note",
+        summary: `Fixture records grounded positive evidence for ${criterion.label}.`,
+        evidenceRefs: [evidenceRef]
+      }]
+    };
+  });
+  return {
+    schemaVersion: "1.0.0",
+    kind: "artifact_quality_review",
+    reviewId: `room_gate.${artifactId.replace(/^artifact_/, "")}.pass`,
+    domain: contract.domain,
+    reviewerAgentId: contract.ownerAgentId,
+    targets,
+    rubric: {
+      rubricId: contract.rubric.rubricId,
+      version: contract.rubric.version,
+      passThreshold: contract.rubric.passThreshold
+    },
+    criteria,
+    scoreTotal: 90,
+    verdict: "pass",
+    requiredChanges: [],
+    risks: [],
+    blockingIssueCodes: [],
+    modelTrace: {
+      providerId: "dashscope",
+      model: contract.domain === "design" ? "qwen3-max" : "qwen3.8-max",
+      invocationId: `room-gate-${contract.domain}-review-invocation`,
+      promptVersion: "1.0.0"
+    },
+    reviewedAt: new Date().toISOString()
+  };
+}
+
+function qualityReviewMetadata(review) {
+  return {
+    toolName: "write_artifact",
+    reviewProviderId: review.modelTrace.providerId,
+    reviewModel: review.modelTrace.model,
+    reviewInvocationId: review.modelTrace.invocationId,
+    reviewPromptVersion: review.modelTrace.promptVersion,
+    qualityReviewDomain: review.domain,
+    qualityReviewVerdict: review.verdict,
+    qualityReviewScore: review.scoreTotal,
+    qualityReviewedAt: review.reviewedAt
+  };
+}
+
+function gameContractFixture() {
+  return {
+    schemaVersion: "1.0.0",
+    kind: "game_contract",
+    identity: {
+      contractId: "room_gate_test.contract",
+      gameId: "room_gate_test",
+      title: "Room Gate Test",
+      slug: "room-gate-test",
+      summary: "A compact current contract used by the strict room gate fixture.",
+      revision: 1,
+      releaseVersion: "0.1.0"
+    },
+    genre: {
+      primary: "tap_action",
+      tags: ["tap_action", "casual"],
+      perspective: "2d",
+      playerMode: "single_player"
+    },
+    coreLoop: {
+      summary: "Start, tap the target and reach the public progress objective.",
+      steps: [{
+        stepId: "play_loop",
+        label: "Play",
+        description: "Perform the primary action and observe public progress.",
+        actionIds: ["tap_target"],
+        stateIds: ["playing"],
+        emits: ["progress"]
+      }],
+      successConditions: [{ signalId: "progress", operator: "gte", value: 1 }],
+      failureConditions: []
+    },
+    stateModel: {
+      lifecycle: "finite",
+      initialState: "ready",
+      states: [
+        { stateId: "ready", label: "Ready", kind: "boot", terminal: false, description: "Waiting to start." },
+        { stateId: "playing", label: "Playing", kind: "active", terminal: false, description: "Main gameplay loop." },
+        { stateId: "won", label: "Won", kind: "success", terminal: true, description: "Objective completed." }
+      ],
+      transitions: [
+        { transitionId: "start_game", from: "ready", to: "playing", trigger: { type: "system", ref: "start" }, guards: [], emits: [] },
+        { transitionId: "complete_goal", from: "playing", to: "won", trigger: { type: "signal", ref: "progress" }, guards: [{ signalId: "progress", operator: "gte", value: 1 }], emits: [] }
+      ]
+    },
+    inputModel: {
+      actions: [{
+        actionId: "tap_target",
+        label: "Tap target",
+        description: "Tap the current gameplay target.",
+        bindings: [{ device: "touch", control: "gameplay_area", gesture: "tap" }],
+        enabledInStates: ["playing"]
+      }],
+      simultaneousTouchPoints: 1
+    },
+    runtimeSignals: {
+      signals: [{
+        signalId: "progress",
+        label: "Progress",
+        description: "Public objective progress.",
+        valueType: "integer",
+        visibility: "public",
+        initialValue: 0
+      }]
+    }
+  };
+}
+
 function materializeGateArtifact(
   targetKernel,
   artifactId,
@@ -259,25 +578,41 @@ function materializeGateArtifact(
   sizeBytes = 128
 ) {
   const now = new Date().toISOString();
-  targetKernel.addArtifact({
-    artifactId,
-    projectId: targetKernel.project.projectId,
-    type,
-    path,
-    ownerAgentId: type === "art_bible" ? "art_director" : "game_designer",
-    stageId: "concept_discussion",
-    status: "draft",
-    version: 1,
-    sourceDecisionIds: [],
-    metadata: {
-      toolExecutedAt: now,
-      toolName: "write_artifact"
-    },
-    createdAt: now,
-    updatedAt: now
-  });
+  const existing = targetKernel.listArtifacts().find((artifact) => artifact.artifactId === artifactId);
+  const artifactPath = existing?.path ?? path;
+  if (existing) {
+    targetKernel.upsertArtifact({
+      ...existing,
+      status: "draft",
+      version: existing.version + 1,
+      metadata: {
+        ...existing.metadata,
+        toolExecutedAt: now,
+        toolName: "write_artifact"
+      },
+      updatedAt: now
+    });
+  } else {
+    targetKernel.addArtifact({
+      artifactId,
+      projectId: targetKernel.project.projectId,
+      type,
+      path: artifactPath,
+      ownerAgentId: type === "art_bible" ? "art_director" : "game_designer",
+      stageId: "concept_discussion",
+      status: "draft",
+      version: 1,
+      sourceDecisionIds: [],
+      metadata: {
+        toolExecutedAt: now,
+        toolName: "write_artifact"
+      },
+      createdAt: now,
+      updatedAt: now
+    });
+  }
   targetKernel.recordArtifactMaterialization(artifactId, {
-    path,
+    path: artifactPath,
     hash,
     sizeBytes,
     materializedAt: now

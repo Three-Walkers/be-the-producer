@@ -14,8 +14,16 @@ import {
 import type { Stats } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, extname, join, relative, resolve, sep } from "node:path";
-import { ContractValidationError, parseSceneBlueprint } from "@game-pipeline/shared-schemas";
-import type { ArtifactDirectoryManifest, SceneBlueprint, SceneDefinition } from "@game-pipeline/shared-schemas";
+import { ContractValidationError, parseAssetManifest, parseSceneBlueprint } from "@game-pipeline/shared-schemas";
+import type {
+  ArtifactDirectoryManifest,
+  CocosAssetImportReceipt,
+  CocosBuildImportReceiptBinding,
+  CocosFileByteEvidence,
+  CocosImportedAssetReceipt,
+  SceneBlueprint,
+  SceneDefinition
+} from "@game-pipeline/shared-schemas";
 import type { CocosEngineConfig } from "./cocosEngineSettings.js";
 import { adaptLegacySceneBlueprint } from "./legacySceneBlueprintAdapter.js";
 import { normalizeRelativePathWithinRoot, resolvePathWithinRoot } from "./pathSafety.js";
@@ -77,8 +85,6 @@ export function verifyCocosBuildManifest(projectRoot: string, manifest: Artifact
 interface ManifestAsset {
   id: string;
   runtimePath: string;
-  sourcePath?: string;
-  status?: string;
 }
 
 interface PreparedManifestAsset extends ManifestAsset {
@@ -116,6 +122,7 @@ interface ScriptComponent {
 }
 
 const defaultManifestPath = "agents/art/asset-manifest.json";
+export const currentCocosImportReceiptPath = "agents/cocos-automation/imports/current.json";
 const defaultBlueprintPath = "agents/engineering/cocos-scene-blueprints/main.scene-blueprint.json";
 const defaultScenePath = "assets/scenes/MainGame.scene";
 const defaultBuildOutput = "shared/build-artifacts/wechat/dev";
@@ -203,8 +210,12 @@ export class CocosEngineBridge {
       if (!existsSync(manifestAbsolutePath) || !statSync(manifestAbsolutePath).isFile()) {
         throw new Error(`资产清单不存在：${manifestPath}`);
       }
-      const manifest = readJsonFile(manifestAbsolutePath);
-      const assets = collectManifestAssets(manifest);
+      const manifestEvidence = fileEvidence(this.projectRoot, manifestPath);
+      const manifest = parseAssetManifest(readJsonFile(manifestAbsolutePath));
+      const assets: ManifestAsset[] = manifest.runtimeAssets.map((asset) => ({
+        id: asset.id,
+        runtimePath: asset.runtimePath
+      }));
       if (assets.length === 0) {
         throw new Error(`资产清单中没有可导入的 runtimePath：${manifestPath}`);
       }
@@ -214,7 +225,9 @@ export class CocosEngineBridge {
         projectRoot: this.projectRoot,
         operationId,
         manifestPath,
+        manifestEvidence,
         reportPath,
+        receiptPath: currentCocosImportReceiptPath,
         mapPath,
         assets: preparedAssets
       });
@@ -230,7 +243,8 @@ export class CocosEngineBridge {
           manifestPath,
           imported: materialized.imported,
           missing: [],
-          assetMap: materialized.assetMap
+          assetMap: materialized.assetMap,
+          importReceipt: materialized.importReceipt
         }
       };
     } catch (error) {
@@ -387,6 +401,9 @@ export class CocosEngineBridge {
       if (platform !== "wechatgame" && platform !== "web-desktop") {
         throw new Error(`当前 Bridge 只允许构建 wechatgame 或 QA 专用 web-desktop，收到：${platform}`);
       }
+      // Fail closed before Creator starts: the build may consume only bytes
+      // proven by the latest successful import of the canonical manifest.
+      const importReceipt = requireCurrentCocosImportReceipt(this.projectRoot, defaultManifestPath);
       const scene = findBuildScene(this.projectRoot);
       if (!scene) {
         throw new Error("工程没有可构建的 .scene 及 .scene.meta。请先调用 cocos_apply_blueprint。");
@@ -453,6 +470,7 @@ export class CocosEngineBridge {
         exitCode: processResult.status,
         signal: processResult.signal,
         outputFiles,
+        importReceipt,
         ...(outputManifest ? { outputManifest } : {}),
         startedAt,
         completedAt: new Date().toISOString(),
@@ -565,33 +583,6 @@ function readJsonFile(path: string): Record<string, unknown> {
   return parsed;
 }
 
-function collectManifestAssets(value: unknown): ManifestAsset[] {
-  const assets: ManifestAsset[] = [];
-  const visit = (candidate: unknown): void => {
-    if (Array.isArray(candidate)) {
-      candidate.forEach(visit);
-      return;
-    }
-    if (!isRecord(candidate)) {
-      return;
-    }
-    const runtimePath = stringValue(candidate.runtimePath ?? candidate.runtime_path ?? candidate.cocosPath ?? candidate.cocos_path);
-    if (runtimePath) {
-      const id = stringValue(candidate.id ?? candidate.assetId ?? candidate.asset_id ?? basename(runtimePath, extname(runtimePath)));
-      assets.push({
-        id,
-        runtimePath,
-        ...(stringValue(candidate.sourcePath ?? candidate.source_path) ? { sourcePath: stringValue(candidate.sourcePath ?? candidate.source_path) } : {}),
-        ...(stringValue(candidate.status) ? { status: stringValue(candidate.status) } : {})
-      });
-      return;
-    }
-    Object.values(candidate).forEach(visit);
-  };
-  visit(value);
-  return assets;
-}
-
 function prepareManifestAssets(projectRoot: string, assets: ManifestAsset[]): PreparedManifestAsset[] {
   const prepared: PreparedManifestAsset[] = [];
   const issues: string[] = [];
@@ -693,55 +684,71 @@ function materializeAssetImport(input: {
   projectRoot: string;
   operationId: string;
   manifestPath: string;
+  manifestEvidence: CocosFileByteEvidence;
   reportPath: string;
+  receiptPath: string;
   mapPath: string;
   assets: PreparedManifestAsset[];
 }): {
-  imported: Array<Record<string, unknown>>;
+  imported: CocosImportedAssetReceipt[];
   assetMap: Record<string, string>;
+  importReceipt: CocosBuildImportReceiptBinding;
   evidence: CocosBridgeEvidence[];
 } {
   const stagingRoot = mkdtempSync(join(tmpdir(), "btp-cocos-import-"));
   try {
     const assetMap: Record<string, string> = {};
     const outputs: AssetImportOutput[] = [];
+    const imported: CocosImportedAssetReceipt[] = [];
     for (const [index, asset] of input.assets.entries()) {
       const stagedPath = join(stagingRoot, `asset-${index}${extname(asset.destinationPath)}`);
       copyFileSync(asset.sourceAbsolutePath, stagedPath);
+      const stagedBody = readFileSync(stagedPath);
+      const source = fileEvidence(input.projectRoot, asset.runtimePath);
+      const stagedHash = createHash("sha256").update(stagedBody).digest("hex");
+      if (source.hash !== stagedHash || source.sizeBytes !== stagedBody.byteLength) {
+        throw new Error(`Cocos 导入暂存期间源资产发生变化：${asset.runtimePath}`);
+      }
       outputs.push({ destinationPath: asset.destinationPath, stagedPath });
       assetMap[asset.id] = asset.resourcePath;
+      imported.push({
+        assetId: asset.id,
+        source,
+        destination: {
+          path: asset.destinationPath,
+          hash: stagedHash,
+          sizeBytes: stagedBody.byteLength
+        },
+        resourcePath: asset.resourcePath
+      });
     }
 
     const mapDocument = {
       generatedBy: "Be The Producer Cocos Engine Bridge",
       manifestPath: input.manifestPath,
+      importOperationId: input.operationId,
+      importReceiptPath: input.receiptPath,
       assets: assetMap
     };
     outputs.push({ destinationPath: input.mapPath, content: `${JSON.stringify(mapDocument, null, 2)}\n` });
 
-    const imported = input.assets.map((asset) => {
-      const body = readFileSync(asset.sourceAbsolutePath);
-      return {
-        assetId: asset.id,
-        sourcePath: asset.runtimePath,
-        cocosPath: asset.destinationPath,
-        resourcePath: asset.resourcePath,
-        hash: createHash("sha256").update(body).digest("hex"),
-        sizeBytes: body.byteLength
-      };
-    });
-    const reportDocument = {
+    const receiptDocument: CocosAssetImportReceipt = {
+      schemaVersion: 1,
+      kind: "cocos_asset_import_receipt",
       operationId: input.operationId,
       operationType: "import_assets",
       status: "completed",
       createdAt: new Date().toISOString(),
-      manifestPath: input.manifestPath,
+      manifest: input.manifestEvidence,
       imported,
-      missing: [],
+      importedDigest: digestImportedAssets(imported),
       importMode: "copied_to_assets_resources",
-      note: "Cocos Creator AssetDB will perform the native import when the project is opened or built."
     };
-    outputs.push({ destinationPath: input.reportPath, content: `${JSON.stringify(reportDocument, null, 2)}\n` });
+    const reportContent = `${JSON.stringify(receiptDocument, null, 2)}\n`;
+    // Both paths carry the same signed-by-bytes receipt. The stable path is the
+    // only receipt a later build accepts; the operation path remains audit history.
+    outputs.push({ destinationPath: input.receiptPath, content: reportContent });
+    outputs.push({ destinationPath: input.reportPath, content: reportContent });
 
     // Validation and staging are complete before the first project file is touched.
     const destinations = outputs.map((output, index) => {
@@ -771,6 +778,11 @@ function materializeAssetImport(input: {
           writeFileSync(destination.absolutePath, destination.output.content ?? "", "utf8");
         }
       }
+      assertFileEvidenceMatches(input.projectRoot, input.manifestEvidence, "资产清单在导入提交期间发生变化");
+      for (const entry of imported) {
+        assertFileEvidenceMatches(input.projectRoot, entry.source, `runtime 源资产在导入提交期间发生变化：${entry.source.path}`);
+        assertFileEvidenceMatches(input.projectRoot, entry.destination, `Cocos 导入目标未物化为相同字节：${entry.destination.path}`);
+      }
     } catch (error) {
       const rollbackErrors: string[] = [];
       for (const destination of touched.reverse()) {
@@ -790,14 +802,231 @@ function materializeAssetImport(input: {
       throw error;
     }
 
+    const receiptEvidence = fileEvidence(input.projectRoot, input.receiptPath);
+    const importReceipt: CocosBuildImportReceiptBinding = {
+      receipt: receiptEvidence,
+      operationId: receiptDocument.operationId,
+      manifest: receiptDocument.manifest,
+      importedAssetCount: receiptDocument.imported.length,
+      importedDigest: receiptDocument.importedDigest
+    };
     return {
       imported,
       assetMap,
+      importReceipt,
       evidence: outputs.map((output) => fileEvidence(input.projectRoot, output.destinationPath))
     };
   } finally {
     rmSync(stagingRoot, { recursive: true, force: true });
   }
+}
+
+/**
+ * Revalidate the receipt frozen into a build report against the stable current
+ * receipt and all live workspace bytes. This is also used by the artifact gate
+ * so a later import or destination mutation invalidates an older build.
+ */
+export function verifyCocosBuildImportReceipt(
+  projectRoot: string,
+  value: unknown,
+  manifestPath = defaultManifestPath
+): boolean {
+  try {
+    const expected = parseBuildImportReceiptBinding(value);
+    const current = requireCurrentCocosImportReceipt(projectRoot, manifestPath);
+    return (
+      sameFileEvidence(expected.receipt, current.receipt) &&
+      expected.operationId === current.operationId &&
+      sameFileEvidence(expected.manifest, current.manifest) &&
+      expected.importedAssetCount === current.importedAssetCount &&
+      expected.importedDigest === current.importedDigest
+    );
+  } catch {
+    return false;
+  }
+}
+
+function requireCurrentCocosImportReceipt(
+  projectRoot: string,
+  manifestPath: string
+): CocosBuildImportReceiptBinding {
+  const normalizedManifestPath = normalizeRelativePath(manifestPath);
+  const receiptAbsolutePath = resolveInsideProject(projectRoot, currentCocosImportReceiptPath);
+  if (!existsSync(receiptAbsolutePath) || !statSync(receiptAbsolutePath).isFile()) {
+    throw new Error(
+      `缺少当前 Cocos 资产导入收据 ${currentCocosImportReceiptPath}；请先调用 cocos_import_assets。`
+    );
+  }
+  const receiptEvidence = fileEvidence(projectRoot, currentCocosImportReceiptPath);
+  const receipt = parseCocosAssetImportReceipt(readJsonFile(receiptAbsolutePath));
+  if (receipt.manifest.path !== normalizedManifestPath) {
+    throw new Error(
+      `当前 Cocos 导入收据绑定 ${receipt.manifest.path}，而构建要求 ${normalizedManifestPath}；请重新调用 cocos_import_assets。`
+    );
+  }
+  assertFileEvidenceMatches(projectRoot, receipt.manifest, "当前 asset manifest 与 Cocos 导入收据不一致；请重新导入");
+
+  const manifest = parseAssetManifest(readJsonFile(resolveInsideProject(projectRoot, normalizedManifestPath)));
+  const declaredAssets: ManifestAsset[] = manifest.runtimeAssets.map((asset) => ({
+    id: asset.id,
+    runtimePath: asset.runtimePath
+  }));
+  const prepared = prepareManifestAssets(projectRoot, declaredAssets);
+  if (prepared.length !== receipt.imported.length) {
+    throw new Error(
+      `当前 asset manifest 声明 ${prepared.length} 个 runtime 资产，但导入收据只有 ${receipt.imported.length} 个；请重新导入。`
+    );
+  }
+  for (const [index, asset] of prepared.entries()) {
+    const imported = receipt.imported[index];
+    if (
+      !imported ||
+      imported.assetId !== asset.id ||
+      imported.source.path !== asset.runtimePath ||
+      imported.destination.path !== asset.destinationPath ||
+      imported.resourcePath !== asset.resourcePath
+    ) {
+      throw new Error(`Cocos 导入收据第 ${index + 1} 项与当前 asset manifest 的规范映射不一致；请重新导入。`);
+    }
+    if (
+      imported.source.hash !== imported.destination.hash ||
+      imported.source.sizeBytes !== imported.destination.sizeBytes
+    ) {
+      throw new Error(`Cocos 导入收据未证明源和目标为相同字节：${asset.runtimePath}`);
+    }
+    assertFileEvidenceMatches(projectRoot, imported.source, `runtime 源资产已变化：${imported.source.path}；请重新导入`);
+    assertFileEvidenceMatches(projectRoot, imported.destination, `Cocos 导入目标已变化：${imported.destination.path}；请重新导入`);
+  }
+  const importedDigest = digestImportedAssets(receipt.imported);
+  if (receipt.importedDigest !== importedDigest) {
+    throw new Error("Cocos 导入收据 importedDigest 无效；请重新导入。");
+  }
+  return {
+    receipt: receiptEvidence,
+    operationId: receipt.operationId,
+    manifest: receipt.manifest,
+    importedAssetCount: receipt.imported.length,
+    importedDigest
+  };
+}
+
+function parseCocosAssetImportReceipt(value: unknown): CocosAssetImportReceipt {
+  if (!isRecord(value)) throw new Error("Cocos 导入收据根节点必须是对象。");
+  if (
+    value.schemaVersion !== 1 ||
+    value.kind !== "cocos_asset_import_receipt" ||
+    value.operationType !== "import_assets" ||
+    value.status !== "completed" ||
+    value.importMode !== "copied_to_assets_resources" ||
+    typeof value.operationId !== "string" ||
+    !value.operationId.trim() ||
+    typeof value.createdAt !== "string" ||
+    !Number.isFinite(Date.parse(value.createdAt)) ||
+    typeof value.importedDigest !== "string" ||
+    !/^[a-f0-9]{64}$/.test(value.importedDigest) ||
+    !Array.isArray(value.imported) ||
+    value.imported.length === 0
+  ) {
+    throw new Error("Cocos 导入收据缺少规范字段。");
+  }
+  const manifest = parseCocosFileEvidence(value.manifest, "manifest");
+  const imported = value.imported.map((entry, index) => parseImportedAssetReceipt(entry, index));
+  return {
+    schemaVersion: 1,
+    kind: "cocos_asset_import_receipt",
+    operationId: value.operationId,
+    operationType: "import_assets",
+    status: "completed",
+    createdAt: value.createdAt,
+    manifest,
+    imported,
+    importedDigest: value.importedDigest,
+    importMode: "copied_to_assets_resources"
+  };
+}
+
+function parseImportedAssetReceipt(value: unknown, index: number): CocosImportedAssetReceipt {
+  if (
+    !isRecord(value) ||
+    typeof value.assetId !== "string" ||
+    !value.assetId.trim() ||
+    typeof value.resourcePath !== "string" ||
+    !value.resourcePath.trim()
+  ) {
+    throw new Error(`Cocos 导入收据 imported[${index}] 无效。`);
+  }
+  return {
+    assetId: value.assetId,
+    source: parseCocosFileEvidence(value.source, `imported[${index}].source`),
+    destination: parseCocosFileEvidence(value.destination, `imported[${index}].destination`),
+    resourcePath: value.resourcePath
+  };
+}
+
+function parseBuildImportReceiptBinding(value: unknown): CocosBuildImportReceiptBinding {
+  if (
+    !isRecord(value) ||
+    typeof value.operationId !== "string" ||
+    !value.operationId.trim() ||
+    typeof value.importedAssetCount !== "number" ||
+    !Number.isSafeInteger(value.importedAssetCount) ||
+    value.importedAssetCount < 1 ||
+    typeof value.importedDigest !== "string" ||
+    !/^[a-f0-9]{64}$/.test(value.importedDigest)
+  ) {
+    throw new Error("Cocos build 缺少规范 import receipt binding。");
+  }
+  return {
+    receipt: parseCocosFileEvidence(value.receipt, "receipt"),
+    operationId: value.operationId,
+    manifest: parseCocosFileEvidence(value.manifest, "manifest"),
+    importedAssetCount: value.importedAssetCount,
+    importedDigest: value.importedDigest
+  };
+}
+
+function parseCocosFileEvidence(value: unknown, label: string): CocosFileByteEvidence {
+  if (
+    !isRecord(value) ||
+    typeof value.path !== "string" ||
+    !value.path.trim() ||
+    normalizeRelativePath(value.path) !== value.path ||
+    typeof value.hash !== "string" ||
+    !/^[a-f0-9]{64}$/.test(value.hash) ||
+    typeof value.sizeBytes !== "number" ||
+    !Number.isSafeInteger(value.sizeBytes) ||
+    value.sizeBytes < 1
+  ) {
+    throw new Error(`Cocos ${label} 字节证据无效。`);
+  }
+  return { path: value.path, hash: value.hash, sizeBytes: value.sizeBytes };
+}
+
+function assertFileEvidenceMatches(projectRoot: string, expected: CocosFileByteEvidence, message: string): void {
+  const absolutePath = resolveInsideProject(projectRoot, expected.path);
+  if (!existsSync(absolutePath) || !statSync(absolutePath).isFile()) {
+    throw new Error(`${message}（文件不存在：${expected.path}）`);
+  }
+  const actual = fileEvidence(projectRoot, expected.path);
+  if (!sameFileEvidence(expected, actual)) {
+    throw new Error(
+      `${message}（expected hash=${expected.hash}, size=${expected.sizeBytes}; actual hash=${actual.hash}, size=${actual.sizeBytes}）`
+    );
+  }
+}
+
+function sameFileEvidence(left: CocosFileByteEvidence, right: CocosFileByteEvidence): boolean {
+  return left.path === right.path && left.hash === right.hash && left.sizeBytes === right.sizeBytes;
+}
+
+function digestImportedAssets(imported: CocosImportedAssetReceipt[]): string {
+  const canonical = imported.map((entry) => ({
+    assetId: entry.assetId,
+    source: entry.source,
+    destination: entry.destination,
+    resourcePath: entry.resourcePath
+  }));
+  return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
 }
 
 function assertRuntimeAsset(absolutePath: string, relativePath: string): void {

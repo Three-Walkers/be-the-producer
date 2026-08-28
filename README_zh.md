@@ -60,8 +60,10 @@ Be The Producer 是一个面向“AI 虚拟游戏工作室”的正式产品系�
 | Studio Orchestrator | 控制工作流状态、消息路由、任务拆解、阶段门禁和跨 Agent 协作。 | 阶段计划、任务图、决策请求、项目状态。 |
 | Producer Agent | 把制作人的意图转化为范围、排期、风险和里程碑评审。 | 生产计划、backlog、风险日志、评审议程、决策日志。 |
 | Game Designer Agent | 设计核心循环、规则、成长、关卡、数值和平衡。 | GDD、GameContract、关卡规格、数值规格。 |
-| Art Director Agent | 定义美术风格、UI 方向、可读性规则、色板、动画语气和资产质量标准。 | Art Bible、风格板、UI 视觉规范、资产评审记录。 |
+| Design Quality Reviewer | 按服务端固定的移动游戏设计 rubric 独立审查 GDD 与 GameContract。 | 绑定版本/hash 的策划质量收据和可执行修改要求。 |
+| Art Director Agent | 定义美术风格、UI 方向、可读性规则、色板、动画语气和资产质量标准。 | Art Bible、真实位图方向板、UI 视觉规范。 |
 | Asset Production Agent | 生产、清洗、规格化、打包和版本化游戏资产。 | 精灵图、UI 资产、sprite sheet、动画序列、asset manifest。 |
+| Visual Quality Reviewer | 独立读取真实图片像素，审查视觉方向、可读性、技术质量和 IP 风险。 | 绑定版本/hash 的视觉质量收据和像素证据。 |
 | Cocos Tech Lead Agent | 负责 Cocos 架构、场景结构、Prefab 策略、资源加载、性能预算和技术规范。 | 技术方案、SceneBlueprint、模块计划、性能检查清单。 |
 | Gameplay Programmer Agent | 实现游戏系统、UI 逻辑、玩法规则、数据加载和集成代码。 | TypeScript 代码、Cocos 组件、实现说明、代码变更日志。 |
 | Cocos Automation Agent | 通过引擎桥或 MCP 工具操作 Cocos。 | 场景操作记录、Prefab 更新记录、资源导入记录、构建日志、编辑器快照。 |
@@ -144,8 +146,10 @@ flowchart LR
 主要参与角色：
 
 - Game Designer Agent。
+- Design Quality Reviewer。
 - Producer Agent。
-- Art Director Agent，轻度参与。
+- Art Director Agent。
+- Visual Quality Reviewer。
 - Studio Orchestrator。
 
 主要任务：
@@ -154,7 +158,8 @@ flowchart LR
 - 定义品类、核心循环、胜利条件和失败条件。
 - 定义玩家幻想、题材、世界观和整体语气。
 - 创建初版 GDD。
-- 创建早期美术方向和参考板。
+- 创建 GameContract、Art Bible 和真实位图方向板。
+- 按固定 rubric 执行独立策划与视觉审查。
 - 定义首个可玩版本范围。
 - 在进入开发前请求制作人审批。
 
@@ -162,8 +167,8 @@ flowchart LR
 
 - 核心循环已审批。
 - 项目范围已审批。
-- 初版 GDD 已审批。
-- 美术方向已审批。
+- GDD 与 GameContract 具有当前且通过的策划质量收据。
+- Art Bible 与方向板具有当前且通过的视觉质量收据。
 - 初始 backlog 和里程碑计划已生成。
 
 ### 阶段 2：开发落地和可玩版本实现
@@ -174,6 +179,7 @@ flowchart LR
 
 - Art Director Agent。
 - Asset Production Agent。
+- Visual Quality Reviewer。
 - Cocos Tech Lead Agent。
 - Gameplay Programmer Agent。
 - Cocos Automation Agent。
@@ -182,7 +188,8 @@ flowchart LR
 
 主要任务：
 
-- 生产并规格化美术资产。
+- 通过受控图片模型生产真实位图运行资产。
+- 使用视觉模型检查联系表和 manifest 中每一个 runtime PNG。
 - 将资产导入 Cocos。
 - 实现玩法逻辑和 UI。
 - 通过受控 Cocos 引擎桥创建场景和 Prefab。
@@ -195,7 +202,7 @@ flowchart LR
 
 - 核心循环可玩。
 - 没有关键运行时错误。
-- 美术资产已集成并可追溯。
+- 美术资产已集成、可追溯，并由当前通过的视觉质量收据覆盖。
 - QA 报告已完成。
 - 制作人接受首个可玩版本，或提交明确变更请求。
 
@@ -516,4 +523,4 @@ Game Pipeline Agents 的目标产品由一组相互连接的能力模块组成�
 
 ## 当前状态
 
-当前仓库处于本地纵向 MVP 阶段。版本化 GameContract、SceneBlueprint 和 PlaytestContract 已落地严格校验与跨契约门禁；Cocos Bridge 已改为声明式通用渲染，QA 已能按契约执行多场景、公开事实断言和证据绑定。Workflow Aggregate 已把评审、制作人决策、变更、豁免、回滚和 LiveOps 迭代变成可重放的一等领域记录。工具执行已绑定 Agent、当前任务、产物身份和路径；Claude MCP 房间会话只读。Artifact Ledger 会冻结输入版本/hash，构建产物使用完整文件 manifest，旧构建、旧 QA、外部篡改和符号链接越界都会在消费前失效。本地项目状态采用原子替换、有效备份与损坏隔离；非本机 API 绑定要求 Bearer token，并具备同源/CORS、请求体限制和基础安全响应头。tap-defense、puzzle、runner/endless 的自动化 fixture 证明核心层不再依赖单一样例，但还没有三套真实 Cocos 游戏端到端交付。生产数据库与分布式队列/租约、Secret Vault、隔离构建 worker、真实微信发布、游戏脚本 Runtime Adapter、Prefab 真实物化及生产 LiveOps 闭环仍在建设中，因此尚不能视为完整产品系统。
+当前仓库处于本地纵向 MVP 阶段。版本化 GameContract、SceneBlueprint、PlaytestContract、Asset Manifest v2 和 ArtifactQualityReview 已落地严格校验与证据绑定门禁。策划/美术作者与独立质量审查员已经分离，服务端固定 rubric 可防止审查员自行降低阈值；美术链路已通过受控 DashScope 图片模型创作真实 PNG，再由独立视觉模型读取实际像素，记录 provider、request、prompt hash、seed、尺寸、语义审查及图片 hash 证据。PNG alpha policy 会按真实像素解码校验，Cocos build 也会绑定当前导入收据和源/目标资产字节。Cocos Bridge 已改为声明式通用渲染，QA 已能按契约执行多场景、公开事实断言和证据绑定。Workflow Aggregate 已把评审、制作人决策、变更、豁免、回滚和 LiveOps 迭代变成可重放的一等领域记录。工具执行已绑定 Agent、当前任务、产物身份和路径；Claude MCP 房间会话只读。Artifact Ledger 会冻结输入版本/hash，构建产物使用完整文件 manifest，旧构建、旧 QA、过期质量审查、外部篡改和符号链接越界都会在消费前失效。自动化 fixture 证明核心层不再依赖单一样例，但还没有三套真实 Cocos 游戏端到端交付。生产数据库与分布式队列/租约、项目媒体预算、隔离构建 worker、真实微信发布、高质量自动抠图/边缘后处理、Prefab 真实物化及生产 LiveOps 闭环仍在建设中，因此尚不能视为完整产品系统。

@@ -10,7 +10,7 @@ import type {
   TaskChildrenSummary
 } from "@game-pipeline/shared-schemas";
 import type { AgentRouteScore, RoutePlan } from "../chat/router.js";
-import type { StudioKernel } from "../studio/studioKernel.js";
+import type { StudioKernel, StudioKernelSnapshot } from "../studio/studioKernel.js";
 import { createSampleIdeaTemplateRegistry, type IdeaTemplateRegistry } from "../templates/index.js";
 
 export interface LocalAgentRunResult {
@@ -28,6 +28,163 @@ export interface LocalAgentRuntimeOptions {
 export interface LocalAgentRuntimeDependencies {
   ideaTemplates?: IdeaTemplateRegistry;
   gateEvidencePolicy?: GateEvidencePolicy;
+}
+
+export interface LocalRuntimeReconciliationResult {
+  changed: boolean;
+  taskIds: string[];
+  artifactIds: string[];
+}
+
+export interface LocalRuntimeSnapshotMigrationResult {
+  snapshot: StudioKernelSnapshot;
+  changed: boolean;
+  artifactIdMigrations: Array<{ fromArtifactId: string; toArtifactId: string }>;
+}
+
+export interface LocalRuntimeSnapshotMigrationOptions {
+  legacyArtifactIdFor(projectId: string, ownerAgentId: AgentId, path: string): string;
+}
+
+export interface StageOneArtifactContract {
+  readonly artifactId: string;
+  readonly type: Artifact["type"];
+  readonly path: string;
+  readonly ownerAgentId: AgentId;
+  readonly sourceTaskId: string;
+}
+
+const stageOneArtifactContractDefinitions: readonly StageOneArtifactContract[] = Object.freeze([
+  Object.freeze({
+    artifactId: "artifact_gdd_baseline_draft",
+    type: "gdd" as const,
+    path: "agents/design/gdd/00_overview.md",
+    ownerAgentId: "game_designer" as const,
+    sourceTaskId: "task_stage_1_design_clarification"
+  }),
+  Object.freeze({
+    artifactId: "artifact_game_contract_draft",
+    type: "game_contract" as const,
+    path: "agents/design/contracts/game-contract.json",
+    ownerAgentId: "game_designer" as const,
+    sourceTaskId: "task_stage_1_design_clarification"
+  }),
+  Object.freeze({
+    artifactId: "artifact_art_bible_baseline_draft",
+    type: "art_bible" as const,
+    path: "agents/art/art-bible.md",
+    ownerAgentId: "art_director" as const,
+    sourceTaskId: "task_stage_1_art_direction"
+  }),
+  Object.freeze({
+    artifactId: "artifact_art_direction_board",
+    type: "asset" as const,
+    path: "agents/art/art-direction-board.png",
+    ownerAgentId: "art_director" as const,
+    sourceTaskId: "task_stage_1_art_direction"
+  })
+]);
+
+export function getStageOneArtifactContracts(): readonly StageOneArtifactContract[] {
+  return stageOneArtifactContractDefinitions;
+}
+
+export interface QualityReviewArtifactContract {
+  readonly artifactId: string;
+  readonly type: "quality_review";
+  readonly path: string;
+  readonly ownerAgentId: AgentId;
+  readonly sourceTaskId: string;
+  readonly domain: "design" | "art_direction" | "visual_assets";
+  readonly subjectArtifactIds: readonly string[];
+  readonly rubric: {
+    readonly rubricId: string;
+    readonly version: string;
+    readonly passThreshold: number;
+    readonly criteria: readonly {
+      readonly criterionId: string;
+      readonly label: string;
+      readonly weight: number;
+    }[];
+  };
+}
+
+const qualityReviewArtifactContractDefinitions: readonly QualityReviewArtifactContract[] = Object.freeze([
+  Object.freeze({
+    artifactId: "artifact_stage_1_design_quality_review",
+    type: "quality_review" as const,
+    path: "agents/review/design/stage-1.quality-review.json",
+    ownerAgentId: "design_quality_reviewer" as const,
+    sourceTaskId: "task_stage_1_design_quality_review",
+    domain: "design" as const,
+    subjectArtifactIds: Object.freeze(["artifact_gdd_baseline_draft", "artifact_game_contract_draft"]),
+    rubric: Object.freeze({
+      rubricId: "stage1.design-quality",
+      version: "1.0.0",
+      passThreshold: 85,
+      criteria: Object.freeze([
+        Object.freeze({ criterionId: "core_loop_player_value", label: "核心循环与玩家价值", weight: 25 }),
+        Object.freeze({ criterionId: "cross_artifact_consistency", label: "GDD 与 GameContract 一致性", weight: 20 }),
+        Object.freeze({ criterionId: "balance_and_pacing", label: "节奏与数值依据", weight: 15 }),
+        Object.freeze({ criterionId: "mvp_feasibility", label: "MVP 范围与实现可行性", weight: 15 }),
+        Object.freeze({ criterionId: "mobile_accessibility", label: "移动端可用性与可访问性", weight: 10 }),
+        Object.freeze({ criterionId: "testability_observability", label: "可测试性与可观测性", weight: 15 })
+      ])
+    })
+  }),
+  Object.freeze({
+    artifactId: "artifact_stage_1_visual_quality_review",
+    type: "quality_review" as const,
+    path: "agents/review/art/stage-1.quality-review.json",
+    ownerAgentId: "visual_quality_reviewer" as const,
+    sourceTaskId: "task_stage_1_visual_quality_review",
+    domain: "art_direction" as const,
+    subjectArtifactIds: Object.freeze(["artifact_art_bible_baseline_draft", "artifact_art_direction_board"]),
+    rubric: Object.freeze({
+      rubricId: "stage1.art-direction-quality",
+      version: "1.0.0",
+      passThreshold: 85,
+      criteria: Object.freeze([
+        Object.freeze({ criterionId: "visual_consistency", label: "视觉主张一致性", weight: 25 }),
+        Object.freeze({ criterionId: "small_screen_readability", label: "轮廓、焦点与小屏可读性", weight: 20 }),
+        Object.freeze({ criterionId: "palette_hierarchy", label: "色板与对比层级", weight: 15 }),
+        Object.freeze({ criterionId: "mobile_ui_readability", label: "移动 UI 可读性", weight: 15 }),
+        Object.freeze({ criterionId: "production_feasibility", label: "生产与技术可行性", weight: 15 }),
+        Object.freeze({ criterionId: "originality_ip_safety", label: "原创性与 IP 安全", weight: 10 })
+      ])
+    })
+  }),
+  Object.freeze({
+    artifactId: "artifact_stage_2_visual_quality_review",
+    type: "quality_review" as const,
+    path: "agents/review/art/first-playable.quality-review.json",
+    ownerAgentId: "visual_quality_reviewer" as const,
+    sourceTaskId: "task_stage_2_visual_quality_review",
+    domain: "visual_assets" as const,
+    subjectArtifactIds: Object.freeze([
+      "artifact_art_bible_baseline_draft",
+      "artifact_asset_manifest_draft",
+      "artifact_asset_contact_sheet"
+    ]),
+    rubric: Object.freeze({
+      rubricId: "stage2.visual-assets-quality",
+      version: "1.0.0",
+      passThreshold: 85,
+      criteria: Object.freeze([
+        Object.freeze({ criterionId: "art_bible_consistency", label: "Art Bible 一致性", weight: 20 }),
+        Object.freeze({ criterionId: "runtime_readability", label: "运行资产小屏辨识", weight: 20 }),
+        Object.freeze({ criterionId: "ui_hierarchy", label: "UI 层级", weight: 15 }),
+        Object.freeze({ criterionId: "alpha_edge_integrity", label: "透明通道与边缘完整性", weight: 15 }),
+        Object.freeze({ criterionId: "performance_budget", label: "性能与纹理预算", weight: 10 }),
+        Object.freeze({ criterionId: "coverage_completeness", label: "资产覆盖完整性", weight: 10 }),
+        Object.freeze({ criterionId: "originality_ip_safety", label: "原创性与 IP 安全", weight: 10 })
+      ])
+    })
+  })
+]);
+
+export function getQualityReviewArtifactContracts(): readonly QualityReviewArtifactContract[] {
+  return qualityReviewArtifactContractDefinitions;
 }
 
 export type GateEvidencePhase = "review" | "decision";
@@ -90,9 +247,12 @@ const gateActions: Record<GateActionId, GateAction> = {
     requiredArtifacts: [
       "artifact_gdd_baseline_draft",
       "artifact_game_contract_draft",
-      "artifact_art_bible_baseline_draft"
+      "artifact_art_bible_baseline_draft",
+      "artifact_art_direction_board",
+      "artifact_stage_1_design_quality_review",
+      "artifact_stage_1_visual_quality_review"
     ],
-    checks: ["gdd_verified", "game_contract_verified", "art_direction_verified", "scope_reviewed"]
+    checks: ["gdd_verified", "game_contract_verified", "design_quality_passed", "art_direction_verified", "visual_quality_passed", "scope_reviewed"]
   },
   playable: {
     actionId: "playable",
@@ -104,13 +264,15 @@ const gateActions: Record<GateActionId, GateAction> = {
     requiredArtifacts: [
       "artifact_game_contract_draft",
       "artifact_asset_manifest_draft",
+      "artifact_asset_contact_sheet",
+      "artifact_stage_2_visual_quality_review",
       "artifact_scene_blueprint_draft",
       "artifact_playtest_contract_draft",
       "artifact_gameplay_source",
       "artifact_wechat_dev_build",
       "artifact_qa_playtest_report"
     ],
-    checks: ["contracts_compatible", "development_build_verified", "playtest_passed"]
+    checks: ["contracts_compatible", "visual_asset_quality_passed", "development_build_verified", "playtest_passed"]
   },
   release: {
     actionId: "release",
@@ -150,8 +312,10 @@ export class LocalAgentRuntime {
     studio_orchestrator: handleOrchestrator,
     producer: handleProducer,
     game_designer: handleGameDesigner,
+    design_quality_reviewer: handleDesignQualityReviewer,
     art_director: handleArtDirector,
     asset_production: handleAssetProduction,
+    visual_quality_reviewer: handleVisualQualityReviewer,
     cocos_tech_lead: handleCocosTechLead,
     gameplay_programmer: handleGameplayProgrammer,
     cocos_automation: handleCocosAutomation,
@@ -219,8 +383,259 @@ export class LocalAgentRuntime {
   }
 }
 
+/**
+ * Reconciles deterministic task/artifact declarations owned by the local runtime.
+ *
+ * Older snapshots may contain Stage 1 tasks created before their canonical output
+ * artifacts were registered. Keeping this migration beside the task blueprint
+ * prevents the API layer from guessing artifact identities or weakening Harness
+ * authorization when those snapshots are restored.
+ */
+export function reconcileLocalRuntimeProjectState(
+  kernel: StudioKernel,
+  now = new Date().toISOString()
+): LocalRuntimeReconciliationResult {
+  const stageOneTaskIds = [
+    "task_group_stage_1",
+    "task_stage_1_design_clarification",
+    "task_stage_1_art_direction",
+    "task_stage_1_design_quality_review",
+    "task_stage_1_visual_quality_review",
+    "task_stage_1_scope_review"
+  ];
+  const stageOneArtifactIds = [
+    "artifact_gdd_baseline_draft",
+    "artifact_game_contract_draft",
+    "artifact_art_bible_baseline_draft",
+    "artifact_art_direction_board",
+    "artifact_stage_1_design_quality_review",
+    "artifact_stage_1_visual_quality_review"
+  ];
+  if (["concept_discussion", "concept_review"].includes(kernel.project.currentStage)) {
+    const before = stageOneContractFingerprint(kernel, stageOneTaskIds, stageOneArtifactIds);
+    ensureStageOneTasksAndArtifacts(kernel, now);
+    reconcileReviewedTaskAgentState(kernel, stageOneTaskIds, now);
+    const after = stageOneContractFingerprint(kernel, stageOneTaskIds, stageOneArtifactIds);
+    return {
+      changed: before !== after,
+      taskIds: stageOneTaskIds,
+      artifactIds: stageOneArtifactIds
+    };
+  }
+
+  const stageTwoTaskIds = [
+    "task_group_stage_2",
+    "task_stage_2_asset_pipeline",
+    "task_stage_2_visual_quality_review",
+    "task_stage_2_cocos_build"
+  ];
+  const stageTwoArtifactIds = [
+    "artifact_asset_manifest_draft",
+    "artifact_asset_contact_sheet",
+    "artifact_stage_2_visual_quality_review"
+  ];
+  if (
+    ["production", "first_playable_review"].includes(kernel.project.currentStage) &&
+    kernel.findTask("task_group_stage_2")
+  ) {
+    const before = stageOneContractFingerprint(kernel, stageTwoTaskIds, stageTwoArtifactIds);
+    ensureStageTwoTasksAndArtifacts(kernel, { messageId: "runtime_quality_reconciliation" }, now);
+    reconcileReviewedTaskAgentState(kernel, stageTwoTaskIds, now);
+    const after = stageOneContractFingerprint(kernel, stageTwoTaskIds, stageTwoArtifactIds);
+    return {
+      changed: before !== after,
+      taskIds: stageTwoTaskIds,
+      artifactIds: stageTwoArtifactIds
+    };
+  }
+
+  return { changed: false, taskIds: [], artifactIds: [] };
+}
+
+/**
+ * Rekeys the one legacy artifact that already owns a canonical Stage 1 path.
+ * This runs on the raw snapshot before StudioKernel restore so every persisted
+ * reference changes atomically and path uniqueness never fails midway through
+ * API startup. Only an unambiguous type/owner/task match is eligible.
+ */
+export function migrateLocalRuntimeSnapshot(
+  snapshot: StudioKernelSnapshot,
+  options: LocalRuntimeSnapshotMigrationOptions
+): LocalRuntimeSnapshotMigrationResult {
+  const migrations: Array<{ fromArtifactId: string; toArtifactId: string }> = [];
+  let conflictSnapshot: StudioKernelSnapshot | undefined;
+  let conflictChanged = false;
+  for (const contract of getStageOneArtifactContracts()) {
+    const canonicalArtifacts = snapshot.artifacts.filter(
+      (artifact) => artifact.artifactId === contract.artifactId
+    );
+    const canonicalArtifact = canonicalArtifacts[0];
+    if (canonicalArtifact) {
+      const mismatches = snapshotStageOneArtifactIdentityMismatches(snapshot, contract, canonicalArtifact);
+      if (canonicalArtifacts.length > 1) {
+        mismatches.push(`artifactId=${contract.artifactId} is duplicated`);
+      }
+      if (mismatches.length > 0) {
+        conflictSnapshot ??= structuredClone(snapshot);
+        conflictChanged =
+          blockSnapshotArtifactIdentityConflict(conflictSnapshot, contract, canonicalArtifact, mismatches) ||
+          conflictChanged;
+      }
+      continue;
+    }
+    if (snapshot.artifactLedger.some((entry) => entry.artifactId === contract.artifactId)) {
+      continue;
+    }
+    if (snapshot.artifactOperations.some((operation) => operation.artifactId === contract.artifactId)) {
+      continue;
+    }
+    const sourceTask = snapshot.tasks.find((task) => task.taskId === contract.sourceTaskId);
+    const pathOwners = snapshot.artifacts.filter((artifact) => artifact.path === contract.path);
+    const candidate = pathOwners[0];
+    const candidateLedger = candidate
+      ? snapshot.artifactLedger.filter((entry) => entry.artifactId === candidate.artifactId)
+      : [];
+    if (
+      sourceTask?.ownerAgentId !== contract.ownerAgentId ||
+      pathOwners.length !== 1 ||
+      !candidate ||
+      candidate.projectId !== snapshot.project.projectId ||
+      candidate.artifactId !== options.legacyArtifactIdFor(
+        snapshot.project.projectId,
+        contract.ownerAgentId,
+        contract.path
+      ) ||
+      candidate.type !== contract.type ||
+      candidate.ownerAgentId !== contract.ownerAgentId ||
+      candidate.sourceTaskId !== contract.sourceTaskId ||
+      candidateLedger.length > 1 ||
+      (candidateLedger[0] !== undefined &&
+        (candidateLedger[0].projectId !== snapshot.project.projectId ||
+          candidateLedger[0].ownerAgentId !== contract.ownerAgentId ||
+          candidateLedger[0].path !== contract.path ||
+          candidateLedger[0].taskId !== contract.sourceTaskId)) ||
+      hasUnsafeDerivedClaimReference(snapshot, candidate.artifactId)
+    ) {
+      continue;
+    }
+    const fromArtifactId = candidate.artifactId;
+    migrations.push({ fromArtifactId, toArtifactId: contract.artifactId });
+  }
+  if (migrations.length === 0 && !conflictChanged) {
+    return { snapshot, changed: false, artifactIdMigrations: [] };
+  }
+  const migratedSnapshot = conflictSnapshot ?? structuredClone(snapshot);
+  for (const migration of migrations) {
+    rekeySnapshotArtifact(migratedSnapshot, migration.fromArtifactId, migration.toArtifactId);
+  }
+  return { snapshot: migratedSnapshot, changed: true, artifactIdMigrations: migrations };
+}
+
+function snapshotStageOneArtifactIdentityMismatches(
+  snapshot: StudioKernelSnapshot,
+  contract: StageOneArtifactContract,
+  actual: Artifact
+): string[] {
+  const mismatches = artifactIdentityMismatches(
+    {
+      artifactId: contract.artifactId,
+      projectId: snapshot.project.projectId,
+      type: contract.type,
+      path: contract.path,
+      ownerAgentId: contract.ownerAgentId,
+      sourceTaskId: contract.sourceTaskId
+    },
+    actual
+  );
+  const sourceTask = snapshot.tasks.find((task) => task.taskId === contract.sourceTaskId);
+  if (sourceTask?.ownerAgentId !== contract.ownerAgentId) {
+    mismatches.push(
+      `source task ${contract.sourceTaskId} owner=${sourceTask?.ownerAgentId ?? "missing"}, expected ${contract.ownerAgentId}`
+    );
+  }
+  const ledgers = snapshot.artifactLedger.filter((entry) => entry.artifactId === actual.artifactId);
+  if (ledgers.length > 1) {
+    mismatches.push(`ledger for ${actual.artifactId} is duplicated`);
+  }
+  const ledger = ledgers[0];
+  if (
+    ledger &&
+    (ledger.projectId !== snapshot.project.projectId ||
+      ledger.ownerAgentId !== contract.ownerAgentId ||
+      ledger.path !== contract.path ||
+      ledger.taskId !== contract.sourceTaskId)
+  ) {
+    mismatches.push(
+      `ledger identity is project=${ledger.projectId}, owner=${ledger.ownerAgentId}, path=${ledger.path}, task=${ledger.taskId ?? "missing"}`
+    );
+  }
+  return mismatches;
+}
+
+function blockSnapshotArtifactIdentityConflict(
+  snapshot: StudioKernelSnapshot,
+  contract: StageOneArtifactContract,
+  actual: Artifact,
+  mismatches: string[]
+): boolean {
+  const task = snapshot.tasks.find((candidate) => candidate.taskId === contract.sourceTaskId);
+  if (!task || task.status === "cancelled") {
+    return false;
+  }
+  const blocker = stageOneArtifactIdentityBlocker(contract, actual, mismatches);
+  const agentState = snapshot.agentLoop.agents[task.ownerAgentId];
+  if (
+    task.status === "blocked" &&
+    task.blockers.includes(blocker) &&
+    agentState?.status === "blocked" &&
+    agentState.lastError === blocker
+  ) {
+    return false;
+  }
+  task.status = "blocked";
+  task.blockers = [...new Set([...task.blockers, blocker])];
+  task.updatedAt = snapshot.savedAt;
+  snapshot.agentLoop.agents[task.ownerAgentId] = {
+    ...(agentState ?? {
+      agentId: task.ownerAgentId,
+      status: "blocked",
+      iteration: snapshot.agentLoop.iteration,
+      updatedAt: snapshot.savedAt
+    }),
+    status: "blocked",
+    taskId: task.taskId,
+    lastError: blocker,
+    updatedAt: snapshot.savedAt
+  };
+  return true;
+}
+
+function hasUnsafeDerivedClaimReference(snapshot: StudioKernelSnapshot, artifactId: string): boolean {
+  if (
+    snapshot.claimVerifications.some(
+      (claim) => claim.relatedArtifactIds.includes(artifactId) && !claim.claimedPath
+    )
+  ) {
+    return true;
+  }
+  return snapshot.messages.some((message) => {
+    const claims = message.metadata.claimVerifications;
+    return Array.isArray(claims) && claims.some((claim) => {
+      if (!claim || typeof claim !== "object" || Array.isArray(claim)) {
+        return false;
+      }
+      const record = claim as Record<string, unknown>;
+      return (
+        Array.isArray(record.relatedArtifactIds) &&
+        record.relatedArtifactIds.includes(artifactId) &&
+        typeof record.claimedPath !== "string"
+      );
+    });
+  });
+}
+
 function bootstrapConceptDiscussion(kernel: StudioKernel, producerMessage: StudioMessage, now: string): void {
-  ensureStageOneTasks(kernel, now);
+  ensureStageOneTasksAndArtifacts(kernel, now);
   writeProjectMemory(kernel, {
     memoryId: `mem_project_idea_${producerMessage.messageId}`,
     ownerAgent: "studio_orchestrator",
@@ -245,7 +660,14 @@ function handleOrchestrator({ kernel, producerMessage, now }: HandlerInput): voi
     agentId: "studio_orchestrator",
     roomKind: "studio-main",
     messageType: "progress_update",
-    relatedTaskIds: ["task_group_stage_1", "task_stage_1_design_clarification", "task_stage_1_art_direction", "task_stage_1_scope_review"],
+    relatedTaskIds: [
+      "task_group_stage_1",
+      "task_stage_1_design_clarification",
+      "task_stage_1_art_direction",
+      "task_stage_1_design_quality_review",
+      "task_stage_1_visual_quality_review",
+      "task_stage_1_scope_review"
+    ],
     content:
       "已创建 Stage 1 立项任务树：策划负责玩法澄清和 GDD baseline，美术负责视觉方向和 Art Bible baseline，Producer 负责范围与评审记录。"
   });
@@ -432,7 +854,7 @@ function submitWorkflowReview(kernel: StudioKernel, message: StudioMessage, gate
 function buildGateReviewLines(kernel: StudioKernel, gate: GateAction, stageApplicable: boolean, now: string): GateReviewLine[] {
   switch (gate.actionId) {
     case "stage1":
-      ensureStageOneTasks(kernel, now);
+      ensureStageOneTasksAndArtifacts(kernel, now);
       return buildStageOneReview(kernel, gate, stageApplicable);
     case "playable":
       return buildPlayableReview(kernel, gate, stageApplicable);
@@ -444,15 +866,29 @@ function buildGateReviewLines(kernel: StudioKernel, gate: GateAction, stageAppli
 function buildStageOneReview(kernel: StudioKernel, gate: GateAction, stageApplicable: boolean): GateReviewLine[] {
   const designTask = kernel.findTask("task_stage_1_design_clarification");
   const artTask = kernel.findTask("task_stage_1_art_direction");
+  const designReviewTask = kernel.findTask("task_stage_1_design_quality_review");
+  const visualReviewTask = kernel.findTask("task_stage_1_visual_quality_review");
   const scopeTask = kernel.findTask("task_stage_1_scope_review");
   const gdd = kernel.listArtifacts().find((artifact) => artifact.artifactId === "artifact_gdd_baseline_draft");
   const gameContract = kernel.listArtifacts().find((artifact) => artifact.artifactId === "artifact_game_contract_draft");
   const artBible = kernel.listArtifacts().find((artifact) => artifact.artifactId === "artifact_art_bible_baseline_draft");
-  const blockers = [...(designTask?.blockers ?? []), ...(artTask?.blockers ?? []), ...(scopeTask?.blockers ?? [])];
+  const artBoard = kernel.listArtifacts().find((artifact) => artifact.artifactId === "artifact_art_direction_board");
+  const designReview = kernel.listArtifacts().find((artifact) => artifact.artifactId === "artifact_stage_1_design_quality_review");
+  const visualReview = kernel.listArtifacts().find((artifact) => artifact.artifactId === "artifact_stage_1_visual_quality_review");
+  const blockers = [
+    ...(designTask?.blockers ?? []),
+    ...(artTask?.blockers ?? []),
+    ...(designReviewTask?.blockers ?? []),
+    ...(visualReviewTask?.blockers ?? []),
+    ...(scopeTask?.blockers ?? [])
+  ];
   const missing = [
     ...(gdd ? [] : ["GDD baseline 尚未生成"]),
     ...(gameContract ? [] : ["GameContract 尚未生成"]),
-    ...(artBible ? [] : ["Art Bible baseline 尚未生成"])
+    ...(artBible ? [] : ["Art Bible baseline 尚未生成"]),
+    ...(artBoard ? [] : ["真实视觉方向板尚未生成"]),
+    ...(designReview ? [] : ["独立策划质量审查尚未生成"]),
+    ...(visualReview ? [] : ["独立视觉质量审查尚未生成"])
   ];
   const risks = [
     ...blockers,
@@ -462,16 +898,16 @@ function buildStageOneReview(kernel: StudioKernel, gate: GateAction, stageApplic
 
   return [
     {
-      agentId: "game_designer",
+      agentId: "design_quality_reviewer",
       roomKind: "design-room",
       messageType: "review",
-      content: `门禁评审：${gate.label}。策划准备度：${readinessText(stageApplicable && Boolean(gdd) && Boolean(gameContract) && !designTask?.blockers.length)}。${taskStatusText(designTask)} 风险：${formatList([...(designTask?.blockers ?? []), gameContract ? "GameContract 已生成，仍需制作人确认核心循环与输入语义。" : "缺少可机读的 GameContract。", "核心操作、胜负条件和第一可玩范围需要制作人明确确认。"])}`
+      content: `门禁评审：${gate.label}。独立策划质量结论：${readinessText(stageApplicable && Boolean(designReview) && !designReviewTask?.blockers.length)}。${taskStatusText(designReviewTask)} 收据：${designReview ? artifactStatusText(designReview) : "缺失"}。审查员未参与 GDD/GameContract 创作，制作人仍需确认产品取舍。`
     },
     {
-      agentId: "art_director",
+      agentId: "visual_quality_reviewer",
       roomKind: "art-room",
       messageType: "review",
-      content: `门禁评审：${gate.label}。美术准备度：${readinessText(stageApplicable && Boolean(artBible) && !artTask?.blockers.length)}。${taskStatusText(artTask)} 风险：${formatList([...(artTask?.blockers ?? []), "视觉参考、主色和禁用风格未确认时，资产生产会出现方向返工。"])}`
+      content: `门禁评审：${gate.label}。独立视觉质量结论：${readinessText(stageApplicable && Boolean(visualReview) && Boolean(artBoard) && !visualReviewTask?.blockers.length)}。${taskStatusText(visualReviewTask)} 收据：${visualReview ? artifactStatusText(visualReview) : "缺失"}；方向板：${artBoard ? artifactStatusText(artBoard) : "缺失"}。审查结论来自真实像素输入，不以 Art Bible 自述代替。`
     },
     {
       agentId: "producer",
@@ -485,15 +921,23 @@ function buildStageOneReview(kernel: StudioKernel, gate: GateAction, stageApplic
 
 function buildPlayableReview(kernel: StudioKernel, gate: GateAction, stageApplicable: boolean): GateReviewLine[] {
   const assetTask = kernel.findTask("task_stage_2_asset_pipeline");
+  const visualReviewTask = kernel.findTask("task_stage_2_visual_quality_review");
   const codeTask = kernel.findTask("task_stage_2_cocos_implementation");
   const qaTask = kernel.findTask("task_stage_2_qa_playtest");
   const build = kernel.listArtifacts().find((artifact) => artifact.artifactId === "artifact_wechat_dev_build");
+  const visualReview = kernel.listArtifacts().find((artifact) => artifact.artifactId === "artifact_stage_2_visual_quality_review");
   const qaReport = kernel.listArtifacts().find((artifact) => artifact.artifactId === "artifact_qa_playtest_report");
   const qaPassed = qaReport?.metadata.playtestVerdict === "pass" &&
     (qaReport.metadata.toolName === "run_playtest" || qaReport.metadata.harnessToolName === "run_playtest");
-  const blockers = [...(assetTask?.blockers ?? []), ...(codeTask?.blockers ?? []), ...(qaTask?.blockers ?? [])];
+  const blockers = [
+    ...(assetTask?.blockers ?? []),
+    ...(visualReviewTask?.blockers ?? []),
+    ...(codeTask?.blockers ?? []),
+    ...(qaTask?.blockers ?? [])
+  ];
   const missing = [
     ...(build ? [] : ["微信小游戏开发构建尚未生成"]),
+    ...(visualReview ? [] : ["独立视觉资产质量审查尚未生成"]),
     ...(qaPassed ? [] : [qaReport ? "QA 报告存在，但真实试玩结论尚未通过" : "首个可玩 QA 试玩报告尚未生成"])
   ];
   const risks = [
@@ -503,6 +947,12 @@ function buildPlayableReview(kernel: StudioKernel, gate: GateAction, stageApplic
   ];
 
   return [
+    {
+      agentId: "visual_quality_reviewer",
+      roomKind: "art-room",
+      messageType: "review",
+      content: `门禁评审：${gate.label}。独立视觉资产质量结论：${readinessText(stageApplicable && Boolean(visualReview) && !visualReviewTask?.blockers.length)}。${taskStatusText(visualReviewTask)} 收据：${visualReview ? artifactStatusText(visualReview) : "缺失"}。该结论以实际 PNG 像素为输入，不能由 manifest 文件名替代。`
+    },
     {
       agentId: "gameplay_programmer",
       roomKind: "engineering-room",
@@ -693,10 +1143,16 @@ function approveStageOne(
   now: string,
   evidencePolicy: GateEvidencePolicy
 ): void {
-  ensureStageOneTasks(kernel, now);
+  ensureStageOneTasksAndArtifacts(kernel, now);
   assertGateEvidence(evidencePolicy, kernel, gateActions.stage1, "decision");
   approveActiveWorkflowGate(kernel, gateActions.stage1, message, now);
-  for (const taskId of ["task_stage_1_design_clarification", "task_stage_1_art_direction", "task_stage_1_scope_review"]) {
+  for (const taskId of [
+    "task_stage_1_design_clarification",
+    "task_stage_1_art_direction",
+    "task_stage_1_design_quality_review",
+    "task_stage_1_visual_quality_review",
+    "task_stage_1_scope_review"
+  ]) {
     kernel.updateTaskStatus(taskId, "done", now);
   }
   kernel.updateTaskStatus("task_group_stage_1", "done", now);
@@ -704,6 +1160,9 @@ function approveStageOne(
   ensureArtifactStatus(kernel, "artifact_gdd_baseline_draft", "approved", now);
   ensureArtifactStatus(kernel, "artifact_game_contract_draft", "approved", now);
   ensureArtifactStatus(kernel, "artifact_art_bible_baseline_draft", "approved", now);
+  ensureArtifactStatus(kernel, "artifact_art_direction_board", "approved", now);
+  ensureArtifactStatus(kernel, "artifact_stage_1_design_quality_review", "approved", now);
+  ensureArtifactStatus(kernel, "artifact_stage_1_visual_quality_review", "approved", now);
   ensureStageTwoTasksAndArtifacts(kernel, message, now);
   writeProjectMemory(kernel, {
     memoryId: `mem_stage_1_approved_${message.messageId}`,
@@ -803,6 +1262,7 @@ function approveFirstPlayable(
   approveActiveWorkflowGate(kernel, gateActions.playable, message, now);
   for (const taskId of [
     "task_stage_2_asset_pipeline",
+    "task_stage_2_visual_quality_review",
     "task_stage_2_cocos_architecture",
     "task_stage_2_cocos_implementation",
     "task_stage_2_playtest_contract",
@@ -814,6 +1274,8 @@ function approveFirstPlayable(
       kernel.updateTaskStatus(taskId, "done", now);
     }
   }
+  ensureArtifactStatus(kernel, "artifact_asset_contact_sheet", "approved", now);
+  ensureArtifactStatus(kernel, "artifact_stage_2_visual_quality_review", "approved", now);
 
   ensureReleaseTasksAndArtifacts(kernel, message, now);
   writeProjectMemory(kernel, {
@@ -921,6 +1383,7 @@ function handleGameDesigner({ kernel, producerMessage, now, ideaTemplates }: Han
     stageId: kernel.project.currentStage,
     status: "draft",
     version: 1,
+    sourceTaskId: "task_stage_1_design_clarification",
     sourceDecisionIds: [],
     metadata: {
       generatedBy: "local_agent_runtime",
@@ -975,6 +1438,7 @@ function handleArtDirector({ kernel, producerMessage, now, ideaTemplates }: Hand
     stageId: kernel.project.currentStage,
     status: "draft",
     version: 1,
+    sourceTaskId: "task_stage_1_art_direction",
     sourceDecisionIds: [],
     metadata: {
       generatedBy: "local_agent_runtime",
@@ -1027,6 +1491,24 @@ function handleAssetProduction({ kernel }: HandlerInput): void {
     roomKind: "art-room",
     messageType: "progress_update",
     content: "资产生产等待 Art Bible baseline 和 asset specs，当前不生成最终运行时资产。"
+  });
+}
+
+function handleDesignQualityReviewer({ kernel }: HandlerInput): void {
+  writeAgentMessage(kernel, {
+    agentId: "design_quality_reviewer",
+    roomKind: "design-room",
+    messageType: "progress_update",
+    content: "独立策划审查等待当前 GDD 与 GameContract 的真实文件证据；审查员不会修改作者产物，也不会替制作人批准门禁。"
+  });
+}
+
+function handleVisualQualityReviewer({ kernel }: HandlerInput): void {
+  writeAgentMessage(kernel, {
+    agentId: "visual_quality_reviewer",
+    roomKind: "art-room",
+    messageType: "progress_update",
+    content: "独立视觉审查等待 Art Bible 与真实像素证据；没有读取实际 PNG 的多模态工具结果时，不会给出通过结论。"
   });
 }
 
@@ -1093,12 +1575,14 @@ function handleLiveOps({ kernel }: HandlerInput): void {
   });
 }
 
-function ensureStageOneTasks(kernel: StudioKernel, now: string): void {
+function ensureStageOneTasksAndArtifacts(kernel: StudioKernel, now: string): void {
   const projectId = kernel.project.projectId;
   const stageId: StageId = "concept_discussion";
   const groupId = "task_group_stage_1";
   const designTaskId = "task_stage_1_design_clarification";
   const artTaskId = "task_stage_1_art_direction";
+  const designReviewTaskId = "task_stage_1_design_quality_review";
+  const visualReviewTaskId = "task_stage_1_visual_quality_review";
   const producerTaskId = "task_stage_1_scope_review";
 
   ensureTask(kernel, {
@@ -1108,15 +1592,28 @@ function ensureStageOneTasks(kernel: StudioKernel, now: string): void {
     taskLevel: "task_group",
     ownerAgentId: "studio_orchestrator",
     title: "阶段 1：立项、机制和世界观讨论",
-    description: "把制作人 idea 澄清成可执行 GDD baseline、版本化 GameContract、Art Bible baseline 和第一可玩范围。",
+    description: "把制作人 idea 澄清成可执行 GDD baseline、版本化 GameContract、Art Bible、真实视觉方向板，并通过独立专业审查后确定第一可玩范围。",
     status: "doing",
     priority: 100,
     sortOrder: 10,
     progressPercent: 0,
     childrenSummary: emptyChildrenSummary(),
     inputArtifacts: [],
-    outputArtifacts: [],
-    acceptanceCriteria: ["核心玩法已确认", "GameContract 已通过结构校验", "美术方向已确认", "第一可玩范围已确认"],
+    outputArtifacts: [
+      "artifact_gdd_baseline_draft",
+      "artifact_game_contract_draft",
+      "artifact_art_bible_baseline_draft",
+      "artifact_art_direction_board",
+      "artifact_stage_1_design_quality_review",
+      "artifact_stage_1_visual_quality_review"
+    ],
+    acceptanceCriteria: [
+      "核心玩法与 GameContract 一致",
+      "独立策划质量审查通过",
+      "Art Bible 与真实视觉方向板一致",
+      "独立视觉质量审查通过",
+      "第一可玩范围已确认"
+    ],
     blockers: [],
     createdAt: now,
     updatedAt: now
@@ -1138,7 +1635,7 @@ function ensureStageOneTasks(kernel: StudioKernel, now: string): void {
     childrenSummary: emptyChildrenSummary(),
     inputArtifacts: [],
     outputArtifacts: ["artifact_gdd_baseline_draft", "artifact_game_contract_draft"],
-    acceptanceCriteria: ["GDD baseline 已提交", "GameContract 通过严格结构校验", "制作人完成核心玩法审批"],
+    acceptanceCriteria: ["GDD baseline 已提交", "GameContract 通过严格结构校验", "GDD 与 GameContract 语义一致", "已提交独立策划质量审查"],
     blockers: ["等待制作人回答开局澄清问题"],
     createdAt: now,
     updatedAt: now
@@ -1152,16 +1649,70 @@ function ensureStageOneTasks(kernel: StudioKernel, now: string): void {
     taskLevel: "task",
     ownerAgentId: "art_director",
     title: "澄清视觉方向并生成 Art Bible baseline",
-    description: "确认视觉风格、色板、UI 可读性、资产规格方向和禁用风格。",
+    description: "确认视觉风格、色板、UI 可读性、资产规格方向和禁用风格，并通过真实图片模型生成一张可审查的视觉方向板。",
     status: "doing",
     priority: 80,
     sortOrder: 30,
     progressPercent: 50,
     childrenSummary: emptyChildrenSummary(),
     inputArtifacts: [],
-    outputArtifacts: ["artifact_art_bible_baseline_draft"],
-    acceptanceCriteria: ["Art Bible baseline 已提交", "制作人完成美术方向审批"],
+    outputArtifacts: ["artifact_art_bible_baseline_draft", "artifact_art_direction_board"],
+    acceptanceCriteria: ["Art Bible baseline 已提交", "真实 PNG 视觉方向板已生成", "方向板与 Art Bible 色板和风格约束一致", "已提交独立视觉质量审查"],
     blockers: ["等待制作人提供视觉参考或风格选择"],
+    createdAt: now,
+    updatedAt: now
+  });
+  ensureTask(kernel, {
+    taskId: designReviewTaskId,
+    projectId,
+    stageId,
+    parentTaskId: groupId,
+    roomId: kernel.getRoom("design-room").roomId,
+    taskLevel: "task",
+    ownerAgentId: "design_quality_reviewer",
+    title: "独立审查 GDD 与 GameContract 质量",
+    description: "以资深移动游戏设计总监视角审查核心循环、反馈张力、边界条件、数值依据、MVP 范围、平台可行性、跨文档一致性和可测试性；不得修改被审产物。",
+    status: "todo",
+    priority: 88,
+    sortOrder: 35,
+    progressPercent: 0,
+    childrenSummary: emptyChildrenSummary(),
+    inputArtifacts: ["artifact_gdd_baseline_draft", "artifact_game_contract_draft"],
+    outputArtifacts: ["artifact_stage_1_design_quality_review"],
+    acceptanceCriteria: [
+      "严格质量审查收据绑定当前 GDD/GameContract 版本与哈希",
+      "每项评分均引用 Markdown 行号或 JSON Pointer",
+      "通过结论达到 rubric 阈值且不存在 critical/major 问题",
+      "审查员未修改作者产物"
+    ],
+    blockers: [],
+    createdAt: now,
+    updatedAt: now
+  });
+  ensureTask(kernel, {
+    taskId: visualReviewTaskId,
+    projectId,
+    stageId,
+    parentTaskId: groupId,
+    roomId: kernel.getRoom("art-room").roomId,
+    taskLevel: "task",
+    ownerAgentId: "visual_quality_reviewer",
+    title: "独立审查 Art Bible 与视觉方向板",
+    description: "以 Principal 2D Art Director 与移动技术美术视角读取实际 PNG 像素，审查风格、轮廓、小屏可读性、对比层级、技术约束和 IP 风险；不得修改或生成被审资产。",
+    status: "todo",
+    priority: 87,
+    sortOrder: 36,
+    progressPercent: 0,
+    childrenSummary: emptyChildrenSummary(),
+    inputArtifacts: ["artifact_art_bible_baseline_draft", "artifact_art_direction_board"],
+    outputArtifacts: ["artifact_stage_1_visual_quality_review"],
+    acceptanceCriteria: [
+      "inspect_visual_assets 已读取真实 PNG 字节",
+      "严格质量审查收据绑定当前 Art Bible/方向板版本与哈希",
+      "通过结论达到 rubric 阈值且不存在 critical/major 问题",
+      "审查员未修改或生成被审资产"
+    ],
+    blockers: [],
     createdAt: now,
     updatedAt: now
   });
@@ -1174,21 +1725,171 @@ function ensureStageOneTasks(kernel: StudioKernel, now: string): void {
     taskLevel: "task",
     ownerAgentId: "producer",
     title: "确认第一可玩范围和阶段门禁",
-    description: "组织制作人确认核心玩法、美术方向和第一可玩范围。",
+    description: "在两份独立专业审查均为当前且通过后，组织制作人确认核心玩法、美术方向和第一可玩范围。",
     status: "todo",
     priority: 85,
     sortOrder: 40,
     childrenSummary: emptyChildrenSummary(),
-    inputArtifacts: ["artifact_gdd_baseline_draft", "artifact_game_contract_draft", "artifact_art_bible_baseline_draft"],
+    inputArtifacts: [
+      "artifact_gdd_baseline_draft",
+      "artifact_game_contract_draft",
+      "artifact_art_bible_baseline_draft",
+      "artifact_art_direction_board",
+      "artifact_stage_1_design_quality_review",
+      "artifact_stage_1_visual_quality_review"
+    ],
     outputArtifacts: [],
     acceptanceCriteria: ["制作人完成 Stage 1 审批或提交变更请求"],
     blockers: [],
     createdAt: now,
     updatedAt: now
   });
+
+  ensureTaskArtifactReferences(
+    kernel,
+    designTaskId,
+    "outputArtifacts",
+    ["artifact_gdd_baseline_draft", "artifact_game_contract_draft"],
+    now
+  );
+  ensureTaskArtifactReferences(
+    kernel,
+    groupId,
+    "outputArtifacts",
+    [
+      "artifact_gdd_baseline_draft",
+      "artifact_game_contract_draft",
+      "artifact_art_bible_baseline_draft",
+      "artifact_art_direction_board",
+      "artifact_stage_1_design_quality_review",
+      "artifact_stage_1_visual_quality_review"
+    ],
+    now
+  );
+  ensureTaskArtifactReferences(
+    kernel,
+    artTaskId,
+    "outputArtifacts",
+    ["artifact_art_bible_baseline_draft", "artifact_art_direction_board"],
+    now
+  );
+  ensureTaskArtifactReferences(
+    kernel,
+    designReviewTaskId,
+    "inputArtifacts",
+    ["artifact_gdd_baseline_draft", "artifact_game_contract_draft"],
+    now
+  );
+  ensureTaskArtifactReferences(
+    kernel,
+    designReviewTaskId,
+    "outputArtifacts",
+    ["artifact_stage_1_design_quality_review"],
+    now
+  );
+  ensureTaskArtifactReferences(
+    kernel,
+    visualReviewTaskId,
+    "inputArtifacts",
+    ["artifact_art_bible_baseline_draft", "artifact_art_direction_board"],
+    now
+  );
+  ensureTaskArtifactReferences(
+    kernel,
+    visualReviewTaskId,
+    "outputArtifacts",
+    ["artifact_stage_1_visual_quality_review"],
+    now
+  );
+  ensureTaskArtifactReferences(
+    kernel,
+    producerTaskId,
+    "inputArtifacts",
+    [
+      "artifact_gdd_baseline_draft",
+      "artifact_game_contract_draft",
+      "artifact_art_bible_baseline_draft",
+      "artifact_art_direction_board",
+      "artifact_stage_1_design_quality_review",
+      "artifact_stage_1_visual_quality_review"
+    ],
+    now
+  );
+
+  const sourceIdea = kernel.project.initialIdea ?? "";
+  for (const artifact of getStageOneArtifactContracts()) {
+    ensureDeclaredArtifact(kernel, {
+      ...artifact,
+      projectId,
+      stageId,
+      status: "draft",
+      version: 1,
+      sourceDecisionIds: [],
+      metadata: {
+        generatedBy: "local_agent_runtime",
+        artifactContract: "stage1.v1",
+        ...(artifact.type === "game_contract" ? { schemaVersion: 1 } : {}),
+        ...(sourceIdea ? { sourceIdea } : {})
+      },
+      createdAt: now,
+      updatedAt: now
+    });
+  }
+
+  for (const artifact of getQualityReviewArtifactContracts().filter((candidate) => candidate.sourceTaskId.startsWith("task_stage_1_"))) {
+    ensureDeclaredArtifact(kernel, {
+      artifactId: artifact.artifactId,
+      projectId,
+      type: artifact.type,
+      path: artifact.path,
+      ownerAgentId: artifact.ownerAgentId,
+      stageId,
+      status: "draft",
+      version: 1,
+      sourceTaskId: artifact.sourceTaskId,
+      sourceDecisionIds: [],
+      metadata: {
+        generatedBy: "local_agent_runtime",
+        artifactContract: "quality-review.v1",
+        qualityReviewDomain: artifact.domain,
+        subjectArtifactIds: [...artifact.subjectArtifactIds]
+      },
+      createdAt: now,
+      updatedAt: now
+    });
+  }
+
+  reopenStageOneTaskForMissingEvidence(
+    kernel,
+    designTaskId,
+    ["artifact_gdd_baseline_draft", "artifact_game_contract_draft"],
+    now
+  );
+  reopenStageOneTaskForMissingEvidence(
+    kernel,
+    artTaskId,
+    ["artifact_art_bible_baseline_draft", "artifact_art_direction_board"],
+    now
+  );
+  reopenStageOneTaskForMissingEvidence(
+    kernel,
+    designReviewTaskId,
+    ["artifact_stage_1_design_quality_review"],
+    now
+  );
+  reopenStageOneTaskForMissingEvidence(
+    kernel,
+    visualReviewTaskId,
+    ["artifact_stage_1_visual_quality_review"],
+    now
+  );
 }
 
-function ensureStageTwoTasksAndArtifacts(kernel: StudioKernel, message: StudioMessage, now: string): void {
+function ensureStageTwoTasksAndArtifacts(
+  kernel: StudioKernel,
+  message: Pick<StudioMessage, "messageId">,
+  now: string
+): void {
   const projectId = kernel.project.projectId;
   const stageId: StageId = "production";
   const groupId = "task_group_stage_2";
@@ -1209,13 +1910,15 @@ function ensureStageTwoTasksAndArtifacts(kernel: StudioKernel, message: StudioMe
     inputArtifacts: ["artifact_gdd_baseline_draft", "artifact_game_contract_draft", "artifact_art_bible_baseline_draft"],
     outputArtifacts: [
       "artifact_asset_manifest_draft",
+      "artifact_asset_contact_sheet",
+      "artifact_stage_2_visual_quality_review",
       "artifact_scene_blueprint_draft",
       "artifact_playtest_contract_draft",
       "artifact_gameplay_source",
       "artifact_wechat_dev_build",
       "artifact_qa_playtest_report"
     ],
-    acceptanceCriteria: ["核心循环可玩", "资产已导入", "QA 试玩报告已生成"],
+    acceptanceCriteria: ["核心循环可玩", "真实美术资产及联系表已生成", "独立视觉质量审查通过", "资产已导入", "QA 试玩报告已生成"],
     blockers: [],
     createdAt: now,
     updatedAt: now
@@ -1229,15 +1932,48 @@ function ensureStageTwoTasksAndArtifacts(kernel: StudioKernel, message: StudioMe
     taskLevel: "task",
     ownerAgentId: "asset_production",
     title: "生产并打包第一可玩美术资产",
-    description: "根据 Art Bible 生成 SVG 源资产，渲染 Cocos 可直接导入的透明 PNG，并维护 asset manifest。",
+    description: "根据 Art Bible 通过真实图片生成模型生产第一可玩 PNG，保留模型与提示词证据，生成资产联系表并维护 asset manifest v2；逐项声明 alphaPolicy 并通过像素级透明通道硬校验。",
     status: "doing",
     priority: 90,
     sortOrder: 110,
     progressPercent: 50,
     childrenSummary: emptyChildrenSummary(),
     inputArtifacts: ["artifact_art_bible_baseline_draft"],
-    outputArtifacts: ["artifact_asset_manifest_draft"],
-    acceptanceCriteria: ["asset manifest 存在且 runtimePath 指向 PNG", "每个 SVG 源资产都有经工具验证的同名 PNG", "关键资产符合 Art Bible"],
+    outputArtifacts: ["artifact_asset_manifest_draft", "artifact_asset_contact_sheet"],
+    acceptanceCriteria: [
+      "至少一个真实 PNG 资产由 generate_raster_asset 物化并登记",
+      "asset manifest 使用 schemaVersion=2.0.0，且每个 runtimePath 指向逐一验证的 PNG 并显式声明 alphaPolicy",
+      "资产联系表覆盖第一可玩关键资产",
+      "生成 provider/model/request/prompt hash/seed/尺寸证据完整",
+      "每个 runtime PNG 都通过与 alphaPolicy 一致的确定性透明通道硬校验"
+    ],
+    blockers: [],
+    createdAt: now,
+    updatedAt: now
+  });
+  ensureTask(kernel, {
+    taskId: "task_stage_2_visual_quality_review",
+    projectId,
+    stageId,
+    parentTaskId: groupId,
+    roomId: kernel.getRoom("art-room").roomId,
+    taskLevel: "task",
+    ownerAgentId: "visual_quality_reviewer",
+    title: "独立审查第一可玩美术资产",
+    description: "读取 Art Bible、asset manifest 和真实资产联系表像素，审查风格一致性、轮廓、小屏可读性、透明边缘、UI 层级、性能预算和 IP/安全风险。",
+    status: "todo",
+    priority: 89,
+    sortOrder: 112,
+    progressPercent: 0,
+    childrenSummary: emptyChildrenSummary(),
+    inputArtifacts: ["artifact_art_bible_baseline_draft", "artifact_asset_manifest_draft", "artifact_asset_contact_sheet"],
+    outputArtifacts: ["artifact_stage_2_visual_quality_review"],
+    acceptanceCriteria: [
+      "inspect_visual_assets 已读取真实联系表 PNG",
+      "严格质量收据绑定当前 Art Bible、manifest 与联系表哈希",
+      "通过结论达到 rubric 阈值且不存在 critical/major 问题",
+      "审查员未修改或生成被审资产"
+    ],
     blockers: [],
     createdAt: now,
     updatedAt: now
@@ -1317,7 +2053,7 @@ function ensureStageTwoTasksAndArtifacts(kernel: StudioKernel, message: StudioMe
     taskLevel: "task",
     ownerAgentId: "cocos_automation",
     title: "导入资产并构建微信首个可玩版本",
-    description: "通过 Cocos 引擎桥导入资产、应用场景蓝图、生成 Prefab 并执行微信小游戏开发构建。",
+    description: "通过 Cocos 引擎桥导入当前已审查 runtime 资产，生成逐文件字节回执，应用场景蓝图、生成 Prefab，并仅在导入回执仍匹配当前 manifest/source/Cocos destination 时执行微信小游戏开发构建。",
     status: "todo",
     priority: 85,
     sortOrder: 125,
@@ -1325,12 +2061,17 @@ function ensureStageTwoTasksAndArtifacts(kernel: StudioKernel, message: StudioMe
     childrenSummary: emptyChildrenSummary(),
     inputArtifacts: [
       "artifact_asset_manifest_draft",
+      "artifact_stage_2_visual_quality_review",
       "artifact_scene_blueprint_draft",
       "artifact_playtest_contract_draft",
       "artifact_gameplay_source"
     ],
     outputArtifacts: ["artifact_wechat_dev_build"],
-    acceptanceCriteria: ["Cocos MCP 构建命令成功", "微信小游戏开发构建可启动"],
+    acceptanceCriteria: [
+      "当前 manifest 的每个 runtime 资产都有 source → Cocos destination 的 hash/size 导入回执",
+      "构建报告绑定当前导入回执且 Cocos MCP 构建命令成功",
+      "微信小游戏开发构建可启动"
+    ],
     blockers: [],
     createdAt: now,
     updatedAt: now
@@ -1364,6 +2105,55 @@ function ensureStageTwoTasksAndArtifacts(kernel: StudioKernel, message: StudioMe
     updatedAt: now
   });
 
+  ensureTaskArtifactReferences(
+    kernel,
+    groupId,
+    "outputArtifacts",
+    ["artifact_asset_manifest_draft", "artifact_asset_contact_sheet", "artifact_stage_2_visual_quality_review"],
+    now
+  );
+  ensureTaskArtifactReferences(
+    kernel,
+    "task_stage_2_asset_pipeline",
+    "outputArtifacts",
+    ["artifact_asset_manifest_draft", "artifact_asset_contact_sheet"],
+    now
+  );
+  ensureTaskArtifactReferences(
+    kernel,
+    "task_stage_2_visual_quality_review",
+    "inputArtifacts",
+    [
+      "artifact_art_bible_baseline_draft",
+      "artifact_asset_manifest_draft",
+      "artifact_asset_contact_sheet",
+      ...kernel.listArtifacts()
+        .filter((artifact) =>
+          artifact.type === "asset" &&
+          artifact.ownerAgentId === "asset_production" &&
+          artifact.sourceTaskId === "task_stage_2_asset_pipeline" &&
+          artifact.path.startsWith("assets/art/first-playable/") &&
+          artifact.path.toLowerCase().endsWith(".png")
+        )
+        .map((artifact) => artifact.artifactId)
+    ],
+    now
+  );
+  ensureTaskArtifactReferences(
+    kernel,
+    "task_stage_2_visual_quality_review",
+    "outputArtifacts",
+    ["artifact_stage_2_visual_quality_review"],
+    now
+  );
+  ensureTaskArtifactReferences(
+    kernel,
+    "task_stage_2_cocos_build",
+    "inputArtifacts",
+    ["artifact_asset_manifest_draft", "artifact_stage_2_visual_quality_review"],
+    now
+  );
+
   ensureArtifact(kernel, {
     artifactId: "artifact_asset_manifest_draft",
     projectId,
@@ -1377,6 +2167,50 @@ function ensureStageTwoTasksAndArtifacts(kernel: StudioKernel, message: StudioMe
     sourceDecisionIds: [],
     metadata: {
       generatedBy: "local_agent_runtime"
+    },
+    createdAt: now,
+    updatedAt: now
+  });
+  ensureArtifact(kernel, {
+    artifactId: "artifact_asset_contact_sheet",
+    projectId,
+    type: "asset",
+    path: "agents/art/processed-assets/first-playable-contact-sheet.png",
+    ownerAgentId: "asset_production",
+    stageId,
+    status: "draft",
+    version: 1,
+    sourceTaskId: "task_stage_2_asset_pipeline",
+    sourceDecisionIds: [],
+    metadata: {
+      generatedBy: "local_agent_runtime",
+      mediaRole: "asset_contact_sheet"
+    },
+    createdAt: now,
+    updatedAt: now
+  });
+  const stageTwoVisualReviewContract = getQualityReviewArtifactContracts().find(
+    (candidate) => candidate.artifactId === "artifact_stage_2_visual_quality_review"
+  );
+  if (!stageTwoVisualReviewContract) {
+    throw new Error("Missing Stage 2 visual quality review artifact contract.");
+  }
+  ensureDeclaredArtifact(kernel, {
+    artifactId: stageTwoVisualReviewContract.artifactId,
+    projectId,
+    type: stageTwoVisualReviewContract.type,
+    path: stageTwoVisualReviewContract.path,
+    ownerAgentId: stageTwoVisualReviewContract.ownerAgentId,
+    stageId,
+    status: "draft",
+    version: 1,
+    sourceTaskId: stageTwoVisualReviewContract.sourceTaskId,
+    sourceDecisionIds: [],
+    metadata: {
+      generatedBy: "local_agent_runtime",
+      artifactContract: "quality-review.v1",
+      qualityReviewDomain: stageTwoVisualReviewContract.domain,
+      subjectArtifactIds: [...stageTwoVisualReviewContract.subjectArtifactIds]
     },
     createdAt: now,
     updatedAt: now
@@ -1475,8 +2309,15 @@ function ensureStageTwoTasksAndArtifacts(kernel: StudioKernel, message: StudioMe
     agentId: "asset_production",
     roomKind: "art-room",
     messageType: "progress_update",
-    relatedArtifactIds: ["artifact_asset_manifest_draft"],
-    content: "Stage 2 美术资产任务已排队；资产生产 Agent 必须通过工具生成资产清单和可验证输出。"
+    relatedArtifactIds: ["artifact_asset_manifest_draft", "artifact_asset_contact_sheet"],
+    content: "Stage 2 美术资产任务已排队；资产生产 Agent 必须通过真实图片模型生成 PNG 与联系表，并登记 provider/model/request/prompt hash 和文件证据。"
+  });
+  writeAgentMessage(kernel, {
+    agentId: "visual_quality_reviewer",
+    roomKind: "art-room",
+    messageType: "progress_update",
+    relatedArtifactIds: ["artifact_stage_2_visual_quality_review"],
+    content: "独立视觉质量审查等待当前 Art Bible、资产清单和真实联系表；未读取实际像素或存在 critical/major 问题时不得通过。"
   });
   writeAgentMessage(kernel, {
     agentId: "cocos_tech_lead",
@@ -1757,9 +2598,369 @@ function ensureTask(kernel: StudioKernel, task: Task): void {
   }
 }
 
+function ensureTaskArtifactReferences(
+  kernel: StudioKernel,
+  taskId: string,
+  field: "inputArtifacts" | "outputArtifacts",
+  requiredArtifactIds: string[],
+  now: string
+): void {
+  const task = kernel.findTask(taskId);
+  if (!task) {
+    throw new Error(`Local runtime artifact contract references unknown task ${taskId}.`);
+  }
+  const current = task[field];
+  const merged = [...requiredArtifactIds, ...current.filter((artifactId) => !requiredArtifactIds.includes(artifactId))];
+  if (current.length === merged.length && current.every((artifactId, index) => artifactId === merged[index])) {
+    return;
+  }
+  kernel.updateTask(
+    taskId,
+    field === "inputArtifacts"
+      ? { inputArtifacts: merged, updatedAt: now }
+      : { outputArtifacts: merged, updatedAt: now }
+  );
+}
+
+function ensureDeclaredArtifact(kernel: StudioKernel, artifact: Artifact): void {
+  const existing = kernel.listArtifacts().find((candidate) => candidate.artifactId === artifact.artifactId);
+  if (!existing) {
+    const pathOwner = kernel.listArtifacts().find((candidate) => candidate.path === artifact.path);
+    if (pathOwner) {
+      blockArtifactIdentityConflict(kernel, artifact, pathOwner, artifactIdentityMismatches(artifact, pathOwner));
+      return;
+    }
+    kernel.addArtifact(artifact);
+    return;
+  }
+  const mismatches = artifactIdentityMismatches(artifact, existing);
+  if (mismatches.length > 0) {
+    blockArtifactIdentityConflict(kernel, artifact, existing, mismatches);
+  }
+}
+
+function artifactIdentityMismatches(
+  expected: Pick<Artifact, "artifactId" | "projectId" | "type" | "path" | "ownerAgentId" | "sourceTaskId">,
+  actual: Artifact
+): string[] {
+  const mismatches: string[] = [];
+  for (const field of ["artifactId", "projectId", "type", "path", "ownerAgentId", "sourceTaskId"] as const) {
+    if (expected[field] !== actual[field]) {
+      mismatches.push(
+        `${field}=${String(actual[field] ?? "missing")}, expected ${String(expected[field] ?? "missing")}`
+      );
+    }
+  }
+  return mismatches;
+}
+
+function rekeySnapshotArtifact(snapshot: StudioKernelSnapshot, fromArtifactId: string, toArtifactId: string): void {
+  const artifact = snapshot.artifacts.find((candidate) => candidate.artifactId === fromArtifactId);
+  if (!artifact || snapshot.artifacts.some((candidate) => candidate.artifactId === toArtifactId)) {
+    throw new Error(`Cannot migrate artifact identity ${fromArtifactId} -> ${toArtifactId}.`);
+  }
+  artifact.artifactId = toArtifactId;
+  artifact.metadata = {
+    ...artifact.metadata,
+    legacyArtifactIds: [
+      ...new Set([
+        ...(Array.isArray(artifact.metadata.legacyArtifactIds)
+          ? artifact.metadata.legacyArtifactIds.filter((value): value is string => typeof value === "string")
+          : []),
+        fromArtifactId
+      ])
+    ],
+    artifactIdentityMigration: "stage1_canonical_v1",
+    artifactIdentityMigratedAt: snapshot.savedAt
+  };
+
+  for (const task of snapshot.tasks) {
+    task.inputArtifacts = replaceArtifactIdList(task.inputArtifacts, fromArtifactId, toArtifactId);
+    task.outputArtifacts = replaceArtifactIdList(task.outputArtifacts, fromArtifactId, toArtifactId);
+  }
+  for (const message of snapshot.messages) {
+    message.relatedArtifactIds = replaceArtifactIdList(message.relatedArtifactIds, fromArtifactId, toArtifactId);
+    const toolExecutions = message.metadata.toolExecutions;
+    if (Array.isArray(toolExecutions)) {
+      for (const execution of toolExecutions) {
+        if (
+          execution &&
+          typeof execution === "object" &&
+          !Array.isArray(execution) &&
+          (execution as Record<string, unknown>).artifactId === fromArtifactId
+        ) {
+          (execution as Record<string, unknown>).artifactId = toArtifactId;
+        }
+      }
+    }
+    rewriteEmbeddedClaimReferences(message.metadata.claimVerifications, fromArtifactId, toArtifactId);
+  }
+  for (const operation of snapshot.artifactOperations) {
+    if (operation.artifactId === fromArtifactId) {
+      operation.artifactId = toArtifactId;
+    }
+  }
+  for (const ledger of snapshot.artifactLedger) {
+    if (ledger.artifactId === fromArtifactId) {
+      ledger.artifactId = toArtifactId;
+    }
+    for (const input of ledger.inputArtifacts ?? []) {
+      if (input.artifactId === fromArtifactId) {
+        input.artifactId = toArtifactId;
+      }
+    }
+  }
+  for (const claim of snapshot.claimVerifications) {
+    claim.relatedArtifactIds = replaceArtifactIdList(claim.relatedArtifactIds, fromArtifactId, toArtifactId);
+    claim.evidenceRefs = replaceArtifactIdList(claim.evidenceRefs, fromArtifactId, toArtifactId);
+  }
+  for (const capsule of snapshot.handoffCapsules ?? []) {
+    capsule.artifactIds = replaceArtifactIdList(capsule.artifactIds, fromArtifactId, toArtifactId);
+  }
+  for (const packet of snapshot.contextPackets ?? []) {
+    for (const layer of packet.layers) {
+      layer.sourceRefs = replaceArtifactIdList(layer.sourceRefs, fromArtifactId, toArtifactId);
+    }
+  }
+  for (const memory of snapshot.memoryRecords) {
+    if (memory.sourceArtifactId === fromArtifactId) {
+      memory.sourceArtifactId = toArtifactId;
+    }
+  }
+  for (const event of snapshot.auditEvents) {
+    event.inputArtifacts = replaceArtifactIdList(event.inputArtifacts, fromArtifactId, toArtifactId);
+    event.outputArtifacts = replaceArtifactIdList(event.outputArtifacts, fromArtifactId, toArtifactId);
+    if (Array.isArray(event.metadata.evidenceRefs)) {
+      event.metadata.evidenceRefs = replaceArtifactIdList(
+        event.metadata.evidenceRefs.filter((value): value is string => typeof value === "string"),
+        fromArtifactId,
+        toArtifactId
+      );
+    }
+  }
+  for (const gate of snapshot.workflow?.gates ?? []) {
+    gate.requiredArtifacts = replaceArtifactIdList(gate.requiredArtifacts, fromArtifactId, toArtifactId);
+  }
+  for (const event of snapshot.workflow?.events ?? []) {
+    if (event.type === "gate_opened") {
+      event.gate.requiredArtifacts = replaceArtifactIdList(
+        event.gate.requiredArtifacts,
+        fromArtifactId,
+        toArtifactId
+      );
+    }
+  }
+  assertNoUnknownMetadataArtifactReference(snapshot, fromArtifactId);
+}
+
+function replaceArtifactIdList(values: string[], fromArtifactId: string, toArtifactId: string): string[] {
+  return [...new Set(values.map((value) => (value === fromArtifactId ? toArtifactId : value)))];
+}
+
+function rewriteEmbeddedClaimReferences(value: unknown, fromArtifactId: string, toArtifactId: string): void {
+  if (!Array.isArray(value)) {
+    return;
+  }
+  for (const claim of value) {
+    if (!claim || typeof claim !== "object" || Array.isArray(claim)) {
+      continue;
+    }
+    const record = claim as Record<string, unknown>;
+    if (Array.isArray(record.relatedArtifactIds)) {
+      record.relatedArtifactIds = replaceArtifactIdList(
+        record.relatedArtifactIds.filter((item): item is string => typeof item === "string"),
+        fromArtifactId,
+        toArtifactId
+      );
+    }
+    if (Array.isArray(record.evidenceRefs)) {
+      record.evidenceRefs = replaceArtifactIdList(
+        record.evidenceRefs.filter((item): item is string => typeof item === "string"),
+        fromArtifactId,
+        toArtifactId
+      );
+    }
+  }
+}
+
+function assertNoUnknownMetadataArtifactReference(snapshot: StudioKernelSnapshot, artifactId: string): void {
+  const metadataValues: unknown[] = [
+    ...snapshot.artifacts.map((artifact) => artifact.metadata),
+    ...snapshot.artifactOperations.map((operation) => operation.metadata),
+    ...snapshot.messages.map((message) => message.metadata),
+    ...snapshot.auditEvents.map((event) => event.metadata)
+  ];
+  if (metadataValues.some((value) => containsExactMetadataValue(value, artifactId))) {
+    throw new Error(`Legacy artifact ${artifactId} has an unknown metadata reference; automatic rekey was refused.`);
+  }
+}
+
+function containsExactMetadataValue(value: unknown, expected: string, key?: string): boolean {
+  if (key === "legacyArtifactIds") {
+    return false;
+  }
+  if (value === expected) {
+    return true;
+  }
+  if (Array.isArray(value)) {
+    return value.some((item) => containsExactMetadataValue(item, expected));
+  }
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  return Object.entries(value as Record<string, unknown>).some(
+    ([entryKey, entryValue]) => containsExactMetadataValue(entryValue, expected, entryKey)
+  );
+}
+
+function stageOneArtifactIdentityBlocker(
+  expected: Pick<Artifact, "artifactId" | "type" | "path" | "ownerAgentId" | "sourceTaskId">,
+  actual: Artifact,
+  mismatches: string[]
+): string {
+  return (
+    `Stage 1 产物身份契约冲突：${expected.artifactId} 必须是 ` +
+    `type=${expected.type}, path=${expected.path}, owner=${expected.ownerAgentId}, task=${expected.sourceTaskId ?? "missing"}；` +
+    `实际 ${actual.artifactId} 不匹配（${mismatches.join("；")}）。已拒绝自动登记/迁移。`
+  );
+}
+
+function blockArtifactIdentityConflict(
+  kernel: StudioKernel,
+  expected: Artifact,
+  pathOwner: Artifact,
+  mismatches: string[]
+): void {
+  if (!expected.sourceTaskId) {
+    return;
+  }
+  const task = kernel.findTask(expected.sourceTaskId);
+  if (!task || task.status === "cancelled") {
+    return;
+  }
+  const now = new Date().toISOString();
+  const blocker = stageOneArtifactIdentityBlocker(expected, pathOwner, mismatches);
+  const agentState = kernel.getAgentLoopState().agents[task.ownerAgentId];
+  if (
+    task.status === "blocked" &&
+    task.blockers.includes(blocker) &&
+    agentState?.status === "blocked" &&
+    agentState.lastError === blocker
+  ) {
+    return;
+  }
+  kernel.updateTask(task.taskId, {
+    status: "blocked",
+    blockers: [...new Set([...task.blockers, blocker])],
+    updatedAt: now
+  });
+  kernel.updateAgentLoopAgent(task.ownerAgentId, {
+    status: "blocked",
+    taskId: task.taskId,
+    lastError: blocker,
+    updatedAt: now
+  });
+}
+
 function ensureArtifact(kernel: StudioKernel, artifact: Artifact): void {
   if (!kernel.listArtifacts().some((candidate) => candidate.artifactId === artifact.artifactId)) {
     kernel.addArtifact(artifact);
+  }
+}
+
+function stageOneContractFingerprint(kernel: StudioKernel, taskIds: string[], artifactIds: string[]): string {
+  const artifacts = kernel.listArtifacts();
+  const loopAgents = kernel.getAgentLoopState().agents;
+  return JSON.stringify({
+    tasks: taskIds.map((taskId) => {
+      const task = kernel.findTask(taskId);
+      return task
+        ? {
+            taskId,
+            status: task.status,
+            progressPercent: task.progressPercent,
+            blockers: task.blockers,
+            ownerAgentId: task.ownerAgentId,
+            stageId: task.stageId,
+            inputArtifacts: task.inputArtifacts,
+            outputArtifacts: task.outputArtifacts
+          }
+        : { taskId, missing: true };
+    }),
+    artifacts: artifactIds.map((artifactId) => {
+      const artifact = artifacts.find((candidate) => candidate.artifactId === artifactId);
+      return artifact
+        ? {
+            artifactId,
+            type: artifact.type,
+            path: artifact.path,
+            ownerAgentId: artifact.ownerAgentId,
+            sourceTaskId: artifact.sourceTaskId
+          }
+        : { artifactId, missing: true };
+    }),
+    agents: taskIds.map((taskId) => {
+      const task = kernel.findTask(taskId);
+      const agent = task ? loopAgents[task.ownerAgentId] : undefined;
+      return agent?.taskId === taskId
+        ? { taskId, agentId: agent.agentId, status: agent.status, lastError: agent.lastError }
+        : { taskId };
+    })
+  });
+}
+
+function reopenStageOneTaskForMissingEvidence(
+  kernel: StudioKernel,
+  taskId: string,
+  requiredArtifactIds: string[],
+  now: string
+): void {
+  const task = kernel.findTask(taskId);
+  if (!task || task.status === "cancelled") {
+    return;
+  }
+  const ledger = kernel.listArtifactLedger();
+  const missingEvidence = requiredArtifactIds.some((artifactId) => {
+    const entry = ledger.find((candidate) => candidate.artifactId === artifactId);
+    return !entry || entry.status !== "verified" || !entry.hash || !entry.sizeBytes;
+  });
+  if (!missingEvidence || ["todo", "doing", "blocked"].includes(task.status)) {
+    return;
+  }
+  kernel.updateTask(task.taskId, {
+    status: "doing",
+    progressPercent: Math.min(task.progressPercent ?? 80, 85),
+    blockers: task.blockers.filter((blocker) => !blocker.startsWith("Agent Loop：")),
+    updatedAt: now
+  });
+  kernel.updateAgentLoopAgent(task.ownerAgentId, {
+    status: "queued",
+    taskId: task.taskId,
+    lastError: undefined,
+    updatedAt: now
+  });
+}
+
+function reconcileReviewedTaskAgentState(kernel: StudioKernel, taskIds: string[], now: string): void {
+  const loopAgents = kernel.getAgentLoopState().agents;
+  for (const taskId of taskIds) {
+    const task = kernel.findTask(taskId);
+    const agent = task ? loopAgents[task.ownerAgentId] : undefined;
+    if (
+      !task ||
+      !["review", "done"].includes(task.status) ||
+      agent?.taskId !== task.taskId ||
+      agent.status === "working" ||
+      (agent.status === "waiting" && !agent.lastError)
+    ) {
+      continue;
+    }
+    kernel.updateAgentLoopAgent(task.ownerAgentId, {
+      status: "waiting",
+      taskId: task.taskId,
+      lastError: undefined,
+      updatedAt: now
+    });
   }
 }
 

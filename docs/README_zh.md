@@ -30,13 +30,17 @@
 | 16 | [开源参考与适配策略](./16_open_source_references_and_adaptation.md) | Clowder、Claude-Code-Game-Studios、美术/策划/Cocos/QA 参考。 |
 | 17 | [交付计划与工程任务](./17_delivery_plan_and_engineering_tasks.md) | 仓库结构、模块任务、测试策略、本地环境和验收标准。 |
 | 18 | [Agent 会话、Context Packet 与跨会话协议](./18_agent_session_context_protocol.md) | 房间游标、Claude resume、session mutex、上下文健康、child session、seal 和 handoff capsule。 |
+| 19 | [游戏、场景与试玩契约](./19_game_scene_playtest_contracts.md) | GameContract、SceneBlueprint、PlaytestContract 和契约驱动试玩。 |
+| 20 | [工作流持久化与安全](./20_workflow_persistence_security.md) | Workflow Aggregate、持久化恢复、路径和本地服务安全。 |
+| 21 | [独立质量评审与多模态美术](./21_quality_review_and_multimodal_art.md) | 设计/视觉独立评审、质量收据、多模态资产生产。 |
+| 22 | [Task Episode 与生产证据审计](./22_task_episode_and_production_audit.md) | 四通道 Evidence Bundle、Finding、Intervention Ledger、不可变审计报告和门禁集成。 |
 
 ## 阅读顺序
 
 1. 先读 01 到 06，理解产品、角色、群聊、阶段、记忆和工作空间。
 2. 再读 07 到 12，理解模型调用、策划、美术、Cocos、微信和 QA。
 3. 再读 13 到 15，理解运维、数据模型和可追溯性。
-4. 最后读 16 到 18，理解开源适配、工程任务拆解和 Agent 持久会话协议。
+4. 最后读 16 到 22，理解开源适配、工程任务拆解、持久会话、契约、质量评审和生产证据审计。
 
 ## 01. 产品范围与用户旅程
 

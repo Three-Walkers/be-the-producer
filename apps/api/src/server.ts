@@ -410,6 +410,24 @@ export async function handleRequest(
       return;
     }
 
+    if (request.method === "GET" && resource === "production-audit") {
+      const auditRuns = kernel.listProductionAuditRuns();
+      const evidenceBundles = kernel.listEvidenceBundles();
+      const latestRun = auditRuns.at(-1);
+      sendJson(response, 200, {
+        taskEpisodes: kernel.listTaskEpisodes(),
+        evidenceBundles,
+        findings: kernel.listProductionAuditFindings(),
+        interventions: kernel.listInterventionLedger(),
+        auditRuns,
+        latestRun: latestRun ?? null,
+        latestBundle: latestRun
+          ? evidenceBundles.find((bundle) => bundle.bundleId === latestRun.bundleId) ?? null
+          : null
+      });
+      return;
+    }
+
     throw new HttpError(404, "Route not found");
   } catch (error) {
     if (error instanceof ApiRequestError) {

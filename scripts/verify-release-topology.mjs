@@ -27,6 +27,8 @@ assert.equal(inferArtifactType("devops", "agents/devops/deployment-reports/deplo
 for (const evidence of [
   ["artifact_game_contract_draft", "game_contract", "agents/design/contracts/game-contract.json"],
   ["artifact_asset_manifest_draft", "asset_manifest", "agents/art/asset-manifest.json"],
+  ["artifact_asset_contact_sheet", "asset", "agents/art/asset-contact-sheet.png"],
+  ["artifact_stage_2_visual_quality_review", "quality_review", "agents/review/art/first-playable.quality-review.json"],
   ["artifact_scene_blueprint_draft", "scene_blueprint", "agents/engineering/scene-blueprint.json"],
   ["artifact_playtest_contract_draft", "playtest_contract", "agents/qa/playtest-contract.json"],
   ["artifact_gameplay_source", "source_code", "assets/scripts/Game.ts"],

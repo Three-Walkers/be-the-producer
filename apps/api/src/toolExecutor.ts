@@ -3,7 +3,12 @@ import { readFileSync, statSync } from "node:fs";
 import { defaultAgentContracts, type StudioKernel } from "@game-pipeline/agent-runtime";
 import type { AgentContract, AgentId, AgentLoopControl, Artifact, ArtifactStatus, StudioMessage, Task, TaskId } from "@game-pipeline/shared-schemas";
 import * as ts from "typescript";
-import { readArtifactContentForModel, resolveWorkspacePathTarget, writeToolArtifactContent } from "./workspaceWriter.js";
+import {
+  readArtifactContentForModel,
+  resolveWorkspacePathTarget,
+  writeToolArtifactBinaryContent,
+  writeToolArtifactContent
+} from "./workspaceWriter.js";
 import { rasterizeSvgFile } from "./svgRasterizer.js";
 import { resolveProjectWorkspaceRoot } from "./workspaceWriter.js";
 import { CocosEngineBridge } from "./cocosEngineBridge.js";
@@ -17,7 +22,34 @@ import {
   authorizeAgentToolRequest,
   normalizeAuthorizationPath
 } from "./toolAuthorization.js";
-import { captureCurrentTaskInputProvenance } from "./taskOutputEvidence.js";
+import { artifactReadyForConsumption, captureCurrentTaskInputProvenance } from "./taskOutputEvidence.js";
+import { modelSettingsStore } from "./modelSettings.js";
+import {
+  composeEffectiveImageGenerationPrompt,
+  DashScopeMultimodalArtProvider,
+  type ArtImageMime
+} from "./multimodalArtProvider.js";
+import {
+  applyQualityReviewChangeRequest,
+  assertQualityReviewEvidenceGrounded,
+  assertQualityReviewVisionMetadataBound,
+  assertQualityReviewTargetsCurrent,
+  buildCurrentVisionReviewAuthoritativeContext,
+  currentGeneratedRuntimeAssetPathsForReview,
+  linkGeneratedRuntimeAssetToVisualReview,
+  mergeVisionSemanticInspectionReceipts,
+  qualityReviewContractForArtifact,
+  readVisionSemanticInspectionReceipts,
+  stampAndValidateQualityReviewText
+} from "./qualityReviewArtifacts.js";
+import { parseCurrentAssetManifestText } from "./assetManifestArtifacts.js";
+import {
+  bindMediaGenerationArtifactMetadata,
+  hasCurrentGenerateRasterAssetReceipt,
+  mediaGenerationOperationMetadata,
+  pickVisionReceiptMetadata,
+  stripPrivilegedMaterializationMetadata
+} from "./mediaArtifactEvidence.js";
 
 export type ExecutableToolName =
   | "write_artifact"
@@ -25,6 +57,8 @@ export type ExecutableToolName =
   | "write_code"
   | "run_typecheck"
   | "generate_image"
+  | "generate_raster_asset"
+  | "inspect_visual_assets"
   | "render_svg_to_png"
   | "cocos_validate_project"
   | "cocos_import_assets"
@@ -54,7 +88,6 @@ interface ToolRequest {
   artifactTypeInvalid?: boolean;
   taskId?: TaskId;
   status?: ArtifactStatus;
-  metadata?: Record<string, unknown>;
   arguments?: Record<string, unknown>;
 }
 
@@ -92,6 +125,7 @@ const artifactTypes: Artifact["type"][] = [
   "source_code",
   "build",
   "qa_report",
+  "quality_review",
   "bug_report",
   "deployment_plan",
   "deployment_report",
@@ -106,6 +140,8 @@ const executableToolNames: ExecutableToolName[] = [
   "write_code",
   "run_typecheck",
   "generate_image",
+  "generate_raster_asset",
+  "inspect_visual_assets",
   "render_svg_to_png",
   "cocos_validate_project",
   "cocos_import_assets",
@@ -228,12 +264,58 @@ async function executeToolRequest(kernel: StudioKernel, message: StudioMessage, 
     if (request.toolName === "run_typecheck") {
       return runTypeScriptSyntaxCheck(kernel.project.projectId, path);
     }
+    if (request.toolName === "generate_raster_asset") {
+      return await executeRasterAssetGeneration(
+        kernel,
+        message,
+        agent,
+        request,
+        path,
+        now,
+        authorization.sourceTaskId,
+        authorization.existing
+      );
+    }
+    if (request.toolName === "inspect_visual_assets") {
+      return await executeVisualAssetInspection(kernel, message, agent, authorization.task, request, now);
+    }
     if (request.toolName === "generate_image") {
       assertSvgImage(path, request.content);
     }
     const sourceTaskId = authorization.sourceTaskId;
     const existing = authorization.existing;
     const artifactType = existing?.type ?? request.artifactType ?? inferArtifactType(agent.agentId, path);
+    let qualityReview: ReturnType<typeof stampAndValidateQualityReviewText>["review"] | undefined;
+    if (artifactType === "quality_review") {
+      const stamped = stampAndValidateQualityReviewText(request.content, {
+        reviewerAgentId: agent.agentId,
+        providerId: stringMetadata(message.metadata.providerId) ?? "unknown-provider",
+        model: stringMetadata(message.metadata.model) ?? "unknown-model",
+        invocationId: stringMetadata(message.metadata.invocationId) ?? message.messageId,
+        reviewedAt: now
+      });
+      const contract = qualityReviewContractForArtifact(existing?.artifactId ?? request.artifactId ?? "");
+      if (!contract) {
+        throw new Error("质量审查必须写入当前任务预登记的 canonical quality_review 产物。");
+      }
+      assertQualityReviewTargetsCurrent(kernel, stamped.review, contract);
+      const additionalEvidencePaths = stamped.review.domain === "visual_assets"
+        ? currentGeneratedRuntimeAssetPathsForReview(kernel, stamped.review)
+        : [];
+      assertQualityReviewEvidenceGrounded(kernel, stamped.review, additionalEvidencePaths);
+      if (stamped.review.domain !== "design") {
+        if (!existing) throw new Error("视觉质量审查必须写入已预登记的 canonical artifact。");
+        assertQualityReviewVisionMetadataBound(kernel, existing, stamped.review, contract);
+      }
+      request.content = stamped.content;
+      qualityReview = stamped.review;
+    }
+    if (artifactType === "asset_manifest") {
+      if (request.toolName === "append_document") {
+        throw new Error("Asset Manifest 只能整份替换，禁止 append_document。");
+      }
+      parseCurrentAssetManifestText(request.content);
+    }
     assertContractArtifactContent(artifactType, request.content, request.toolName === "append_document" ? "append" : "write");
     if (isContractArtifactType(artifactType)) {
       const previousContent = existing?.metadata.toolExecutedAt
@@ -253,24 +335,41 @@ async function executeToolRequest(kernel: StudioKernel, message: StudioMessage, 
       path,
       ownerAgentId: agent.agentId,
       stageId: kernel.project.currentStage,
-      status: request.status ?? existing?.status ?? "draft",
+      status: nextMaterializedArtifactStatus(request.status, existing?.status),
       version: existing ? existing.version + 1 : 1,
       ...(sourceTaskId ? { sourceTaskId } : {}),
       sourceDecisionIds: existing?.sourceDecisionIds ?? [],
       metadata: {
-        ...(existing?.metadata ?? {}),
-        ...(request.metadata ?? {}),
+        ...stripPrivilegedMaterializationMetadata(existing?.metadata ?? {}),
+        ...(qualityReview?.domain !== "design" && existing
+          ? pickVisionReceiptMetadata(existing.metadata)
+          : {}),
         toolName: request.toolName,
         toolSourceMessageId: message.messageId,
         toolExecutedAt: now,
         toolWriteMode: writeMode(request.toolName),
-        toolContent: request.content
+        toolContent: request.content,
+        ...(qualityReview
+          ? {
+              reviewProviderId: qualityReview.modelTrace.providerId,
+              reviewModel: qualityReview.modelTrace.model,
+              reviewInvocationId: qualityReview.modelTrace.invocationId,
+              reviewPromptVersion: qualityReview.modelTrace.promptVersion,
+              qualityReviewDomain: qualityReview.domain,
+              qualityReviewVerdict: qualityReview.verdict,
+              qualityReviewScore: qualityReview.scoreTotal
+            }
+          : {})
       },
       createdAt: existing?.createdAt ?? now,
       updatedAt: now
     };
 
     const registered = kernel.upsertArtifact(artifact);
+    // StudioKernel merges metadata for ordinary updates.  A new materializing
+    // tool operation instead uses the sanitized server view above so receipts
+    // from the previous bytes cannot survive by omission.
+    registered.metadata = artifact.metadata;
     const writeResult = writeToolArtifactContent(kernel, registered, {
       content: request.content,
       mode: writeMode(request.toolName)
@@ -292,6 +391,9 @@ async function executeToolRequest(kernel: StudioKernel, message: StudioMessage, 
       sizeBytes: writeResult.sizeBytes,
       materializedAt: writeResult.materializedAt
     });
+    if (qualityReview) {
+      applyQualityReviewChangeRequest(kernel, materialized, qualityReview, writeResult.materializedAt);
+    }
 
     return {
       toolName: request.toolName,
@@ -351,7 +453,7 @@ async function executePlaytestTool(
       ...(sourceTaskId ? { sourceTaskId } : {}),
       sourceDecisionIds: existing?.sourceDecisionIds ?? [],
       metadata: {
-        ...(existing?.metadata ?? {}),
+        ...stripPrivilegedMaterializationMetadata(existing?.metadata ?? {}),
         toolName: request.toolName,
         toolSourceMessageId: message.messageId,
         toolExecutedAt: now,
@@ -400,6 +502,329 @@ async function executePlaytestTool(
   return primary;
 }
 
+async function executeRasterAssetGeneration(
+  kernel: StudioKernel,
+  message: StudioMessage,
+  agent: AgentContract,
+  request: ToolRequest,
+  path: string,
+  now: string,
+  sourceTaskId: TaskId,
+  existing?: Artifact
+): Promise<ToolExecutionResult> {
+  if (!path.toLowerCase().endsWith(".png")) {
+    throw new Error("generate_raster_asset 只物化 PNG；目标 path 必须以 .png 结尾。");
+  }
+  const args = request.arguments ?? {};
+  const prompt = stringValue(args.prompt) || request.content.trim();
+  if (!prompt) throw new Error("generate_raster_asset 必须提供 prompt。");
+  const referencePaths = Array.isArray(args.referencePaths)
+    ? args.referencePaths.filter((value): value is string => typeof value === "string" && Boolean(value.trim()))
+    : [];
+  if (referencePaths.length > 3) {
+    throw new Error("generate_raster_asset 最多接受 3 个 task-bound referencePaths。");
+  }
+  const referenceImageDataUrls = referencePaths.map((referencePath) => {
+    const target = resolveWorkspacePathTarget(kernel.project.projectId, normalizeAuthorizationPath(referencePath));
+    if (!target.exists || target.type !== "file") throw new Error(`参考图片不存在：${referencePath}`);
+    const mime = imageMimeForPath(referencePath);
+    const bytes = readFileSync(target.absolutePath);
+    if (bytes.byteLength > 10 * 1024 * 1024) throw new Error(`参考图片超过 10MiB：${referencePath}`);
+    return `data:${mime};base64,${bytes.toString("base64")}`;
+  });
+  const size = normalizeGeneratedImageSize(args.size, args.width, args.height);
+  const seed = typeof args.seed === "number" && Number.isInteger(args.seed) ? args.seed : undefined;
+  const [requestedWidth, requestedHeight] = size.split("*").map(Number);
+  const negativePrompt = stringValue(args.negativePrompt);
+  const imageModel = process.env.BTP_IMAGE_GENERATION_MODEL ?? "wan2.7-image-pro";
+  const effectivePrompt = composeEffectiveImageGenerationPrompt(imageModel, prompt.trim(), negativePrompt.trim());
+  const promptHash = createHash("sha256").update(effectivePrompt).digest("hex");
+  const negativePromptHash = createHash("sha256").update(negativePrompt.trim()).digest("hex");
+  const recordedReferencePaths = Array.isArray(existing?.metadata.mediaReferencePaths)
+    ? existing.metadata.mediaReferencePaths.filter((value): value is string => typeof value === "string")
+    : [];
+  const existingLedger = existing
+    ? kernel.listArtifactLedger().find((entry) => entry.artifactId === existing.artifactId)
+    : undefined;
+  if (
+    existing &&
+    existingLedger?.hash &&
+    existingLedger.sizeBytes !== undefined &&
+    artifactReadyForConsumption(kernel, existing.artifactId) &&
+    hasCurrentGenerateRasterAssetReceipt(kernel, existing) &&
+    existing.metadata.mediaPromptHash === promptHash &&
+    existing.metadata.mediaNegativePromptHash === negativePromptHash &&
+    existing.metadata.mediaWidth === requestedWidth &&
+    existing.metadata.mediaHeight === requestedHeight &&
+    (seed === undefined || existing.metadata.mediaSeed === seed) &&
+    recordedReferencePaths.length === referencePaths.length &&
+    recordedReferencePaths.every((value, index) => value === referencePaths[index])
+  ) {
+    return {
+      toolName: request.toolName,
+      status: "completed",
+      path: existing.path,
+      artifactId: existing.artifactId,
+      hash: existingLedger.hash,
+      sizeBytes: existingLedger.sizeBytes,
+      details: {
+        provider: existing.metadata.mediaProvider,
+        model: existing.metadata.mediaModel,
+        requestId: existing.metadata.mediaRequestId,
+        seed: existing.metadata.mediaSeed,
+        width: existing.metadata.mediaWidth,
+        height: existing.metadata.mediaHeight,
+        promptHash,
+        reused: true
+      }
+    };
+  }
+  const provider = createConfiguredMultimodalArtProvider();
+  const generated = await provider.generateImage({
+    prompt,
+    size,
+    ...(negativePrompt ? { negativePrompt } : {}),
+    ...(seed !== undefined ? { seed } : {}),
+    ...(referenceImageDataUrls.length > 0 ? { referenceImageDataUrls } : {})
+  });
+  const artifactType = existing?.type ?? request.artifactType ?? "asset";
+  if (artifactType !== "asset") {
+    throw new Error(`generate_raster_asset 只能物化 asset，当前类型是 ${artifactType}。`);
+  }
+  const artifact: Artifact = {
+    artifactId: existing?.artifactId ?? request.artifactId ?? stableArtifactId(kernel.project.projectId, agent.agentId, path),
+    projectId: kernel.project.projectId,
+    type: "asset",
+    path,
+    ownerAgentId: agent.agentId,
+    stageId: kernel.project.currentStage,
+    status: nextMaterializedArtifactStatus(request.status, existing?.status),
+    version: existing ? existing.version + 1 : 1,
+    sourceTaskId,
+    sourceDecisionIds: existing?.sourceDecisionIds ?? [],
+    metadata: {
+      ...stripPrivilegedMaterializationMetadata(existing?.metadata ?? {}),
+      generatedBy: "dashscope_multimodal_art_provider",
+      toolName: request.toolName,
+      toolSourceMessageId: message.messageId,
+      toolExecutedAt: now,
+      mediaProvider: generated.provider,
+      mediaModel: generated.model,
+      mediaRequestId: generated.requestId,
+      mediaEndpointFingerprint: generated.endpointFingerprint,
+      mediaPromptHash: generated.promptHash,
+      mediaNegativePromptHash: generated.negativePromptHash,
+      mediaSeed: generated.seed,
+      mediaMime: generated.mime,
+      mediaWidth: generated.width,
+      mediaHeight: generated.height,
+      mediaLatencyMs: generated.latencyMs,
+      mediaReferencePaths: referencePaths,
+      mediaReviewStatus: "pending_independent_review"
+    },
+    createdAt: existing?.createdAt ?? now,
+    updatedAt: now
+  };
+  const writeResult = writeToolArtifactBinaryContent(kernel, artifact, generated.buffer);
+  const registered = kernel.upsertArtifact({ ...artifact, updatedAt: writeResult.materializedAt });
+  registered.metadata = artifact.metadata;
+  const materialization = kernel.recordArtifactMaterialization(registered.artifactId, {
+    path: writeResult.relativePath,
+    hash: writeResult.hash,
+    sizeBytes: writeResult.sizeBytes,
+    materializedAt: writeResult.materializedAt,
+    operationMetadata: mediaGenerationOperationMetadata({
+      hash: writeResult.hash,
+      sizeBytes: writeResult.sizeBytes,
+      provider: generated.provider,
+      model: generated.model,
+      requestId: generated.requestId,
+      promptHash: generated.promptHash
+    })
+  });
+  const bound = kernel.upsertArtifact({
+    ...registered,
+    metadata: bindMediaGenerationArtifactMetadata(
+      registered.metadata,
+      materialization.sourceOperationId,
+      { hash: writeResult.hash, sizeBytes: writeResult.sizeBytes }
+    ),
+    updatedAt: writeResult.materializedAt
+  });
+  linkGeneratedRuntimeAssetToVisualReview(kernel, bound, writeResult.materializedAt);
+  return {
+    toolName: request.toolName,
+    status: "completed",
+    path: writeResult.relativePath,
+    artifactId: registered.artifactId,
+    hash: writeResult.hash,
+    sizeBytes: writeResult.sizeBytes,
+    details: {
+      provider: generated.provider,
+      model: generated.model,
+      requestId: generated.requestId,
+      seed: generated.seed,
+      width: generated.width,
+      height: generated.height,
+      promptHash: generated.promptHash
+    }
+  };
+}
+
+async function executeVisualAssetInspection(
+  kernel: StudioKernel,
+  message: StudioMessage,
+  agent: AgentContract,
+  task: Task,
+  request: ToolRequest,
+  now: string
+): Promise<ToolExecutionResult> {
+  const args = request.arguments ?? {};
+  const paths = Array.isArray(args.paths)
+    ? [...new Set(args.paths.filter((value): value is string => typeof value === "string" && Boolean(value.trim())))]
+    : [];
+  if (paths.length === 0 || paths.length > 16) {
+    throw new Error("inspect_visual_assets 必须提供 1-16 个 task-bound 图片 paths。");
+  }
+  const inspectedEvidence: Array<{ path: string; hash: string; sizeBytes: number }> = [];
+  const images = paths.map((path, index) => {
+    const normalized = normalizeAuthorizationPath(path);
+    const target = resolveWorkspacePathTarget(kernel.project.projectId, normalized);
+    if (!target.exists || target.type !== "file") throw new Error(`待审图片不存在：${normalized}`);
+    const buffer = readFileSync(target.absolutePath);
+    inspectedEvidence.push({
+      path: normalized,
+      hash: createHash("sha256").update(buffer).digest("hex"),
+      sizeBytes: buffer.byteLength
+    });
+    paths[index] = normalized;
+    return { path: normalized, mime: imageMimeForPath(normalized), buffer };
+  });
+  const rubricPrompt = stringValue(args.rubricPrompt) || request.content.trim();
+  const reviewArtifact = task.outputArtifacts
+    .map((artifactId) => kernel.listArtifacts().find((artifact) => artifact.artifactId === artifactId))
+    .find((artifact) => artifact?.type === "quality_review");
+  if (!reviewArtifact || reviewArtifact.ownerAgentId !== agent.agentId) {
+    throw new Error(`任务 ${task.taskId} 没有由 ${agent.agentId} 拥有的 quality_review 输出。`);
+  }
+  const contract = qualityReviewContractForArtifact(reviewArtifact.artifactId);
+  if (!contract || contract.ownerAgentId !== agent.agentId || contract.sourceTaskId !== task.taskId) {
+    throw new Error(`任务 ${task.taskId} 没有可用的 canonical visual quality review contract。`);
+  }
+  const authoritativeContext = buildCurrentVisionReviewAuthoritativeContext(kernel, contract);
+  const inspected = await createConfiguredMultimodalArtProvider().reviewImages({
+    images,
+    rubric: contract.rubric,
+    authoritativeContext,
+    rubricPrompt,
+    systemPrompt:
+      "你是独立的 Principal 2D Game Art Director 与移动技术美术。只依据真实图片像素和给定 rubric 审查，不因生成者自述而通过。返回严格 JSON，列出可观察证据、严重度、问题与建议；不要声称批准制作人门禁。"
+  });
+  const invocationId = stringMetadata(message.metadata.invocationId) ?? message.messageId;
+  const previousReceipts = reviewArtifact.metadata.visionInspectionInvocationId === invocationId
+    ? readVisionSemanticInspectionReceipts(reviewArtifact.metadata.visionInspectionSemanticReceipts)
+    : [];
+  const receipts = [
+    ...previousReceipts,
+    {
+      invocationId,
+      operationId: inspected.requestId,
+      providerId: inspected.provider,
+      model: inspected.model,
+      paths: [...paths],
+      evidence: inspectedEvidence,
+      responseHash: inspected.rawHash,
+      authoritativeContextEvidence: inspected.authoritativeContextEvidence,
+      authoritativeContextHash: inspected.authoritativeContextHash,
+      requestSemanticHash: inspected.requestSemanticHash,
+      result: inspected.result
+    }
+  ];
+  const merged = mergeVisionSemanticInspectionReceipts(receipts, contract);
+  kernel.upsertArtifact({
+    ...reviewArtifact,
+    metadata: {
+      ...reviewArtifact.metadata,
+      visionInspectionOperationId: merged.operationId,
+      visionInspectionProvider: merged.providerId,
+      visionInspectionModel: merged.model,
+      visionInspectionResponseHash: merged.responseHash,
+      visionInspectionSemanticHash: merged.semanticHash,
+      visionAuthoritativeContextEvidence: merged.authoritativeContextEvidence,
+      visionAuthoritativeContextHash: merged.authoritativeContextHash,
+      visionRequestSemanticHash: merged.requestSemanticHash,
+      visionInspectionSemanticResult: merged.result,
+      visionInspectionSemanticReceipts: receipts,
+      visionInspectionLatencyMs: inspected.latencyMs,
+      visionInspectionInvocationId: invocationId,
+      visionInspectedPaths: merged.paths,
+      visionInspectedEvidence: merged.evidence,
+      visionInspectedAt: now
+    },
+    updatedAt: now
+  });
+  return {
+    toolName: request.toolName,
+    status: "completed",
+    path: paths[0]!,
+    hash: merged.responseHash,
+    details: {
+      provider: inspected.provider,
+      model: inspected.model,
+      requestId: inspected.requestId,
+      operationId: merged.operationId,
+      responseHash: merged.responseHash,
+      semanticHash: merged.semanticHash,
+      authoritativeContextEvidence: merged.authoritativeContextEvidence,
+      authoritativeContextHash: merged.authoritativeContextHash,
+      requestSemanticHash: merged.requestSemanticHash,
+      paths: merged.paths,
+      inspectedEvidence: merged.evidence,
+      result: merged.result,
+      latencyMs: inspected.latencyMs
+    }
+  };
+}
+
+function createConfiguredMultimodalArtProvider(): DashScopeMultimodalArtProvider {
+  const provider = modelSettingsStore.getProviderConfig("dashscope");
+  if (!provider.apiKey) throw new Error("DashScope API key 未配置，无法执行真实多模态美术工具。");
+  const baseUrl = new URL(provider.baseUrl);
+  const origin = baseUrl.origin;
+  return new DashScopeMultimodalArtProvider({
+    apiKey: provider.apiKey,
+    imageEndpoint:
+      process.env.BTP_IMAGE_GENERATION_ENDPOINT ??
+      `${origin}/api/v1/services/aigc/multimodal-generation/generation`,
+    visionEndpoint:
+      process.env.BTP_VISION_REVIEW_ENDPOINT ??
+      `${provider.baseUrl.replace(/\/+$/, "")}/chat/completions`,
+    imageModel: process.env.BTP_IMAGE_GENERATION_MODEL ?? "wan2.7-image-pro",
+    visionModel: process.env.BTP_VISION_REVIEW_MODEL ?? "qwen3.8-max",
+    allowedDownloadHostSuffixes: [".aliyuncs.com", ".aliyun.com"]
+  });
+}
+
+function imageMimeForPath(path: string): ArtImageMime {
+  if (/\.png$/i.test(path)) return "image/png";
+  if (/\.jpe?g$/i.test(path)) return "image/jpeg";
+  if (/\.webp$/i.test(path)) return "image/webp";
+  throw new Error(`多模态美术工具只接受 PNG/JPEG/WebP：${path}`);
+}
+
+function normalizeGeneratedImageSize(size: unknown, width: unknown, height: unknown): string {
+  if (typeof size === "string" && /^\d{3,4}\*\d{3,4}$/.test(size.trim())) return size.trim();
+  if (
+    typeof width === "number" &&
+    typeof height === "number" &&
+    Number.isInteger(width) &&
+    Number.isInteger(height)
+  ) {
+    return `${width}*${height}`;
+  }
+  return "1024*1024";
+}
+
 function executeSvgRasterization(
   kernel: StudioKernel,
   message: StudioMessage,
@@ -428,13 +853,12 @@ function executeSvgRasterization(
     path,
     ownerAgentId: agent.agentId,
     stageId: kernel.project.currentStage,
-    status: request.status ?? existing?.status ?? "draft",
+    status: nextMaterializedArtifactStatus(request.status, existing?.status),
     version: existing ? existing.version + 1 : 1,
     ...(sourceTaskId ? { sourceTaskId } : {}),
     sourceDecisionIds: existing?.sourceDecisionIds ?? [],
     metadata: {
-      ...(existing?.metadata ?? {}),
-      ...(request.metadata ?? {}),
+      ...stripPrivilegedMaterializationMetadata(existing?.metadata ?? {}),
       toolName: request.toolName,
       toolSourceMessageId: message.messageId,
       toolExecutedAt: now,
@@ -450,6 +874,7 @@ function executeSvgRasterization(
     updatedAt: materializedAt
   };
   const registered = kernel.upsertArtifact(artifact);
+  registered.metadata = artifact.metadata;
   kernel.recordArtifactMaterialization(registered.artifactId, {
     path: target.relativePath,
     hash: rendered.hash,
@@ -567,7 +992,11 @@ function normalizeToolRequest(raw: Record<string, unknown>, agent: AgentContract
   const path = stringValue(args.path ?? args.filePath ?? args.artifactPath ?? args.relativePath);
   const rawContent = args.content ?? args.body ?? args.markdown ?? args.text;
   const content = typeof rawContent === "string" ? rawContent : rawContent === undefined ? "" : JSON.stringify(rawContent, null, 2);
-  const isServiceTool = toolName.startsWith("cocos_") || toolName === "run_playtest";
+  const isServiceTool =
+    toolName.startsWith("cocos_") ||
+    toolName === "run_playtest" ||
+    toolName === "generate_raster_asset" ||
+    toolName === "inspect_visual_assets";
   if ((!path && !isServiceTool) || (!isServiceTool && !["run_typecheck", "render_svg_to_png"].includes(toolName) && !content.trim())) {
     return undefined;
   }
@@ -592,8 +1021,7 @@ function normalizeToolRequest(raw: Record<string, unknown>, agent: AgentContract
     ...(explicitArtifactType ? { artifactTypeExplicit: true } : {}),
     ...(explicitArtifactType && !normalizedArtifactType ? { artifactTypeInvalid: true } : {}),
     ...(taskId ? { taskId } : {}),
-    ...(status ? { status } : {}),
-    ...(isRecord(args.metadata) ? { metadata: args.metadata } : {})
+    ...(status ? { status } : {})
   };
 }
 
@@ -645,7 +1073,7 @@ function executeCocosBridgeTool(
     ...(sourceTaskId ? { sourceTaskId } : {}),
     sourceDecisionIds: existing?.sourceDecisionIds ?? [],
     metadata: {
-      ...(existing?.metadata ?? {}),
+      ...stripPrivilegedMaterializationMetadata(existing?.metadata ?? {}),
       bridgeOperationId: result.operationId,
       bridgeOperationType: result.operationType,
       bridgeReportPath: result.reportPath,
@@ -717,6 +1145,12 @@ function defaultServiceToolPath(toolName: ExecutableToolName, args: Record<strin
       return stringValue(args.outputDir) || "shared/build-artifacts/wechat/dev";
     case "run_playtest":
       return "agents/qa/playtest-reports/report-001.md";
+    case "generate_raster_asset":
+      return stringValue(args.path) || "agents/art/processed-assets/generated.png";
+    case "inspect_visual_assets": {
+      const paths = Array.isArray(args.paths) ? args.paths : [];
+      return paths.find((value): value is string => typeof value === "string" && Boolean(value.trim())) ?? "agents/review/art";
+    }
     default:
       return "agents/cocos-automation";
   }
@@ -771,6 +1205,9 @@ export function inferArtifactType(agentId: AgentId, path: string): Artifact["typ
   }
   if (normalized.includes("manifest")) {
     return "asset_manifest";
+  }
+  if (normalized.includes("quality-review") || normalized.includes("quality_review")) {
+    return "quality_review";
   }
   if (normalized.includes("scene") || normalized.includes("blueprint")) {
     return "scene_blueprint";
@@ -828,7 +1265,9 @@ function assertToolAllowed(agent: AgentContract, toolName: ExecutableToolName): 
 }
 
 function toolPathAccess(toolName: ExecutableToolName): "read" | "write" {
-  return toolName === "run_typecheck" || toolName === "cocos_import_assets" ? "read" : "write";
+  return toolName === "run_typecheck" || toolName === "cocos_import_assets" || toolName === "inspect_visual_assets"
+    ? "read"
+    : "write";
 }
 
 function assertAuxiliaryToolPathsAuthorized(
@@ -841,6 +1280,18 @@ function assertAuxiliaryToolPathsAuthorized(
     assertAgentPathAuthorized(kernel, agent, task, normalizeToolPath(request.sourcePath, agent), "read");
   }
   const args = request.arguments ?? {};
+  if (request.toolName === "generate_raster_asset" || request.toolName === "inspect_visual_assets") {
+    const paths = request.toolName === "generate_raster_asset" ? args.referencePaths : args.paths;
+    if (paths !== undefined && !Array.isArray(paths)) {
+      throw new Error(`${request.toolName} 的图片路径参数必须是数组。`);
+    }
+    for (const path of Array.isArray(paths) ? paths : []) {
+      if (typeof path !== "string" || !path.trim()) {
+        throw new Error(`${request.toolName} 的图片路径必须是非空字符串。`);
+      }
+      assertAgentPathAuthorized(kernel, agent, task, normalizeAuthorizationPath(path), "read");
+    }
+  }
   const readKeys = request.toolName === "cocos_import_assets"
     ? ["manifestPath"]
     : request.toolName === "cocos_apply_blueprint"
@@ -865,6 +1316,19 @@ function assertAuxiliaryToolPathsAuthorized(
 
 function writeMode(toolName: ExecutableToolName): "replace" | "append" {
   return toolName === "append_document" ? "append" : "replace";
+}
+
+function nextMaterializedArtifactStatus(
+  requestedStatus: ArtifactStatus | undefined,
+  existingStatus: ArtifactStatus | undefined
+): ArtifactStatus {
+  if (requestedStatus && ["approved", "review", "rejected", "superseded"].includes(requestedStatus)) {
+    throw new Error(`工具请求不能直接设置受控产物状态 ${requestedStatus}；评审和制作人门禁必须通过 Workflow 完成。`);
+  }
+  if (requestedStatus) {
+    return requestedStatus;
+  }
+  return existingStatus === "change_requested" ? "submitted" : existingStatus ?? "draft";
 }
 
 function runTypeScriptSyntaxCheck(projectId: string, path: string): ToolExecutionResult {

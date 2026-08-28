@@ -2,13 +2,13 @@
 
 ## 1. Agent 基础
 
-美术 Agent 以 `Claude-Code-Game-Studios/art-director` 为基础。该 Agent 已覆盖 Art Bible、风格规范、资产规格、UI 视觉方向、色彩、视觉层级和资产命名规则。
-
-本系统对其进行以下适配：
+美术链由 Art Director、Asset Production 和独立 Visual Quality Reviewer 三个角色组成。本系统针对 2D 微信小游戏做以下约束：
 
 - 面向 2D 微信小游戏。
 - 输出运行时可用资产规格。
 - 与 Asset Production Agent 分离。
+- 创作与审查分离，作者不能审批自己的产物。
+- 图片生成和视觉检查必须由真实多模态工具完成。
 - 与 Cocos Automation Agent 通过 asset manifest 交接。
 - 所有资产进入美术工作空间。
 
@@ -17,10 +17,9 @@
 Art Director Agent：
 
 - 定义视觉方向。
-- 审批 Art Bible。
+- 提交 Art Bible 与真实 PNG 视觉方向板。
 - 制定资产规格。
-- 审阅资产一致性。
-- 给出美术门禁结论。
+- 把产物交给独立视觉审查。
 
 Asset Production Agent：
 
@@ -28,6 +27,13 @@ Asset Production Agent：
 - 调用图像、视频、sprite 工具。
 - 执行切图、透明、压缩、命名。
 - 输出 runtime-ready 资产。
+
+Visual Quality Reviewer：
+
+- 以 Principal 2D Game Art Director 和移动技术美术人设工作。
+- 读取真实图片像素，而不是只读 Art Bible 或 prompt。
+- 输出绑定版本、哈希、固定 rubric 和模型追踪的质量审查收据。
+- 只能请求修改或提交专业通过结论，不能替制作人批准门禁。
 
 Technical Artist 能力由 Cocos Tech Lead 和 Asset Production 共同覆盖，主要处理性能、格式、尺寸、压缩和 Cocos 导入约束。
 
@@ -115,7 +121,7 @@ SVG 是可编辑源资产，不是 Cocos 运行时交付格式。Asset Productio
 
 ```json
 {
-  "manifest_version": 1,
+  "schemaVersion": "2.0.0",
   "project_id": "game_...",
   "assets": [
     {
@@ -123,10 +129,10 @@ SVG 是可编辑源资产，不是 Cocos 运行时交付格式。Asset Productio
       "asset_key": "char_basic_enemy_idle",
       "category": "character",
       "source_path": "agents/art/raw-assets/characters/enemy_idle_raw.png",
-      "runtime_path": "agents/art/processed-assets/characters/char_basic_enemy_idle_01.png",
+      "runtimePath": "assets/art/first-playable/char_basic_enemy_idle_01.png",
+      "alphaPolicy": "required",
       "format": "png",
       "resolution": "256x256",
-      "transparent": true,
       "status": "approved",
       "owner_agent_id": "asset_production",
       "reviewed_by": "art_director"
@@ -137,23 +143,9 @@ SVG 是可编辑源资产，不是 Cocos 运行时交付格式。Asset Productio
 
 ## 7. 工具接入
 
-`ai-game-art-pipeline-skill` 用于：
+`generate_raster_asset` 调用受控图片模型并直接物化真实 PNG；`inspect_visual_assets` 把获准的本地图片字节交给视觉模型审查。默认使用 DashScope `wan2.7-image-pro` 生成、`qwen3.8-max` 检查。图像 provider key 由 Model Settings 保存，不写进资产仓库或模型上下文。详见 [21_quality_review_and_multimodal_art.md](./21_quality_review_and_multimodal_art.md)。
 
-- 资产生产计划。
-- 静态道具、图标、背景。
-- 视频转帧工作流。
-- 移动端 runtime 风险审计。
-
-`agent-sprite-forge` 用于：
-
-- 2D sprite。
-- sprite sheet。
-- 透明帧。
-- GIF 预览。
-- 小地图或可玩地图素材。
-- 后处理脚本。
-
-图像生成供应商通过 Model Gateway 接入，不把 provider SDK 和 key 写进资产仓库。
+Stage 2 只接受 Asset Manifest v2。每个 `runtimePath` 必须显式声明 `alphaPolicy`：`required` 要求至少存在真实透明像素且图片不能全透明，`opaque` 禁止任何透明像素，`optional` 只用于确实没有透明契约的资产。系统会解码 PNG，而不是相信 `transparent: true` 之类的自述字段。
 
 ## 8. 资产生产流程
 
@@ -164,7 +156,7 @@ flowchart LR
     C --> D["Raw Asset"]
     D --> E["Post Processing"]
     E --> F["Runtime Preview"]
-    F --> G["Art Review"]
+    F --> G["Independent Pixel Review"]
     G --> H["Asset Manifest"]
     H --> I["Cocos Import"]
 ```
@@ -191,7 +183,7 @@ flowchart LR
 - 预览文件。
 - metadata。
 
-资产任务进入评审前必须同时满足：每个登记 SVG 都有同名 PNG、PNG 由工具调用产生并通过 Artifact Ledger 验证、`asset-manifest.json` 的 `runtime_path` 指向对应 PNG。任一条件不成立时，任务保持 `doing`。
+资产任务进入评审前必须同时满足：至少一个非联系表 runtime PNG 由 `generate_raster_asset` 产生；每个登记 SVG 派生物都有工具生成的 PNG；`asset-manifest.json` 的 `runtimePath` 指向当前 verified PNG；联系表已生成。任一条件不成立时，任务保持 `doing`。
 
 ## 10. 美术 QA
 
@@ -205,15 +197,16 @@ flowchart LR
 - 视觉层级是否清晰。
 - 包体和纹理尺寸是否可接受。
 
-评审记录：
+评审记录使用严格 `ArtifactQualityReview`，而不是作者自填的简化批准对象：
 
 ```json
 {
-  "asset_id": "asset_char_basic_enemy_idle",
-  "reviewer": "art_director",
-  "verdict": "approved",
-  "issues": [],
-  "created_at": "2026-07-15T00:00:00Z"
+  "schemaVersion": "1.0.0",
+  "kind": "artifact_quality_review",
+  "domain": "visual_assets",
+  "reviewerAgentId": "visual_quality_reviewer",
+  "targets": ["绑定 artifactId/version/path/hash/size"],
+  "verdict": "pass | change_requested | blocked"
 }
 ```
 
@@ -234,5 +227,5 @@ Cocos Automation Agent 不直接使用 raw-assets。
 - 不生成侵犯 IP 的角色或风格。
 - 不把 prompt 中的制作人隐私写入资产 metadata。
 - 不把图像 provider key 写入仓库。
-- 未经 Art Director 审阅的资产不能进入 runtime manifest。
+- 未经独立 Visual Quality Reviewer 检查真实像素并提交当前 `pass` 收据的资产不能进入 Cocos 构建。
 - 未经 QA 检查的关键资产不能进入发布构建。

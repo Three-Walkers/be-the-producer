@@ -22,8 +22,10 @@ const controlledWriteRoots: Record<string, string[]> = {
   studio_orchestrator: ["shared/milestones", "docs/production"],
   producer: ["agents/producer", "shared/milestones", "docs/production"],
   game_designer: ["agents/design", "docs/design"],
+  design_quality_reviewer: ["agents/review/design"],
   art_director: ["agents/art", "docs/art"],
   asset_production: ["agents/art/processed-assets", "agents/art/asset-manifest.json", "assets/art", "artifacts/art", "intermediate/art"],
+  visual_quality_reviewer: ["agents/review/art"],
   cocos_tech_lead: ["agents/engineering", "docs/engineering", "intermediate/engineering"],
   gameplay_programmer: ["assets/scripts", "assets/resources", "docs/engineering", "intermediate/engineering"],
   cocos_automation: [
@@ -54,17 +56,44 @@ const exclusiveWriteRoots: Array<{ root: string; agentIds: string[] }> = [
   { root: "assets/scripts", agentIds: ["gameplay_programmer", "cocos_automation"] },
   { root: "assets/art", agentIds: ["asset_production"] },
   { root: "agents/design", agentIds: ["game_designer"] },
+  { root: "agents/review/design", agentIds: ["design_quality_reviewer"] },
+  { root: "agents/review/art", agentIds: ["visual_quality_reviewer"] },
   { root: "agents/engineering", agentIds: ["cocos_tech_lead"] },
   { root: "agents/qa", agentIds: ["qa_evaluator"] },
   { root: "agents/cocos-automation", agentIds: ["cocos_automation"] }
+];
+
+const cocosBridgeManagedWritePolicies: Array<{ roots: string[]; toolNames: string[] }> = [
+  {
+    roots: ["agents/cocos-automation/validation"],
+    toolNames: ["cocos_validate_project"]
+  },
+  {
+    roots: ["agents/cocos-automation/imports", "assets/resources/btp-art"],
+    toolNames: ["cocos_import_assets"]
+  },
+  {
+    roots: ["assets/resources/btp"],
+    toolNames: ["cocos_import_assets", "cocos_apply_blueprint"]
+  },
+  {
+    roots: ["agents/cocos-automation/scene-ops", "assets/scripts/btp", "assets/scenes", "assets/prefabs"],
+    toolNames: ["cocos_apply_blueprint"]
+  },
+  {
+    roots: ["agents/cocos-automation/build-ops", "agents/cocos-automation/cocos-build-logs"],
+    toolNames: ["cocos_build"]
+  }
 ];
 
 const taskReadRoots: Record<string, string[]> = {
   studio_orchestrator: ["shared/milestones", "docs/production"],
   producer: ["agents/producer", "docs/production", "shared/milestones"],
   game_designer: ["agents/design", "docs/design"],
+  design_quality_reviewer: ["agents/review/design"],
   art_director: ["agents/art", "docs/art"],
   asset_production: ["agents/art/processed-assets", "assets/art"],
+  visual_quality_reviewer: ["agents/review/art"],
   cocos_tech_lead: ["agents/engineering", "docs/engineering"],
   gameplay_programmer: ["assets/scripts", "docs/engineering"],
   cocos_automation: ["agents/cocos-automation"],
@@ -127,11 +156,31 @@ export function createConversationHarnessAuthorization(
   kernel: StudioKernel,
   agent: AgentContract
 ): AgentHarnessAuthorization {
+  const readableStages = new Set(workflowTaskStages(kernel.project.currentStage));
+  const taskInputArtifactIds = new Set(
+    kernel
+      .listTasks()
+      .filter(
+        (task) =>
+          task.ownerAgentId === agent.agentId &&
+          task.status !== "cancelled" &&
+          readableStages.has(task.stageId)
+      )
+      .flatMap((task) => task.inputArtifacts)
+  );
+  const artifacts = kernel.listArtifacts();
+  const inputArtifactIds = artifacts
+    .filter((artifact) => taskInputArtifactIds.has(artifact.artifactId))
+    .map((artifact) => artifact.artifactId);
+  const visibleArtifactIds = new Set([
+    ...inputArtifactIds,
+    ...artifacts.filter((artifact) => artifact.ownerAgentId === agent.agentId).map((artifact) => artifact.artifactId)
+  ]);
   return {
     mode: "conversation",
-    inputArtifactIds: [],
+    inputArtifactIds,
     outputArtifactIds: [],
-    artifacts: kernel.listArtifacts().filter((artifact) => artifact.ownerAgentId === agent.agentId).map((artifact) => ({
+    artifacts: artifacts.filter((artifact) => visibleArtifactIds.has(artifact.artifactId)).map((artifact) => ({
       artifactId: artifact.artifactId,
       type: artifact.type,
       path: normalizeAuthorizationPath(artifact.path),
@@ -157,6 +206,7 @@ export function authorizeAgentToolRequest(
 ): AuthorizedToolRequest {
   const task = resolveAuthorizedTask(kernel, message, agent, request.requestedTaskId);
   const artifacts = kernel.listArtifacts();
+  assertCocosBridgeManagedWriteAuthorized(task, artifacts, request);
   const byId = request.artifactId ? artifacts.find((artifact) => artifact.artifactId === request.artifactId) : undefined;
   const byPath = artifacts.find((artifact) => artifact.path === request.path);
 
@@ -203,6 +253,34 @@ export function authorizeAgentToolRequest(
     sourceTaskId: task.taskId,
     ...(existing ? { existing } : {})
   };
+}
+
+function assertCocosBridgeManagedWriteAuthorized(
+  task: Task,
+  artifacts: Artifact[],
+  request: ToolAuthorizationRequest
+): void {
+  if (request.access !== "write") return;
+  const normalized = normalizeAuthorizationPath(request.path);
+  const staticPolicy = cocosBridgeManagedWritePolicies.find((policy) =>
+    policy.roots.some((root) => pathMatchesRoot(normalized, root))
+  );
+  if (staticPolicy && !staticPolicy.toolNames.includes(request.toolName)) {
+    throw new Error(
+      `路径 ${normalized} 由 Cocos Bridge 管理；只能通过 ${staticPolicy.toolNames.join(" / ")} 写入，` +
+      `${request.toolName} 不得直接伪造或覆盖引擎证据。`
+    );
+  }
+
+  const registeredBuild = task.outputArtifacts
+    .map((artifactId) => artifacts.find((artifact) => artifact.artifactId === artifactId))
+    .find((artifact) => artifact?.type === "build" && pathMatchesArtifact(normalized, artifact));
+  if (registeredBuild && request.toolName !== "cocos_build") {
+    throw new Error(
+      `构建路径 ${normalized} 由 Cocos Bridge 管理；只能通过 cocos_build 写入，` +
+      `${request.toolName} 不得直接伪造 build report 或 bundle。`
+    );
+  }
 }
 
 export function assertAgentPathAuthorized(

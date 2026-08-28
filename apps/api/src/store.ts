@@ -3,6 +3,8 @@ import {
   createStudioKernel,
   defaultAgentContracts,
   LocalAgentRuntime,
+  reconcileLocalRuntimeProjectState,
+  workflowTaskStages,
   type GateEvidencePolicy,
   type StudioKernel
 } from "@game-pipeline/agent-runtime";
@@ -19,7 +21,19 @@ import { ModelAgentRuntime } from "./modelAgentRuntime.js";
 import { ProjectPersistenceStore, type ProjectStateRepository, type ProjectSummary } from "./projectPersistence.js";
 import { reconcileQaPlaytestResults } from "./qaResultIngestion.js";
 import { apiGateEvidencePolicy } from "./gateEvidencePolicy.js";
+import { reconcileProductionAudit } from "./productionAudit.js";
+import {
+  captureCurrentStageReviewOutputEvidence,
+  reconcileCurrentStageReviewOutputEvidence,
+  reconcileInvalidQualityReviewEvidence
+} from "./evidenceReconciliation.js";
 import { executeAgentToolRequests } from "./toolExecutor.js";
+import { assetProductionOutputsVerified } from "./taskOutputEvidence.js";
+import {
+  artifactClaimsMediaGeneration,
+  hasCurrentGenerateRasterAssetReceipt,
+  stripPrivilegedMaterializationMetadata
+} from "./mediaArtifactEvidence.js";
 import {
   deleteProjectWorkspace,
   readArtifactPreview,
@@ -78,6 +92,7 @@ export class StudioProjectStore {
     for (const persistedKernel of this.persistence.loadAll()) {
       const migration = migrateLegacyClaimRepairStorm(persistedKernel);
       const kernel = migration.kernel;
+      migrateLegacyMediaGenerationReceipts(kernel);
       for (const activity of kernel.listAgentActivities()) {
         kernel.removeAgentActivity(activity.activityId);
       }
@@ -286,6 +301,8 @@ export class StudioProjectStore {
     if (kernel.project.executionStatus !== "running") {
       throw new HttpError(409, "项目尚未启动或已暂停，不能继续 Agent Loop。");
     }
+    reconcileLocalRuntimeProjectState(kernel);
+    this.checkpointKernel(kernel);
     return this.agentLoop.start(projectId, {
       reason: "制作人手动要求 Agents 继续未完成工作。",
       unlockProducerWaits: true,
@@ -475,19 +492,38 @@ export class StudioProjectStore {
     const persistedKernel = this.persistence.load(projectId);
     if (persistedKernel) {
       const kernel = migrateLegacyClaimRepairStorm(persistedKernel).kernel;
+      migrateLegacyMediaGenerationReceipts(kernel);
+      reconcileLocalRuntimeProjectState(kernel);
       migrateRuntimeAssetPipeline(kernel);
       this.projects.set(projectId, kernel);
+      const evidenceBaseline = captureCurrentStageReviewOutputEvidence(kernel);
       syncProjectWorkspace(kernel);
+      reconcileCurrentStageReviewOutputEvidence(kernel, evidenceBaseline);
+      reconcileInvalidQualityReviewEvidence(kernel);
+      reconcileProductionAudit(kernel);
+      syncProjectWorkspace(kernel);
+      // Workspace sync can invalidate placeholder/file evidence even when the
+      // runtime topology itself needed no migration. Persist every lazy load so
+      // those evidence and task transitions survive a crash or restart.
+      this.persistence.save(kernel);
       return kernel;
     }
     return undefined;
   }
 
   private checkpointKernel(kernel: StudioKernel): WorkspaceSyncResult {
+    if (kernel.project.executionStatus === "running") {
+      reconcileLocalRuntimeProjectState(kernel);
+    }
     const qaIngestion = reconcileQaPlaytestResults(kernel);
+    const evidenceBaseline = captureCurrentStageReviewOutputEvidence(kernel);
     let workspace = syncProjectWorkspace(kernel);
     verifyProjectClaims(kernel);
     reconcileClaimRepairs(kernel);
+    workspace = syncProjectWorkspace(kernel);
+    reconcileCurrentStageReviewOutputEvidence(kernel, evidenceBaseline);
+    reconcileInvalidQualityReviewEvidence(kernel);
+    reconcileProductionAudit(kernel);
     workspace = syncProjectWorkspace(kernel);
     this.persistence.save(kernel);
     if (qaIngestion.queuedAgentIds.length > 0 && kernel.project.executionStatus === "running") {
@@ -508,27 +544,20 @@ function migrateRuntimeAssetPipeline(kernel: StudioKernel): boolean {
     return false;
   }
   const criteria = [
-    "asset manifest 存在且 runtimePath 指向 PNG",
-    "每个 SVG 源资产都有经工具验证的同名 PNG",
-    "关键资产符合 Art Bible"
+    "至少一个真实 PNG 资产由 generate_raster_asset 物化并登记",
+    "asset manifest 使用 schemaVersion=2.0.0，且每个 runtimePath 指向逐一验证的 PNG 并显式声明 alphaPolicy",
+    "资产联系表覆盖第一可玩关键资产",
+    "生成 provider/model/request/prompt hash/seed/尺寸证据完整",
+    "每个 runtime PNG 都通过与 alphaPolicy 一致的确定性透明通道硬校验"
   ];
-  const artifacts = kernel.listArtifacts();
-  const ledger = kernel.listArtifactLedger();
-  const sourcePaths = task.outputArtifacts
-    .map((artifactId) => artifacts.find((artifact) => artifact.artifactId === artifactId)?.path)
-    .filter((path): path is string => Boolean(path?.toLowerCase().endsWith(".svg")));
-  const missingRuntimePng = sourcePaths.some((sourcePath) => {
-    const runtimePath = sourcePath.replace(/\.svg$/i, ".png");
-    const artifact = artifacts.find((candidate) => candidate.path === runtimePath);
-    const evidence = artifact ? ledger.find((entry) => entry.artifactId === artifact.artifactId) : undefined;
-    return !artifact?.metadata.toolExecutedAt || evidence?.status !== "verified";
-  });
   const fields: Parameters<StudioKernel["updateTask"]>[1] = {
-    description: "根据 Art Bible 生成 SVG 源资产，渲染 Cocos 可直接导入的透明 PNG，并维护 asset manifest。",
+    description:
+      "根据 Art Bible 通过真实图片生成模型生产第一可玩 PNG，保留模型与提示词证据，生成资产联系表并维护 asset manifest v2；逐项声明 alphaPolicy 并通过像素级透明通道硬校验。",
     acceptanceCriteria: criteria
   };
-  const requiresRuntimePngWork = sourcePaths.length > 0 && missingRuntimePng;
-  if (requiresRuntimePngWork && ["review", "done"].includes(task.status)) {
+  const requiresRuntimePngWork = !assetProductionOutputsVerified(kernel, task);
+  const taskIsExecutableNow = workflowTaskStages(kernel.project.currentStage).includes(task.stageId);
+  if (requiresRuntimePngWork && taskIsExecutableNow && ["review", "done"].includes(task.status)) {
     fields.status = "doing";
     fields.progressPercent = Math.min(task.progressPercent ?? 80, 80);
     fields.blockers = task.blockers.filter((blocker) => !/Claude CLI.*(超时|没有产生工具写入)/i.test(blocker));
@@ -538,7 +567,38 @@ function migrateRuntimeAssetPipeline(kernel: StudioKernel): boolean {
     fields.updatedAt = new Date().toISOString();
     kernel.updateTask(task.taskId, fields);
   }
-  return requiresRuntimePngWork && (task.status === "doing" || fields.status === "doing");
+  return taskIsExecutableNow && requiresRuntimePngWork && (task.status === "doing" || fields.status === "doing");
+}
+
+/**
+ * Older snapshots allowed Agent-supplied Artifact.metadata to resemble a media
+ * provider receipt.  Only receipts also stamped into the current immutable
+ * artifact operation survive this one-way migration.
+ */
+export function migrateLegacyMediaGenerationReceipts(kernel: StudioKernel): boolean {
+  const now = new Date().toISOString();
+  let changed = false;
+  for (const artifact of kernel.listArtifacts()) {
+    if (!artifactClaimsMediaGeneration(artifact) || hasCurrentGenerateRasterAssetReceipt(kernel, artifact)) {
+      continue;
+    }
+    const sanitizedMetadata = {
+      ...stripPrivilegedMaterializationMetadata(artifact.metadata),
+      toolExecutedAt: undefined,
+      legacyMediaReceiptInvalidatedAt: now,
+      legacyMediaReceiptInvalidationReason: "missing_current_server_materialization_operation"
+    };
+    const migrated = kernel.upsertArtifact({
+      ...artifact,
+      status: "change_requested",
+      version: artifact.version + 1,
+      metadata: sanitizedMetadata,
+      updatedAt: now
+    });
+    migrated.metadata = sanitizedMetadata;
+    changed = true;
+  }
+  return changed;
 }
 
 const mentionAliases: Record<string, string[]> = {
