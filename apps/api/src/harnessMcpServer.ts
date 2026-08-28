@@ -12,9 +12,22 @@ import {
   assertContractRevisionAdvance,
   contractArtifactTypeForPath
 } from "./contractArtifacts.js";
-import type { ArtifactInputProvenance } from "@game-pipeline/shared-schemas";
+import type { ArtifactInputProvenance, ArtifactQualityReview } from "@game-pipeline/shared-schemas";
+import { getQualityReviewArtifactContracts, type QualityReviewArtifactContract } from "@game-pipeline/agent-runtime";
 import type { AgentHarnessAuthorization, AgentHarnessAuthorizationArtifact } from "./agentHarness.js";
 import { normalizeRelativePathWithinRoot, resolvePathWithinRoot } from "./pathSafety.js";
+import { DashScopeMultimodalArtProvider, type ArtImageMime } from "./multimodalArtProvider.js";
+import {
+  assertQualityReviewMatchesVisionSemanticResult,
+  assertQualityReviewEvidenceGroundedInWorkspace,
+  assertQualityReviewRubric,
+  buildVisionReviewAuthoritativeContext,
+  mergeVisionSemanticInspectionReceipts,
+  stampAndValidateQualityReviewText,
+  type MergedVisionSemanticReceipt,
+  type VisionSemanticInspectionReceipt
+} from "./qualityReviewArtifacts.js";
+import { parseCurrentAssetManifestText } from "./assetManifestArtifacts.js";
 
 interface JsonRpcRequest {
   jsonrpc?: string;
@@ -31,6 +44,7 @@ assertAuthorizationEnvelope();
 const taskInputEvidence = parseTaskInputEvidence(process.env.BTP_TASK_INPUT_EVIDENCE);
 const controlPath = process.env.BTP_CONTROL_PATH?.trim();
 const operationLogPath = process.env.BTP_OPERATION_LOG_PATH?.trim();
+const visionInspectionReceipts: VisionSemanticInspectionReceipt[] = [];
 const reader = createInterface({ input: process.stdin, terminal: false });
 
 reader.on("line", (line) => {
@@ -75,6 +89,7 @@ async function handleRequest(request: JsonRpcRequest): Promise<void> {
         respondError(request.id, -32601, `Method not found: ${request.method ?? "unknown"}`);
     }
   } catch (error) {
+    recordFailedWorkspaceWrite(request, error);
     respond(request.id, {
       content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
       isError: true
@@ -82,17 +97,52 @@ async function handleRequest(request: JsonRpcRequest): Promise<void> {
   }
 }
 
+function recordFailedWorkspaceWrite(request: JsonRpcRequest, error: unknown): void {
+  if (request.method !== "tools/call") {
+    return;
+  }
+  const name = typeof request.params?.name === "string" ? request.params.name : "";
+  if (!["write_artifact", "append_document", "generate_raster_asset", "inspect_visual_assets"].includes(name)) {
+    return;
+  }
+  const args = isRecord(request.params?.arguments) ? request.params.arguments : {};
+  const requestedPath = typeof args.path === "string"
+    ? args.path
+    : Array.isArray(args.paths) && typeof args.paths[0] === "string"
+      ? args.paths[0]
+      : undefined;
+  if (!requestedPath) {
+    return;
+  }
+  let path: string;
+  try {
+    path = normalizeAuthorizationPath(requestedPath);
+  } catch {
+    return;
+  }
+  recordOperation({
+    toolName: name,
+    path,
+    access: name === "inspect_visual_assets" ? "read" : "write",
+    status: "failed",
+    error: error instanceof Error ? error.message : String(error)
+  });
+}
+
 function toolDefinitions(): Array<Record<string, unknown>> {
   const readTools: Array<Record<string, unknown>> = [
     {
       name: "read_file",
       title: "Read authorized project file",
-      description: "Read one UTF-8 project file allowed by the current task-bound authorization.",
+      description: "Read one UTF-8 project file allowed by the current task-bound authorization. Use withLineNumbers for auditable Markdown evidenceRefs.",
       inputSchema: {
         type: "object",
         properties: {
           path: { type: "string", description: "Authorized project-relative file path" },
-          maxBytes: { type: "integer", minimum: 1, maximum: 1048576 }
+          maxBytes: { type: "integer", minimum: 1, maximum: 1048576 },
+          lineStart: { type: "integer", minimum: 1, description: "Optional first line, 1-based" },
+          lineEnd: { type: "integer", minimum: 1, description: "Optional last line, inclusive" },
+          withLineNumbers: { type: "boolean", description: "Prefix every returned line with its authoritative 1-based line number" }
         },
         required: ["path"],
         additionalProperties: false
@@ -171,6 +221,24 @@ function toolDefinitions(): Array<Record<string, unknown>> {
   ];
   if (["art_director", "asset_production"].includes(agentId)) {
     tools.push({
+      name: "generate_raster_asset",
+      title: "Generate real PNG art asset",
+      description: "Call the configured DashScope image model and immediately persist one task-authorized PNG with provider provenance. This is the real raster generator; it is not SVG text generation.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Task-authorized .png destination" },
+          prompt: { type: "string", description: "Concrete art direction, composition, palette, camera and negative constraints" },
+          negativePrompt: { type: "string" },
+          size: { type: "string", pattern: "^[0-9]{3,4}\\*[0-9]{3,4}$" },
+          seed: { type: "integer", minimum: 0, maximum: 2147483647 },
+          referencePaths: { type: "array", maxItems: 3, items: { type: "string" } }
+        },
+        required: ["path", "prompt"],
+        additionalProperties: false
+      }
+    });
+    tools.push({
       name: "render_svg_to_png",
       title: "Render SVG source to PNG",
       description: "Rasterize an authorized SVG source into a transparent PNG runtime asset for Cocos Creator. The PNG is recorded as tool evidence.",
@@ -182,6 +250,22 @@ function toolDefinitions(): Array<Record<string, unknown>> {
           width: { type: "integer", minimum: 1, maximum: 4096, description: "Optional output width; aspect ratio is preserved" }
         },
         required: ["sourcePath", "path"],
+        additionalProperties: false
+      }
+    });
+  }
+  if (agentId === "visual_quality_reviewer") {
+    tools.push({
+      name: "inspect_visual_assets",
+      title: "Inspect real image pixels with a vision model",
+      description: "Send 1-16 task-authorized local images as real image bytes to qwen3.8-max and return rubric-bound structured visual evidence. A visual quality receipt is rejected unless this tool inspected every image target and preserves the model's scores/findings/verdict.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          paths: { type: "array", minItems: 1, maxItems: 16, items: { type: "string" } },
+          rubricPrompt: { type: "string", description: "Optional focus only; server context and rubric remain authoritative." }
+        },
+        required: ["paths"],
         additionalProperties: false
       }
     });
@@ -269,18 +353,75 @@ async function callTool(params: Record<string, unknown> | undefined): Promise<Re
     if (body.byteLength > maxBytes) {
       throw new Error(`文件 ${target.relativePath} 为 ${body.byteLength} bytes，超过本次读取上限 ${maxBytes} bytes。`);
     }
+    const sourceText = body.toString("utf8");
+    const lines = sourceText.split(/\r?\n/);
+    const requestedStart = integerArgument(args.lineStart);
+    const requestedEnd = integerArgument(args.lineEnd);
+    if (requestedStart !== undefined && requestedEnd !== undefined && requestedEnd < requestedStart) {
+      throw new Error("lineEnd 不能小于 lineStart。");
+    }
+    const lineStart = Math.min(requestedStart ?? 1, lines.length);
+    const lineEnd = Math.min(requestedEnd ?? lines.length, lines.length);
+    const selectedLines = lines.slice(lineStart - 1, lineEnd);
+    const withLineNumbers = args.withLineNumbers === true;
+    const text = withLineNumbers
+      ? selectedLines.map((line, index) => `${lineStart + index}: ${line}`).join("\n")
+      : selectedLines.join("\n");
     return {
-      content: [{ type: "text", text: body.toString("utf8") }],
-      structuredContent: { path: target.relativePath, sizeBytes: body.byteLength }
+      content: [{ type: "text", text }],
+      // Claude CLI currently surfaces structuredContent as the tool result when both fields exist.
+      // Keep the authorized UTF-8 body in both representations so the Agent can actually inspect it.
+      structuredContent: {
+        path: target.relativePath,
+        sizeBytes: body.byteLength,
+        text,
+        lineStart,
+        lineEnd,
+        lineCount: lines.length,
+        withLineNumbers
+      }
     };
   }
   if (name === "write_artifact" || name === "append_document") {
     const path = requiredString(args.path, "path");
-    const content = requiredString(args.content, "content", true);
+    let content = requiredString(args.content, "content", true);
     if (Buffer.byteLength(content, "utf8") > 5 * 1024 * 1024) {
       throw new Error("单次 MCP 文本写入不能超过 5 MB。");
     }
     let target = resolveAuthorizedTarget(path, false, "artifact_write");
+    const outputArtifact = taskOutputArtifacts().find((artifact) => artifact.path === target.relativePath);
+    const canonicalReviewPath = getQualityReviewArtifactContracts().some(
+      (contract) => contract.path === target.relativePath
+    );
+    let qualityVisionReceipt = undefined as MergedVisionSemanticReceipt | undefined;
+    if (outputArtifact?.type === "asset_manifest") {
+      if (name !== "write_artifact") throw new Error("Asset Manifest 只能整份替换，禁止 append_document。");
+      parseCurrentAssetManifestText(content);
+    }
+    if (outputArtifact && (outputArtifact.type === "quality_review" || canonicalReviewPath)) {
+      if (name !== "write_artifact") throw new Error("quality_review 只能整份替换，禁止 append_document。");
+      const stamped = stampAndValidateQualityReviewText(content, {
+        reviewerAgentId: agentId,
+        providerId: requiredEnvironment("BTP_PROVIDER_ID"),
+        model: requiredEnvironment("BTP_MODEL"),
+        invocationId: requiredEnvironment("BTP_HARNESS_INVOCATION_ID")
+      });
+      assertMcpQualityReviewTargets(stamped.review, outputArtifact);
+      if (stamped.review.domain !== "design") {
+        const invocationId = requiredEnvironment("BTP_HARNESS_INVOCATION_ID");
+        qualityVisionReceipt = mergeVisionInspectionReceipts(invocationId, stamped.review);
+        if (!qualityVisionReceipt) {
+          throw new Error("视觉 quality_review 必须先在本 invocation 用 inspect_visual_assets 读取全部图片 target 的真实像素；可分多批检查。");
+        }
+        assertQualityReviewMatchesVisionSemanticResult(stamped.review, qualityVisionReceipt.result);
+      }
+      assertQualityReviewEvidenceGroundedInWorkspace(
+        projectRoot,
+        stamped.review,
+        qualityVisionReceipt?.paths ?? []
+      );
+      content = stamped.content;
+    }
     assertQaEvidenceWriteAllowed(target.relativePath, name);
     assertContractPathContent(target.relativePath, content, name === "append_document" ? "append" : "write");
     const contractType = contractArtifactTypeForPath(target.relativePath);
@@ -300,7 +441,34 @@ async function callTool(params: Record<string, unknown> | undefined): Promise<Re
     }
     const stats = statSync(target.absolutePath);
     const hash = createHash("sha256").update(readFileSync(target.absolutePath)).digest("hex");
-    recordOperation({ toolName: name, path: target.relativePath, hash, sizeBytes: stats.size, status: "completed" });
+    recordOperation({
+      toolName: name,
+      path: target.relativePath,
+      access: "write",
+      hash,
+      sizeBytes: stats.size,
+      status: "completed",
+      ...(qualityVisionReceipt
+        ? {
+            operationId: qualityVisionReceipt.operationId,
+            operationType: "quality_review_with_vision",
+            providerId: qualityVisionReceipt.providerId,
+            model: qualityVisionReceipt.model,
+            requestId: qualityVisionReceipt.operationId,
+            inspectedPaths: qualityVisionReceipt.paths,
+            inspectedEvidence: qualityVisionReceipt.evidence,
+            visionResponseHash: qualityVisionReceipt.responseHash,
+            visionSemanticHash: qualityVisionReceipt.semanticHash,
+            visionSemanticResult: qualityVisionReceipt.result,
+            authoritativeContextEvidence: qualityVisionReceipt.authoritativeContextEvidence,
+            authoritativeContextHash: qualityVisionReceipt.authoritativeContextHash,
+            requestSemanticHash: qualityVisionReceipt.requestSemanticHash,
+            visionSemanticReceipts: visionInspectionReceipts.filter(
+              (receipt) => receipt.invocationId === qualityVisionReceipt.invocationId
+            )
+          }
+        : {})
+    });
     return {
       content: [{ type: "text", text: `写入成功：${target.relativePath}；hash=${hash}；size=${stats.size} bytes` }],
       structuredContent: { path: target.relativePath, hash, sizeBytes: stats.size }
@@ -314,6 +482,174 @@ async function callTool(params: Record<string, unknown> | undefined): Promise<Re
     return {
       content: [{ type: "text", text: files.length > 0 ? files.join("\n") : "目录中暂无文件。" }],
       structuredContent: { path: target.relativePath, files }
+    };
+  }
+  if (name === "generate_raster_asset" && ["art_director", "asset_production"].includes(agentId)) {
+    const path = requiredString(args.path, "path");
+    if (!path.toLowerCase().endsWith(".png")) throw new Error("generate_raster_asset 目标必须是 .png。");
+    const registeredOutput = taskOutputArtifacts().some((artifact) => artifact.path === normalizeAuthorizationPath(path));
+    let target = resolveAuthorizedTarget(path, false, registeredOutput ? "artifact_write" : "service_write");
+    const referencePaths = Array.isArray(args.referencePaths)
+      ? args.referencePaths.filter((value): value is string => typeof value === "string" && Boolean(value.trim()))
+      : [];
+    if (referencePaths.length > 3) throw new Error("generate_raster_asset 最多接受 3 张参考图。");
+    const referenceImageDataUrls = referencePaths.map((referencePath) => {
+      const source = resolveAuthorizedTarget(referencePath, false, "read");
+      if (!existsSync(source.absolutePath) || !statSync(source.absolutePath).isFile()) {
+        throw new Error(`参考图片不存在：${source.relativePath}`);
+      }
+      const bytes = readFileSync(source.absolutePath);
+      if (bytes.byteLength > 10 * 1024 * 1024) throw new Error(`参考图片超过 10MiB：${source.relativePath}`);
+      return `data:${imageMimeForPath(source.relativePath)};base64,${bytes.toString("base64")}`;
+    });
+    const generated = await createMcpMultimodalProvider().generateImage({
+      prompt: requiredString(args.prompt, "prompt"),
+      size: typeof args.size === "string" ? args.size : "1024*1024",
+      ...(typeof args.negativePrompt === "string" && args.negativePrompt.trim()
+        ? { negativePrompt: args.negativePrompt.trim() }
+        : {}),
+      ...(typeof args.seed === "number" && Number.isInteger(args.seed) ? { seed: args.seed } : {}),
+      ...(referenceImageDataUrls.length > 0 ? { referenceImageDataUrls } : {})
+    });
+    mkdirSync(dirname(target.absolutePath), { recursive: true });
+    target = resolveAuthorizedTarget(path, false, registeredOutput ? "artifact_write" : "service_write");
+    writeFileSync(target.absolutePath, generated.buffer, { mode: 0o600 });
+    const stats = statSync(target.absolutePath);
+    const hash = createHash("sha256").update(readFileSync(target.absolutePath)).digest("hex");
+    recordOperation({
+      toolName: name,
+      path: target.relativePath,
+      access: "write",
+      status: "completed",
+      operationId: generated.requestId,
+      operationType: "image_generation",
+      providerId: generated.provider,
+      model: generated.model,
+      requestId: generated.requestId,
+      promptHash: generated.promptHash,
+      negativePromptHash: generated.negativePromptHash,
+      seed: generated.seed,
+      width: generated.width,
+      height: generated.height,
+      mime: generated.mime,
+      endpointFingerprint: generated.endpointFingerprint,
+      latencyMs: generated.latencyMs,
+      hash,
+      sizeBytes: stats.size
+    });
+    return {
+      content: [{
+        type: "text",
+        text: `真实 PNG 生成成功：${target.relativePath}；model=${generated.model}；requestId=${generated.requestId}；seed=${generated.seed}；${generated.width}x${generated.height}；hash=${hash}`
+      }],
+      structuredContent: {
+        path: target.relativePath,
+        hash,
+        sizeBytes: stats.size,
+        provider: generated.provider,
+        model: generated.model,
+        requestId: generated.requestId,
+        promptHash: generated.promptHash,
+        negativePromptHash: generated.negativePromptHash,
+        seed: generated.seed,
+        width: generated.width,
+        height: generated.height,
+        mime: generated.mime,
+        endpointFingerprint: generated.endpointFingerprint,
+        latencyMs: generated.latencyMs
+      }
+    };
+  }
+  if (name === "inspect_visual_assets" && agentId === "visual_quality_reviewer") {
+    const inspectionInvocationId = requiredEnvironment("BTP_HARNESS_INVOCATION_ID");
+    const paths = Array.isArray(args.paths)
+      ? [...new Set(args.paths.filter((value): value is string => typeof value === "string" && Boolean(value.trim())))]
+      : [];
+    if (paths.length === 0 || paths.length > 16) throw new Error("inspect_visual_assets 必须提供 1-16 个图片路径。");
+    const images = paths.map((path) => {
+      const source = resolveAuthorizedTarget(path, false, "read");
+      if (!existsSync(source.absolutePath) || !statSync(source.absolutePath).isFile()) {
+        throw new Error(`待审图片不存在：${source.relativePath}`);
+      }
+      const buffer = readFileSync(source.absolutePath);
+      return {
+        path: source.relativePath,
+        mime: imageMimeForPath(source.relativePath),
+        buffer,
+        hash: createHash("sha256").update(buffer).digest("hex")
+      };
+    });
+    const reviewOutput = taskOutputArtifacts().find((artifact) => artifact.type === "quality_review");
+    const contract = reviewOutput
+      ? getQualityReviewArtifactContracts().find((candidate) => candidate.artifactId === reviewOutput.artifactId)
+      : undefined;
+    if (!contract || contract.ownerAgentId !== agentId || contract.sourceTaskId !== authorization.taskId) {
+      throw new Error("inspect_visual_assets 缺少当前任务 canonical visual quality review contract。");
+    }
+    const authoritativeContext = buildMcpVisionAuthoritativeContext(contract);
+    const inspected = await createMcpMultimodalProvider().reviewImages({
+      images: images.map(({ path, mime, buffer }) => ({ path, mime, buffer })),
+      rubric: contract.rubric,
+      authoritativeContext,
+      ...(typeof args.rubricPrompt === "string" ? { rubricPrompt: args.rubricPrompt } : {}),
+      systemPrompt:
+        "你是独立的 Principal 2D Game Art Director 与移动技术美术。只依据真实图片像素和 rubric 审查，返回严格 JSON；逐项列出可观察证据、严重度、问题和建议，不得替制作人批准门禁。"
+    });
+    const inspectedPaths = images.map((image) => image.path);
+    visionInspectionReceipts.push({
+      invocationId: inspectionInvocationId,
+      operationId: inspected.requestId,
+      providerId: inspected.provider,
+      model: inspected.model,
+      paths: inspectedPaths,
+      evidence: images.map((image) => ({ path: image.path, hash: image.hash, sizeBytes: image.buffer.byteLength })),
+      responseHash: inspected.rawHash,
+      authoritativeContextEvidence: inspected.authoritativeContextEvidence,
+      authoritativeContextHash: inspected.authoritativeContextHash,
+      requestSemanticHash: inspected.requestSemanticHash,
+      result: inspected.result
+    });
+    const merged = mergeVisionSemanticInspectionReceipts(
+      visionInspectionReceipts.filter((receipt) => receipt.invocationId === inspectionInvocationId),
+      contract
+    );
+    recordOperation({
+      toolName: name,
+      path: inspectedPaths[0]!,
+      access: "read",
+      status: "completed",
+      operationId: inspected.requestId,
+      operationType: "vision_review",
+      providerId: inspected.provider,
+      model: inspected.model,
+      requestId: inspected.requestId,
+      inspectedPaths,
+      inspectedEvidence: images.map((image) => ({ path: image.path, hash: image.hash, sizeBytes: image.buffer.byteLength })),
+      hash: inspected.rawHash,
+      visionResponseHash: inspected.rawHash,
+      visionSemanticHash: merged.semanticHash,
+      visionSemanticResult: inspected.result,
+      authoritativeContextEvidence: merged.authoritativeContextEvidence,
+      authoritativeContextHash: merged.authoritativeContextHash,
+      requestSemanticHash: merged.requestSemanticHash
+    });
+    return {
+      content: [{ type: "text", text: JSON.stringify(merged.result, null, 2) }],
+      structuredContent: {
+        provider: inspected.provider,
+        model: inspected.model,
+        requestId: inspected.requestId,
+        rawHash: inspected.rawHash,
+        aggregateResponseHash: merged.responseHash,
+        semanticHash: merged.semanticHash,
+        authoritativeContextEvidence: merged.authoritativeContextEvidence,
+        authoritativeContextHash: merged.authoritativeContextHash,
+        requestSemanticHash: merged.requestSemanticHash,
+        inspectedPaths: merged.paths,
+        inspectedEvidence: merged.evidence,
+        result: merged.result,
+        latencyMs: inspected.latencyMs
+      }
     };
   }
   if (name === "render_svg_to_png" && ["art_director", "asset_production"].includes(agentId)) {
@@ -455,6 +791,181 @@ async function callTool(params: Record<string, unknown> | undefined): Promise<Re
     };
   }
   throw new Error(`不支持的 BTP MCP 工具：${name || "unknown"}`);
+}
+
+function createMcpMultimodalProvider(): DashScopeMultimodalArtProvider {
+  const imageEndpoint = process.env.BTP_IMAGE_GENERATION_ENDPOINT?.trim();
+  const visionEndpoint = process.env.BTP_VISION_REVIEW_ENDPOINT?.trim();
+  const imageModel = process.env.BTP_IMAGE_GENERATION_MODEL?.trim();
+  const visionModel = process.env.BTP_VISION_REVIEW_MODEL?.trim();
+  return new DashScopeMultimodalArtProvider({
+    apiKey: requiredEnvironment("BTP_MULTIMODAL_API_KEY"),
+    ...(imageEndpoint ? { imageEndpoint } : {}),
+    ...(visionEndpoint ? { visionEndpoint } : {}),
+    ...(imageModel ? { imageModel } : {}),
+    ...(visionModel ? { visionModel } : {}),
+    // DashScope generation URLs are temporary Alibaba OSS/CDN URLs. Keep the
+    // download surface fixed even when the API response itself is compromised.
+    allowedDownloadHostSuffixes: [".aliyuncs.com", ".aliyun.com"]
+  });
+}
+
+function imageMimeForPath(path: string): ArtImageMime {
+  if (/\.png$/i.test(path)) return "image/png";
+  if (/\.jpe?g$/i.test(path)) return "image/jpeg";
+  if (/\.webp$/i.test(path)) return "image/webp";
+  throw new Error(`多模态工具只接受 PNG/JPEG/WebP：${path}`);
+}
+
+function assertMcpQualityReviewTargets(
+  review: ArtifactQualityReview,
+  outputArtifact: AgentHarnessAuthorizationArtifact
+): void {
+  const contract = getQualityReviewArtifactContracts().find(
+    (candidate) => candidate.artifactId === outputArtifact.artifactId
+  );
+  if (!contract) {
+    throw new Error(`quality_review 输出 ${outputArtifact.artifactId} 没有 canonical review contract。`);
+  }
+  const identityMismatches = [
+    outputArtifact.type === contract.type ? undefined : `type=${outputArtifact.type}`,
+    outputArtifact.path === contract.path ? undefined : `path=${outputArtifact.path}`,
+    outputArtifact.ownerAgentId === contract.ownerAgentId ? undefined : `owner=${outputArtifact.ownerAgentId}`,
+    outputArtifact.sourceTaskId === contract.sourceTaskId ? undefined : `sourceTask=${outputArtifact.sourceTaskId ?? "missing"}`,
+    authorization.taskId === contract.sourceTaskId ? undefined : `authorizedTask=${authorization.taskId ?? "missing"}`,
+    agentId === contract.ownerAgentId ? undefined : `agent=${agentId}`
+  ].filter((value): value is string => Boolean(value));
+  if (identityMismatches.length > 0) {
+    throw new Error(`quality_review canonical identity 不匹配：${identityMismatches.join("；")}。`);
+  }
+  if (review.domain !== contract.domain) {
+    throw new Error(`quality_review domain=${review.domain}，canonical domain=${contract.domain}。`);
+  }
+  if (review.reviewerAgentId !== contract.ownerAgentId) {
+    throw new Error(`quality_review reviewer=${review.reviewerAgentId}，canonical reviewer=${contract.ownerAgentId}。`);
+  }
+  assertQualityReviewRubric(review, contract);
+
+  const expectedSubjectIds = [...contract.subjectArtifactIds].sort();
+  const actualSubjectIds = review.targets.map((target) => target.artifactId).sort();
+  if (
+    expectedSubjectIds.length !== actualSubjectIds.length ||
+    expectedSubjectIds.some((artifactId, index) => artifactId !== actualSubjectIds[index])
+  ) {
+    throw new Error(`quality_review targets 必须精确等于 canonical subjects：${expectedSubjectIds.join("、")}。`);
+  }
+
+  for (const target of review.targets) {
+    const authorizedInput = taskInputArtifacts().find((artifact) => artifact.artifactId === target.artifactId);
+    if (!authorizedInput) {
+      throw new Error(`被审产物 ${target.artifactId} 不是当前任务授权输入。`);
+    }
+    if (authorizedInput.ownerAgentId === agentId) {
+      throw new Error(`审查员 ${agentId} 不得审查自己的产物 ${target.artifactId}。`);
+    }
+    const matchingEvidence = taskInputEvidence.filter((entry) => entry.artifactId === target.artifactId);
+    if (matchingEvidence.length !== 1) {
+      throw new Error(`被审产物 ${target.artifactId} 必须有且仅有一条 taskInputEvidence，实际 ${matchingEvidence.length} 条。`);
+    }
+    const evidence = matchingEvidence[0]!;
+    if (
+      !Number.isSafeInteger(evidence.version) || evidence.version < 1 ||
+      !Number.isSafeInteger(evidence.sizeBytes) || evidence.sizeBytes < 1 ||
+      evidence.path !== authorizedInput.path
+    ) {
+      throw new Error(`被审产物 ${target.artifactId} 的 taskInputEvidence identity 非法或与授权输入不一致。`);
+    }
+    if (
+      target.version !== evidence.version ||
+      target.path !== evidence.path ||
+      target.ledgerHash !== evidence.hash ||
+      target.sizeBytes !== evidence.sizeBytes
+    ) {
+      throw new Error(`quality_review target ${target.artifactId} 的 version/path/hash/size 与 taskInputEvidence 不一致。`);
+    }
+    const evidenceTarget = resolveAuthorizedTarget(evidence.evidencePath, false, "read");
+    if (!existsSync(evidenceTarget.absolutePath) || !statSync(evidenceTarget.absolutePath).isFile()) {
+      throw new Error(`被审产物 ${target.artifactId} 的 evidencePath 不存在：${evidence.evidencePath}。`);
+    }
+    const currentBytes = readFileSync(evidenceTarget.absolutePath);
+    const currentHash = createHash("sha256").update(currentBytes).digest("hex");
+    if (currentBytes.byteLength !== evidence.sizeBytes || currentHash !== evidence.hash) {
+      throw new Error(`被审产物 ${target.artifactId} 的当前文件字节与 taskInputEvidence 不一致。`);
+    }
+  }
+}
+
+function mergeVisionInspectionReceipts(
+  invocationId: string,
+  review: ArtifactQualityReview
+): MergedVisionSemanticReceipt | undefined {
+  const receipts = visionInspectionReceipts.filter((receipt) => receipt.invocationId === invocationId);
+  if (receipts.length === 0) return undefined;
+  const contract = getQualityReviewArtifactContracts().find((candidate) =>
+    candidate.domain === review.domain && candidate.ownerAgentId === review.reviewerAgentId
+  );
+  if (!contract) throw new Error("视觉 quality_review 缺少 canonical contract。");
+  const merged = mergeVisionSemanticInspectionReceipts(receipts, contract);
+  const currentContext = buildMcpVisionAuthoritativeContext(contract);
+  if (
+    merged.authoritativeContextHash !== currentContext.hash ||
+    JSON.stringify(merged.authoritativeContextEvidence) !== JSON.stringify(currentContext.evidence)
+  ) {
+    throw new Error("视觉 quality_review 的 Art Bible、Asset Manifest 或 runtime 技术上下文已在 inspection 后变化。 ");
+  }
+  const requiredImageTargets = review.targets.filter((target) => /\.(?:png|jpe?g|webp)$/i.test(target.path));
+  if (requiredImageTargets.length === 0) {
+    throw new Error("视觉 quality_review 的 canonical targets 中没有可检查的图片产物。");
+  }
+  if (requiredImageTargets.some((target) => {
+    const evidence = merged.evidence.find((entry) => entry.path === target.path);
+    return !evidence || evidence.hash !== target.ledgerHash || evidence.sizeBytes !== target.sizeBytes;
+  })) {
+    return undefined;
+  }
+  return merged;
+}
+
+function buildMcpVisionAuthoritativeContext(contract: QualityReviewArtifactContract) {
+  const requiredIds = contract.domain === "art_direction"
+    ? ["artifact_art_bible_baseline_draft"]
+    : contract.domain === "visual_assets"
+      ? ["artifact_art_bible_baseline_draft", "artifact_asset_manifest_draft"]
+      : [];
+  const artifacts = requiredIds.map((artifactId) => {
+    const authorized = taskInputArtifacts().find((artifact) => artifact.artifactId === artifactId);
+    const matches = taskInputEvidence.filter((entry) => entry.artifactId === artifactId);
+    if (!authorized || matches.length !== 1) {
+      throw new Error(`视觉权威上下文 ${artifactId} 缺少唯一 task-bound input evidence。`);
+    }
+    const evidence = matches[0]!;
+    if (authorized.path !== evidence.path) {
+      throw new Error(`视觉权威上下文 ${artifactId} 的授权路径与 evidence 不一致。`);
+    }
+    const target = resolveAuthorizedTarget(evidence.evidencePath, false, "read");
+    if (!existsSync(target.absolutePath) || !statSync(target.absolutePath).isFile()) {
+      throw new Error(`视觉权威上下文文件不存在：${evidence.evidencePath}`);
+    }
+    return {
+      artifactId,
+      version: evidence.version,
+      path: evidence.path,
+      hash: evidence.hash,
+      sizeBytes: evidence.sizeBytes,
+      buffer: readFileSync(target.absolutePath)
+    };
+  });
+  return buildVisionReviewAuthoritativeContext({
+    contract,
+    artifacts,
+    readRuntimeAsset: (path) => {
+      const target = resolveAuthorizedTarget(path, false, "read");
+      if (!existsSync(target.absolutePath) || !statSync(target.absolutePath).isFile()) {
+        throw new Error(`权威上下文 runtime asset 不存在：${path}`);
+      }
+      return readFileSync(target.absolutePath);
+    }
+  });
 }
 
 function parseTaskInputEvidence(raw: string | undefined): ArtifactInputProvenance[] {
@@ -758,6 +1269,14 @@ function requiredString(value: unknown, name: string, allowEmpty = false): strin
     throw new Error(`${name} 必须是${allowEmpty ? "" : "非空"}字符串。`);
   }
   return value;
+}
+
+function integerArgument(value: unknown): number | undefined {
+  if (value === undefined) return undefined;
+  if (!Number.isSafeInteger(value) || (value as number) < 1) {
+    throw new Error("行号参数必须是大于等于 1 的整数。");
+  }
+  return value as number;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

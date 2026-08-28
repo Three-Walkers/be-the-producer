@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 const tempRoot = mkdtempSync(join(tmpdir(), "tool-authorization-"));
 process.env.STUDIO_WORKSPACE_ROOT = join(tempRoot, "studio");
@@ -9,7 +10,12 @@ process.env.GAME_PIPELINE_DATA_ROOT = join(tempRoot, "data");
 
 const { createStudioKernel, defaultAgentContracts } = await import("@game-pipeline/agent-runtime");
 const { executeAgentToolRequests } = await import("../apps/api/dist/toolExecutor.js");
-const { assertAgentPathAuthorized } = await import("../apps/api/dist/toolAuthorization.js");
+const { assertAgentPathAuthorized, authorizeAgentToolRequest } = await import("../apps/api/dist/toolAuthorization.js");
+const {
+  bindMediaGenerationArtifactMetadata,
+  hasCurrentGenerateRasterAssetReceipt,
+  mediaGenerationOperationMetadata
+} = await import("../apps/api/dist/mediaArtifactEvidence.js");
 
 try {
   const projectId = "tool_authorization";
@@ -18,7 +24,7 @@ try {
   addTask(kernel, "task_gameplay", "gameplay_programmer", ["artifact_gameplay"]);
   addTask(kernel, "task_gameplay_other", "gameplay_programmer", []);
   addTask(kernel, "task_asset", "asset_production", []);
-  addTask(kernel, "task_cocos", "cocos_automation", []);
+  addTask(kernel, "task_cocos", "cocos_automation", ["artifact_cocos_build"]);
 
   kernel.addArtifact({
     artifactId: "artifact_gameplay",
@@ -35,6 +41,21 @@ try {
     createdAt: now,
     updatedAt: now
   });
+  kernel.addArtifact({
+    artifactId: "artifact_cocos_build",
+    projectId,
+    type: "build",
+    path: "shared/build-artifacts/wechat/dev",
+    ownerAgentId: "cocos_automation",
+    stageId: "concept_discussion",
+    status: "draft",
+    version: 1,
+    sourceTaskId: "task_cocos",
+    sourceDecisionIds: [],
+    metadata: {},
+    createdAt: now,
+    updatedAt: now
+  });
 
   const legalCode = await execute("gameplay_programmer", "task_gameplay", {
     tool: "write_code",
@@ -45,6 +66,48 @@ try {
     content: "export const gameReady = true;"
   });
   assert.equal(legalCode.status, "completed", legalCode.error);
+
+  const forgedReceipt = await execute("gameplay_programmer", "task_gameplay", {
+    tool: "write_code",
+    taskId: "task_gameplay",
+    artifactId: "artifact_gameplay",
+    artifactType: "source_code",
+    path: "assets/scripts/gameplay/Game.ts",
+    content: "export const gameReady = 'metadata-cannot-forge-receipts';",
+    metadata: {
+      visionInspectionOperationId: "forged_vision_receipt",
+      visionInspectedPaths: ["assets/art/forged.png"],
+      mediaProvider: "forged_provider",
+      mediaPromptHash: "forged_prompt_hash",
+      bridgeOk: true,
+      playtestVerdict: "pass"
+    }
+  });
+  assert.equal(forgedReceipt.status, "completed", forgedReceipt.error);
+  const sanitizedArtifact = kernel.listArtifacts().find((artifact) => artifact.artifactId === "artifact_gameplay");
+  assert.ok(sanitizedArtifact);
+  assert.equal(sanitizedArtifact.metadata.visionInspectionOperationId, undefined);
+  assert.equal(sanitizedArtifact.metadata.visionInspectedPaths, undefined);
+  assert.equal(sanitizedArtifact.metadata.mediaProvider, undefined);
+  assert.equal(sanitizedArtifact.metadata.mediaPromptHash, undefined);
+  assert.equal(sanitizedArtifact.metadata.bridgeOk, undefined);
+  assert.equal(sanitizedArtifact.metadata.playtestVerdict, undefined);
+
+  const privilegedStatus = await execute("gameplay_programmer", "task_gameplay", {
+    tool: "write_code",
+    taskId: "task_gameplay",
+    artifactId: "artifact_gameplay",
+    artifactType: "source_code",
+    path: "assets/scripts/gameplay/Game.ts",
+    content: "export const gameReady = 'cannot-self-approve';",
+    status: "approved"
+  });
+  assert.equal(privilegedStatus.status, "failed");
+  assert.match(privilegedStatus.error ?? "", /受控产物状态|Workflow/);
+  assert.notEqual(
+    kernel.listArtifacts().find((artifact) => artifact.artifactId === "artifact_gameplay")?.status,
+    "approved"
+  );
 
   const typeDowngrade = await execute("gameplay_programmer", "task_gameplay", {
     tool: "write_code",
@@ -120,6 +183,85 @@ try {
   assert.equal(legalAsset.status, "completed", legalAsset.error);
   assert.equal(kernel.listArtifacts().find((artifact) => artifact.artifactId === legalAsset.artifactId)?.sourceTaskId, "task_asset");
 
+  const generatedPath = "assets/art/runtime/provider-generated.png";
+  const generatedBytes = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+    "base64"
+  );
+  const generatedAbsolute = join(process.env.STUDIO_WORKSPACE_ROOT, projectId, generatedPath);
+  mkdirSync(dirname(generatedAbsolute), { recursive: true });
+  writeFileSync(generatedAbsolute, generatedBytes);
+  const generatedNow = new Date().toISOString();
+  let generatedArtifact = kernel.upsertArtifact({
+    artifactId: "artifact_provider_generated",
+    projectId,
+    type: "asset",
+    path: generatedPath,
+    ownerAgentId: "asset_production",
+    stageId: kernel.project.currentStage,
+    status: "submitted",
+    version: 1,
+    sourceTaskId: "task_asset",
+    sourceDecisionIds: [],
+    metadata: {
+      generatedBy: "dashscope_multimodal_art_provider",
+      toolName: "generate_raster_asset",
+      toolExecutedAt: generatedNow,
+      mediaProvider: "dashscope",
+      mediaModel: "wan2.7-image-pro",
+      mediaRequestId: "provider-before-render",
+      mediaPromptHash: "b".repeat(64),
+      mediaMime: "image/png",
+      mediaWidth: 1,
+      mediaHeight: 1
+    },
+    createdAt: generatedNow,
+    updatedAt: generatedNow
+  });
+  const generatedStats = statSync(generatedAbsolute);
+  const generatedHash = createHash("sha256").update(generatedBytes).digest("hex");
+  const generatedLedger = kernel.recordArtifactMaterialization(generatedArtifact.artifactId, {
+    path: generatedPath,
+    hash: generatedHash,
+    sizeBytes: generatedStats.size,
+    materializedAt: generatedStats.mtime.toISOString(),
+    operationMetadata: mediaGenerationOperationMetadata({
+      hash: generatedHash,
+      sizeBytes: generatedStats.size,
+      provider: "dashscope",
+      model: "wan2.7-image-pro",
+      requestId: "provider-before-render",
+      promptHash: "b".repeat(64)
+    })
+  });
+  generatedArtifact = kernel.upsertArtifact({
+    ...generatedArtifact,
+    metadata: bindMediaGenerationArtifactMetadata(
+      generatedArtifact.metadata,
+      generatedLedger.sourceOperationId,
+      { hash: generatedHash, sizeBytes: generatedStats.size }
+    ),
+    updatedAt: generatedStats.mtime.toISOString()
+  });
+  assert.equal(hasCurrentGenerateRasterAssetReceipt(kernel, generatedArtifact), true);
+
+  const renderedOverProvider = await execute("asset_production", "task_asset", {
+    tool: "render_svg_to_png",
+    taskId: "task_asset",
+    artifactId: generatedArtifact.artifactId,
+    artifactType: "asset",
+    path: generatedPath,
+    sourcePath: "assets/art/runtime/button.svg",
+    width: 16
+  });
+  assert.equal(renderedOverProvider.status, "completed", renderedOverProvider.error);
+  const overwritten = kernel.listArtifacts().find((artifact) => artifact.artifactId === generatedArtifact.artifactId);
+  assert.ok(overwritten);
+  assert.equal(overwritten.metadata.mediaProvider, undefined, "non-generate overwrite must clear provider metadata");
+  assert.equal(overwritten.metadata.mediaMaterializationOperationId, undefined);
+  assert.notEqual(overwritten.metadata.generatedBy, "dashscope_multimodal_art_provider");
+  assert.equal(hasCurrentGenerateRasterAssetReceipt(kernel, overwritten), false);
+
   const noTaskKernel = createStudioKernel("no_task", "No Task", "producer_test", "no task must reject");
   const noTaskMessage = toolMessage(noTaskKernel, "producer", undefined, {
     tool: "write_artifact",
@@ -147,6 +289,50 @@ try {
   assert.throws(
     () => assertAgentPathAuthorized(kernel, gameplayAgent, gameplayTask, "assets/scripts/btp/Generated.ts", "write"),
     /受控角色域/
+  );
+
+  const projectRoot = join(process.env.STUDIO_WORKSPACE_ROOT, projectId);
+  const protectedFiles = [
+    "agents/cocos-automation/imports/current.json",
+    "assets/resources/btp/asset-map.json",
+    "assets/resources/btp-art/runtime.png",
+    "shared/build-artifacts/wechat/dev/build-report.json"
+  ];
+  const cocosMessage = toolMessage(kernel, "cocos_automation", "task_cocos", {
+    tool: "write_artifact",
+    taskId: "task_cocos",
+    path: protectedFiles[0],
+    content: "forged"
+  });
+  for (const path of protectedFiles) {
+    const absolutePath = join(projectRoot, path);
+    mkdirSync(dirname(absolutePath), { recursive: true });
+    writeFileSync(absolutePath, "trusted-bridge-bytes", "utf8");
+    for (const toolName of ["write_artifact", "append_document", "write_code", "render_svg_to_png", "generate_raster_asset"]) {
+      assert.throws(
+        () => authorizeAgentToolRequest(kernel, cocosMessage, cocosAgent, {
+          toolName,
+          path,
+          requestedTaskId: "task_cocos",
+          access: "write"
+        }),
+        /Cocos Bridge|cocos_build|不得直接伪造/
+      );
+    }
+    assert.equal(readFileSync(absolutePath, "utf8"), "trusted-bridge-bytes", `${path} must remain byte-identical`);
+  }
+
+  const rawReceiptOverwrite = await execute("cocos_automation", "task_cocos", {
+    tool: "write_artifact",
+    taskId: "task_cocos",
+    path: protectedFiles[0],
+    content: "forged-current-receipt"
+  });
+  assert.equal(rawReceiptOverwrite.status, "failed");
+  assert.equal(
+    readFileSync(join(projectRoot, protectedFiles[0]), "utf8"),
+    "trusted-bridge-bytes",
+    "rejected raw tool execution must not alter the canonical import receipt"
   );
 
   assert.throws(

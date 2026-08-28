@@ -1,5 +1,7 @@
 import type { AgentContract, AgentHarnessId, AgentLoopControl, AgentSessionScope, Artifact, ArtifactDirectoryManifest, ArtifactInputProvenance } from "@game-pipeline/shared-schemas";
 import type { ModelProviderConfig } from "./modelSettings.js";
+import type { ArtVisionAuthoritativeContextEvidence, ArtVisionSemanticResult } from "./multimodalArtProvider.js";
+import type { VisionSemanticInspectionReceipt } from "./qualityReviewArtifacts.js";
 
 export type AgentHarnessProgressType = "started" | "model_output" | "tool_started" | "tool_completed" | "completed" | "failed";
 
@@ -31,6 +33,7 @@ export interface AgentHarnessRunInput {
   sessionScope?: AgentSessionScope;
   sessionId?: string;
   timeoutMs?: number;
+  initialProgressTimeoutMs?: number;
   idleTimeoutMs?: number;
   effort?: "low" | "medium" | "high" | "max";
   includePartialMessages?: boolean;
@@ -78,6 +81,7 @@ export interface AgentHarnessRunResult {
 export interface AgentHarnessToolOperation {
   toolName: string;
   path: string;
+  access?: "read" | "write";
   status?: "completed" | "failed";
   bridgeOk?: boolean;
   operationId?: string;
@@ -86,6 +90,26 @@ export interface AgentHarnessToolOperation {
   error?: string;
   hash?: string;
   sizeBytes?: number;
+  providerId?: string;
+  model?: string;
+  requestId?: string;
+  promptHash?: string;
+  negativePromptHash?: string;
+  seed?: number;
+  width?: number;
+  height?: number;
+  mime?: string;
+  endpointFingerprint?: string;
+  latencyMs?: number;
+  inspectedPaths?: string[];
+  inspectedEvidence?: Array<{ path: string; hash: string; sizeBytes: number }>;
+  visionResponseHash?: string;
+  visionSemanticHash?: string;
+  visionSemanticResult?: ArtVisionSemanticResult;
+  authoritativeContextEvidence?: ArtVisionAuthoritativeContextEvidence[];
+  authoritativeContextHash?: string;
+  requestSemanticHash?: string;
+  visionSemanticReceipts?: VisionSemanticInspectionReceipt[];
   recordedAt?: string;
 }
 
