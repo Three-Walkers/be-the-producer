@@ -9,6 +9,11 @@ export type MemoryId = string;
 export type AuditEventId = string;
 export type OperationId = string;
 export type ClaimId = string;
+export type TaskEpisodeId = string;
+export type AuditRunId = string;
+export type EvidenceBundleId = string;
+export type AuditFindingId = string;
+export type InterventionId = string;
 export type AgentHarnessId = "direct-api" | "claude-cli";
 
 export type AgentSessionScope = "room" | "task_child";
@@ -443,6 +448,7 @@ export interface Artifact {
     | "source_code"
     | "build"
     | "qa_report"
+    | "quality_review"
     | "bug_report"
     | "deployment_plan"
     | "deployment_report"
@@ -493,6 +499,48 @@ export interface ArtifactDirectoryManifest {
   rootPath: string;
   files: ArtifactDirectoryManifestEntry[];
   digest: string;
+}
+
+/** Immutable byte evidence used by the Cocos asset-import boundary. */
+export interface CocosFileByteEvidence {
+  path: string;
+  hash: string;
+  sizeBytes: number;
+}
+
+/** One manifest runtime asset copied into Cocos' resources tree. */
+export interface CocosImportedAssetReceipt {
+  assetId: string;
+  source: CocosFileByteEvidence;
+  destination: CocosFileByteEvidence;
+  resourcePath: string;
+}
+
+/**
+ * Canonical receipt for the latest successful Cocos asset import.  A build is
+ * allowed only while this exact receipt still matches the manifest, every
+ * source runtime asset, and every copied Cocos destination byte-for-byte.
+ */
+export interface CocosAssetImportReceipt {
+  schemaVersion: 1;
+  kind: "cocos_asset_import_receipt";
+  operationId: string;
+  operationType: "import_assets";
+  status: "completed";
+  createdAt: string;
+  manifest: CocosFileByteEvidence;
+  imported: CocosImportedAssetReceipt[];
+  importedDigest: string;
+  importMode: "copied_to_assets_resources";
+}
+
+/** Receipt identity frozen into a successful Cocos build report. */
+export interface CocosBuildImportReceiptBinding {
+  receipt: CocosFileByteEvidence;
+  operationId: string;
+  manifest: CocosFileByteEvidence;
+  importedAssetCount: number;
+  importedDigest: string;
 }
 
 export interface ArtifactOperation {
@@ -572,6 +620,155 @@ export interface ClaimRepair {
   resolvedAt?: string;
   resolution?: ClaimRepairResolution;
   resolutionClaimId?: ClaimId;
+}
+
+export type TaskEpisodeStatus = "open" | "reviewing" | "accepted" | "rework" | "closed";
+
+/**
+ * A bounded producer goal and its observable acceptance boundary. Episodes span
+ * discussion and the corresponding review stage so audit evidence is not split
+ * merely because the workflow entered a gate.
+ */
+export interface TaskEpisode {
+  episodeId: TaskEpisodeId;
+  projectId: ProjectId;
+  scope: "concept" | "first_playable" | "release" | "deployment" | "liveops";
+  stageIds: StageId[];
+  currentStageId: StageId;
+  goal: string;
+  acceptanceBoundary: string[];
+  status: TaskEpisodeStatus;
+  producerMessageIds: MessageId[];
+  roomIds: RoomId[];
+  taskIds: TaskId[];
+  artifactIds: ArtifactId[];
+  sessionKeys: string[];
+  startedAt: string;
+  updatedAt: string;
+  closedAt?: string;
+  outcome?: string;
+}
+
+export type AuditEvidenceLaneKind = "session" | "artifact" | "validation" | "decision_delivery";
+export type AuditEvidenceLaneStatus = "available" | "partial" | "unavailable";
+export type AuditEvidenceFactStatus = "observed" | "verified" | "failed" | "unobserved";
+
+export interface AuditEvidenceFact {
+  ref: string;
+  refType: "message" | "session" | "task" | "artifact" | "ledger" | "claim" | "workflow" | "decision" | "validation" | "handoff";
+  summary: string;
+  status: AuditEvidenceFactStatus;
+  digest?: string;
+}
+
+export interface AuditEvidenceLane {
+  kind: AuditEvidenceLaneKind;
+  status: AuditEvidenceLaneStatus;
+  facts: AuditEvidenceFact[];
+  missing: string[];
+}
+
+export type ProductionAuditTrigger = "checkpoint" | "task_review" | "stage_gate" | "release_gate" | "manual";
+
+export interface ProductionEvidenceBundle {
+  bundleId: EvidenceBundleId;
+  projectId: ProjectId;
+  episodeId: TaskEpisodeId;
+  trigger: ProductionAuditTrigger;
+  triggerRef: string;
+  stageId: StageId;
+  status: "complete" | "partial" | "failed";
+  lanes: AuditEvidenceLane[];
+  digest: string;
+  frozenAt: string;
+}
+
+export type ProductionAuditSeverity = "critical" | "high" | "medium" | "low";
+export type ProductionAuditDimension =
+  | "intent_alignment"
+  | "controlled_production"
+  | "artifact_integrity"
+  | "quality_validation"
+  | "delivery_recoverability"
+  | "learning_capture";
+export type ProductionAuditFindingStatus = "open" | "resolved" | "waived";
+
+export interface ProductionAuditFinding {
+  findingId: AuditFindingId;
+  signature: string;
+  projectId: ProjectId;
+  auditRunId: AuditRunId;
+  episodeId: TaskEpisodeId;
+  taskId?: TaskId;
+  artifactId?: ArtifactId;
+  ownerAgentId: AgentId;
+  severity: ProductionAuditSeverity;
+  dimension: ProductionAuditDimension;
+  title: string;
+  reason: string;
+  evidenceRefs: string[];
+  expectedOutcome: string;
+  repairBoundary: string;
+  acceptanceChecks: string[];
+  status: ProductionAuditFindingStatus;
+  createdAt: string;
+  updatedAt: string;
+  resolvedAt?: string;
+}
+
+export interface ProductionAuditReportPaths {
+  episode: string;
+  evidenceBundle: string;
+  findings: string;
+  markdown: string;
+  html: string;
+  manifest: string;
+}
+
+export interface ProductionAuditRun {
+  auditRunId: AuditRunId;
+  projectId: ProjectId;
+  episodeId: TaskEpisodeId;
+  bundleId: EvidenceBundleId;
+  trigger: ProductionAuditTrigger;
+  triggerRef: string;
+  stageId: StageId;
+  status: "complete" | "partial" | "blocked";
+  blocking: boolean;
+  findingIds: AuditFindingId[];
+  findings: ProductionAuditFinding[];
+  /** Frozen at audit creation so later Episode reconciliation cannot rewrite history. */
+  episodeSnapshot?: TaskEpisode;
+  /** Frozen at audit creation so report rendering never reads a mutable bundle index. */
+  evidenceBundleSnapshot?: ProductionEvidenceBundle;
+  reportPaths: ProductionAuditReportPaths;
+  evidenceDigest: string;
+  createdAt: string;
+}
+
+export type InterventionStatus = "pending" | "improving" | "unchanged" | "regressing" | "outcome_supported";
+
+export interface InterventionMeasurement {
+  label: string;
+  value: string;
+  evidenceRefs: string[];
+  observedAt: string;
+}
+
+export interface InterventionLedgerEntry {
+  interventionId: InterventionId;
+  projectId: ProjectId;
+  episodeId: TaskEpisodeId;
+  findingId: AuditFindingId;
+  ownerAgentId: AgentId;
+  action: string;
+  expectedOutcome: string;
+  stopOrRevertCondition: string;
+  status: InterventionStatus;
+  baseline: InterventionMeasurement;
+  comparison?: InterventionMeasurement;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface MemoryRecord {
