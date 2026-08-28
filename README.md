@@ -60,8 +60,10 @@ The product is organized as a role-based multi-agent studio. Each agent owns a c
 | Studio Orchestrator | Controls workflow state, routing, task creation, phase gates, and cross-agent coordination. | Stage plan, task graph, decision requests, project status. |
 | Producer Agent | Converts producer intent into scope, schedule, risks, and milestone reviews. | Production plan, backlog, risk log, review agenda, decision log. |
 | Game Designer Agent | Designs core loop, rules, progression, levels, balance, and player goals. | GDD, GameContract, level specs, economy and balance specs. |
-| Art Director Agent | Defines visual style, UI direction, readability rules, color palette, animation tone, and asset quality bar. | Art Bible, style board, UI visual spec, asset review notes. |
+| Design Quality Reviewer | Independently evaluates the GDD and GameContract against a server-fixed mobile-game design rubric. | Version/hash-bound design quality review and actionable change requests. |
+| Art Director Agent | Defines visual style, UI direction, readability rules, color palette, animation tone, and asset quality bar. | Art Bible, real raster direction board, UI visual spec. |
 | Asset Production Agent | Produces, normalizes, packages, and version-controls game assets. | Sprites, UI assets, sprite sheets, animation strips, asset manifest. |
+| Visual Quality Reviewer | Independently inspects actual image pixels for art direction, readability, technical quality, and IP risk. | Version/hash-bound visual quality review and pixel evidence. |
 | Cocos Tech Lead Agent | Owns Cocos architecture, scene structure, prefab strategy, asset loading, performance budget, and technical standards. | Technical design, SceneBlueprint, module plan, performance checklist. |
 | Gameplay Programmer Agent | Implements game systems, UI logic, gameplay rules, data loading, and integration code. | TypeScript code, Cocos components, implementation notes, code change log. |
 | Cocos Automation Agent | Operates Cocos through an engine bridge or MCP layer. | Scene operations, prefab updates, asset imports, build logs, editor snapshots. |
@@ -144,8 +146,10 @@ This stage handles the early ambiguity of the producer's idea. The producer may 
 Primary agents:
 
 - Game Designer Agent.
+- Design Quality Reviewer.
 - Producer Agent.
-- Art Director Agent, lightly involved.
+- Art Director Agent.
+- Visual Quality Reviewer.
 - Studio Orchestrator.
 
 Main tasks:
@@ -154,7 +158,8 @@ Main tasks:
 - Define genre, core loop, win and fail conditions.
 - Define player fantasy, theme, worldview, and tone.
 - Create initial GDD.
-- Create early art direction and reference board.
+- Create GameContract, Art Bible, and a real raster direction board.
+- Run independent design and visual reviews against fixed rubrics.
 - Define scope for the first playable.
 - Request producer approval before development starts.
 
@@ -162,8 +167,8 @@ Exit criteria:
 
 - Approved core loop.
 - Approved project scope.
-- Approved GDD baseline.
-- Approved art direction.
+- Current passing design-quality receipt for the GDD and GameContract.
+- Current passing visual-quality receipt for the Art Bible and direction board.
 - Initial backlog and milestone plan.
 
 ### Stage 2: Production and Playable Implementation
@@ -174,6 +179,7 @@ Primary agents:
 
 - Art Director Agent.
 - Asset Production Agent.
+- Visual Quality Reviewer.
 - Cocos Tech Lead Agent.
 - Gameplay Programmer Agent.
 - Cocos Automation Agent.
@@ -182,7 +188,8 @@ Primary agents:
 
 Main tasks:
 
-- Produce and normalize art assets.
+- Produce real raster runtime assets through a controlled image model.
+- Inspect the contact sheet and every manifest runtime PNG with a vision model.
 - Import assets into Cocos.
 - Implement gameplay logic and UI.
 - Build scenes and prefabs through a controlled Cocos engine bridge.
@@ -195,7 +202,7 @@ Exit criteria:
 
 - Playable core loop.
 - No critical runtime errors.
-- Art assets integrated and traceable.
+- Art assets integrated, traceable, and covered by a current passing visual-quality receipt.
 - QA report completed.
 - Producer accepts the first playable or submits change requests.
 
@@ -516,4 +523,4 @@ The architecture uses Clowder-style multi-agent rooms, agent registries, message
 
 ## Current Status
 
-This repository is currently a local vertical MVP. Versioned GameContract, SceneBlueprint, and PlaytestContract artifacts have strict validation and cross-contract gates; the Cocos Bridge is declarative and genre-neutral, and QA executes contract scenarios against public runtime facts with bound evidence. A replayable Workflow Aggregate now owns reviews, producer decisions, changes, waivers, rollbacks, and LiveOps iterations. Tool execution is bound to the Agent, current task, immutable artifact identity, and path; Claude MCP room sessions are read-only. The Artifact Ledger freezes input versions and hashes, builds carry complete file manifests, and stale builds, stale QA, external tampering, or symlink traversal fail before consumption. Local project state uses atomic replacement, a last-known-good backup, and corruption isolation. Non-loopback API binding requires a Bearer token and adds origin controls, body limits, and baseline security headers. Automated tap-defense, puzzle, runner, and endless fixtures prove that the core layers no longer depend on one sample, but three real Cocos games have not yet completed end-to-end delivery. A production database and distributed invocation queue/leases, Secret Vault, isolated build workers, real WeChat release, generated-game Runtime Adapters, real prefab materialization, and the production LiveOps loop remain under construction, so this is not yet the complete product system described above.
+This repository is currently a local vertical MVP. Versioned GameContract, SceneBlueprint, PlaytestContract, Asset Manifest v2, and ArtifactQualityReview artifacts have strict validation and evidence-bound gates. Design and visual authors are separated from independent quality reviewers; fixed server-side rubrics prevent reviewers from lowering thresholds. The art path now uses a controlled DashScope image model for real PNG creation and a separate vision model for pixel inspection, with provider, request, prompt hash, seed, dimensions, semantic-review, and inspected-image hash evidence. PNG alpha policies are decoded and checked from pixels, while Cocos builds are bound to the exact current import receipt and source/destination asset bytes. The Cocos Bridge is declarative and genre-neutral, and QA executes contract scenarios against public runtime facts with bound evidence. A replayable Workflow Aggregate owns reviews, producer decisions, changes, waivers, rollbacks, and LiveOps iterations. Tool execution is bound to the Agent, current task, immutable artifact identity, and path; Claude MCP room sessions are read-only. The Artifact Ledger freezes input versions and hashes, builds carry complete file manifests, and stale builds, stale QA, stale quality reviews, external tampering, or symlink traversal fail before consumption. Automated fixtures prove the core layers no longer depend on one sample, but three real Cocos games have not yet completed end-to-end delivery. A production database and distributed invocation queue/leases, project media budgets, isolated build workers, real WeChat release, high-quality automatic background removal/edge post-processing, real prefab materialization, and the production LiveOps loop remain under construction, so this is not yet the complete product system described above.
