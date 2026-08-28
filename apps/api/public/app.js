@@ -12,6 +12,7 @@ const state = {
   agentActivities: [],
   taskBoard: null,
   artifacts: [],
+  productionAudit: null,
   workspace: null,
   agentLoop: null,
   modelProviders: [],
@@ -94,8 +95,10 @@ const agentLabels = {
   studio_orchestrator: "总控 Agent",
   producer: "制作人协调",
   game_designer: "策划 Agent",
+  design_quality_reviewer: "策划质量总监",
   art_director: "美术导演 Agent",
   asset_production: "资产生产 Agent",
+  visual_quality_reviewer: "视觉质量总监",
   cocos_tech_lead: "Cocos 架构 Agent",
   gameplay_programmer: "玩法程序 Agent",
   cocos_automation: "Cocos 自动化 Agent",
@@ -117,8 +120,10 @@ const mentionCandidates = [
   { agentId: "studio_orchestrator", token: "总控", aliases: ["studio_orchestrator", "orchestrator", "调度", "主持人"] },
   { agentId: "producer", token: "制作人协调", aliases: ["producer", "producer_agent", "制作"] },
   { agentId: "game_designer", token: "策划", aliases: ["game_designer", "游戏策划", "designer"] },
+  { agentId: "design_quality_reviewer", token: "策划审查", aliases: ["design_quality_reviewer", "策划质量", "设计审查"] },
   { agentId: "art_director", token: "美术", aliases: ["art_director", "美术导演", "art"] },
   { agentId: "asset_production", token: "资产", aliases: ["asset_production", "资产生产"] },
+  { agentId: "visual_quality_reviewer", token: "视觉审查", aliases: ["visual_quality_reviewer", "视觉质量", "美术审查"] },
   { agentId: "cocos_tech_lead", token: "架构", aliases: ["cocos_tech_lead", "cocos", "技术负责人", "工程结构"] },
   { agentId: "gameplay_programmer", token: "程序", aliases: ["gameplay_programmer", "玩法程序", "开发"] },
   { agentId: "cocos_automation", token: "自动化", aliases: ["cocos_automation", "编辑器"] },
@@ -135,9 +140,11 @@ const avatarThemes = {
   producer: { initial: "制", color: "#8a6a2a" },
   studio_orchestrator: { initial: "总", color: "#2f7d66" },
   game_designer: { initial: "策", color: "#4f6fb3" },
+  design_quality_reviewer: { initial: "审", color: "#6b54a3" },
   producer_agent: { initial: "制", color: "#8a6a2a" },
   art_director: { initial: "美", color: "#b45a7f" },
   asset_production: { initial: "资", color: "#a0672b" },
+  visual_quality_reviewer: { initial: "鉴", color: "#8d4e74" },
   cocos_tech_lead: { initial: "架", color: "#52606d" },
   gameplay_programmer: { initial: "程", color: "#2d6d91" },
   cocos_automation: { initial: "构", color: "#5b6cbb" },
@@ -151,14 +158,14 @@ const teamDefinitions = [
   {
     teamId: "design",
     name: "策划团队",
-    agents: ["game_designer", "producer"],
-    taskOwners: ["game_designer"],
+    agents: ["game_designer", "design_quality_reviewer", "producer"],
+    taskOwners: ["game_designer", "design_quality_reviewer"],
     idle: "等待项目启动，启动后先进行立项、机制和第一可玩范围讨论。"
   },
   {
     teamId: "art",
     name: "美术团队",
-    agents: ["art_director", "asset_production"],
+    agents: ["art_director", "asset_production", "visual_quality_reviewer"],
     idle: "等待项目启动，启动后确认视觉方向并进入资产生产。"
   },
   {
@@ -187,6 +194,7 @@ const artifactTypeLabels = {
   asset_spec: "资产规格",
   asset: "美术资产",
   asset_manifest: "资产清单",
+  quality_review: "独立质量审查",
   scene_blueprint: "场景蓝图",
   source_code: "代码变更",
   build: "可玩构建",
@@ -891,13 +899,14 @@ function buildPresetMessage(presetId, preset) {
 async function refreshProject() {
   ensureProject();
   const projectId = state.projectId;
-  const [project, rooms, messages, activities, taskBoard, artifacts, workspace, agentLoop] = await Promise.all([
+  const [project, rooms, messages, activities, taskBoard, artifacts, productionAudit, workspace, agentLoop] = await Promise.all([
     request(`/projects/${projectId}`),
     request(`/projects/${projectId}/rooms`),
     request(`/projects/${projectId}/messages`),
     request(`/projects/${projectId}/activities`),
     request(`/projects/${projectId}/task-board`),
     request(`/projects/${projectId}/artifacts`),
+    request(`/projects/${projectId}/production-audit`),
     request(`/projects/${projectId}/workspace-tree`),
     request(`/projects/${projectId}/agent-loop`)
   ]);
@@ -912,6 +921,7 @@ async function refreshProject() {
   state.agentActivities = activities.activities;
   state.taskBoard = taskBoard.taskBoard;
   state.artifacts = artifacts.artifacts;
+  state.productionAudit = productionAudit;
   state.workspace = workspace;
   state.agentLoop = agentLoop.agentLoop;
   render();
@@ -943,6 +953,7 @@ function render() {
   renderMessages();
   renderTaskBoard();
   renderArtifacts();
+  renderProductionAudit();
   renderWorkspace();
 }
 
@@ -1814,7 +1825,7 @@ function renderMessages() {
             <span>${escapeHtml(sender)} · ${escapeHtml(message.messageType)}${escapeHtml(statusText)}</span>
             <span>${new Date(message.createdAt).toLocaleTimeString()}</span>
           </div>
-          <div class="message-content">${renderMessageContent(message.content)}</div>
+          <div class="message-content">${renderMessageContent(message)}</div>
           ${renderMessageActivityTimeline(message)}
           ${renderClaimVerifications(message)}
         </div>
@@ -1884,16 +1895,31 @@ function renderActivityStep(step, compact) {
 }
 
 function renderActivityDetail(detail) {
-  const candidate = normalizeWorkspacePathCandidate(detail);
-  return candidate ? workspacePathLink(candidate.path, candidate.label) : escapeHtml(detail);
+  const safeDetail = sanitizeLegacyHarnessFailure(detail);
+  const candidate = normalizeWorkspacePathCandidate(safeDetail);
+  return candidate ? workspacePathLink(candidate.path, candidate.label) : escapeHtml(safeDetail);
 }
 
 function isNearScrollBottom(element) {
   return element.scrollHeight - element.scrollTop - element.clientHeight < 80;
 }
 
-function renderMessageContent(content) {
-  return renderMarkdown(String(content ?? ""));
+function renderMessageContent(message) {
+  return renderMarkdown(sanitizeLegacyHarnessFailure(String(message?.content ?? "")));
+}
+
+function sanitizeLegacyHarnessFailure(value) {
+  const content = String(value ?? "");
+  const initEventIndex = content.search(/\{\s*"type"\s*:\s*"system"\s*,\s*"subtype"\s*:\s*"init"/i);
+  if (initEventIndex < 0) {
+    return content;
+  }
+
+  const rawPrefix = content.slice(0, initEventIndex).replace(/[：:\s]+$/g, "");
+  const exitCode = /code=([^,）)]+)/i.exec(rawPrefix)?.[1]?.trim();
+  const prefix = rawPrefix.replace(/Claude CLI 退出异常（code=[^）]+）$/i, "Claude CLI 会话失败");
+  const exitLabel = exitCode ? `（退出码 ${exitCode}）` : "";
+  return `${prefix}${exitLabel}。旧版错误记录只捕获了 CLI 初始化事件，真实退出原因未被正确提取；原始 JSON 已从聊天视图隐藏，本次任务没有形成可验收结果。`;
 }
 
 function renderMarkdown(text) {
@@ -2212,6 +2238,45 @@ function renderArtifacts() {
       openArtifactInFinder(button.closest("[data-artifact-id]").dataset.artifactId).catch((error) => showToast(error.message));
     });
   });
+}
+
+function renderProductionAudit() {
+  const panel = $("#production-audit");
+  if (!state.project || !isProjectStarted()) {
+    $("#audit-summary").textContent = "待启动";
+    panel.innerHTML = '<div class="producer-empty-panel"><strong>暂无审计运行</strong><span>项目启动后会按 Task Episode 冻结四条独立证据通道。</span></div>';
+    return;
+  }
+  const audit = state.productionAudit;
+  const run = audit?.latestRun;
+  const bundle = audit?.latestBundle;
+  if (!run || !bundle) {
+    $("#audit-summary").textContent = "等待证据";
+    panel.innerHTML = '<div class="producer-empty-panel"><strong>正在建立证据包</strong><span>首次 checkpoint 后会生成项目内审计报告。</span></div>';
+    return;
+  }
+  const openFindings = (audit.findings ?? []).filter((finding) => finding.status === "open");
+  const blocking = openFindings.filter((finding) => ["critical", "high"].includes(finding.severity));
+  $("#audit-summary").textContent = blocking.length ? `阻塞 ${blocking.length}` : run.status === "complete" ? "通过" : "部分证据";
+  const laneLabels = {
+    session: "会话",
+    artifact: "产物",
+    validation: "验证",
+    decision_delivery: "决策交付"
+  };
+  panel.innerHTML = `<div class="audit-run-head">
+      <div><strong>${escapeHtml(run.trigger === "task_review" ? "任务评审审计" : run.trigger === "release_gate" ? "发布门禁审计" : run.trigger === "stage_gate" ? "阶段门禁审计" : "过程审计")}</strong><span>${escapeHtml(stageLabels[run.stageId] ?? run.stageId)} · ${new Date(run.createdAt).toLocaleTimeString()}</span></div>
+      <button class="deliverable-action-button" data-open-audit-report type="button" title="在 Finder 打开审计报告" aria-label="在 Finder 打开审计报告">${folderIcon()}</button>
+    </div>
+    <div class="audit-lanes">${bundle.lanes.map((lane) => `<div class="audit-lane audit-${escapeHtml(lane.status)}"><span>${escapeHtml(laneLabels[lane.kind] ?? lane.kind)}</span><strong>${escapeHtml(auditEvidenceStatus(lane.status))}</strong></div>`).join("")}</div>
+    ${openFindings.length ? `<div class="audit-findings">${openFindings.slice(0, 3).map((finding) => `<div class="audit-finding audit-severity-${escapeHtml(finding.severity)}"><strong>${escapeHtml(finding.title)}</strong><span>${escapeHtml(agentName(finding.ownerAgentId))} · ${escapeHtml(finding.reason)}</span></div>`).join("")}</div>` : '<div class="audit-clear">当前没有开放 Finding。</div>'}`;
+  panel.querySelector("[data-open-audit-report]")?.addEventListener("click", () => {
+    openWorkspacePath(run.reportPaths.markdown).catch((error) => showToast(error.message));
+  });
+}
+
+function auditEvidenceStatus(status) {
+  return status === "available" ? "完整" : status === "partial" ? "部分" : "缺失";
 }
 
 async function previewArtifact(artifactId) {

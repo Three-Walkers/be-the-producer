@@ -130,7 +130,7 @@ textarea {
 
 .workspace-column {
   display: grid;
-  grid-template-rows: minmax(180px, 0.36fr) minmax(180px, 0.36fr) minmax(0, 1fr);
+  grid-template-rows: minmax(160px, 0.32fr) minmax(160px, 0.32fr) minmax(160px, 0.32fr) minmax(0, 1fr);
   gap: 16px;
   border-right: 0;
   border-left: 1px solid var(--line);
@@ -1178,6 +1178,7 @@ textarea {
 .message-list {
   display: grid;
   gap: 12px;
+  min-width: 0;
   min-height: min-content;
 }
 
@@ -1198,6 +1199,8 @@ textarea {
   grid-template-columns: 36px minmax(0, 1fr);
   gap: 10px;
   align-items: start;
+  width: min(86%, 100%);
+  min-width: 0;
   max-width: 86%;
 }
 
@@ -1331,8 +1334,10 @@ textarea {
 
 .agent-activity-step small {
   display: block;
+  max-width: 100%;
   margin-top: 1px;
   overflow-wrap: anywhere;
+  word-break: break-word;
   color: var(--muted);
 }
 
@@ -1371,6 +1376,7 @@ textarea {
 
 .message-body {
   min-width: 0;
+  max-width: 100%;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--surface);
@@ -1386,8 +1392,22 @@ textarea {
   font-size: 12px;
 }
 
+.message-meta span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .message-content {
+  min-width: 0;
+  max-width: 100%;
   line-height: 1.55;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.message-content > * {
+  min-width: 0;
+  max-width: 100%;
 }
 
 .message-content p {
@@ -1517,6 +1537,7 @@ textarea {
 
 .workspace-path-link {
   display: inline;
+  max-width: 100%;
   min-height: 0;
   border: 0;
   border-radius: 3px;
@@ -1527,6 +1548,9 @@ textarea {
   font-weight: 650;
   line-height: inherit;
   vertical-align: baseline;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .workspace-path-link:hover,
@@ -1537,11 +1561,16 @@ textarea {
 }
 
 .message-inline-code {
+  display: inline;
+  max-width: 100%;
   border-radius: 3px;
   background: rgba(31, 37, 36, 0.06);
   padding: 0 3px;
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   font-size: 0.95em;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .message-code-block {
@@ -1556,7 +1585,10 @@ textarea {
 
 .message-code-block code {
   display: block;
-  white-space: pre;
+  max-width: 100%;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   font-size: 12px;
   line-height: 1.5;
@@ -1735,6 +1767,7 @@ textarea {
 
 .task-board,
 .artifact-list,
+.production-audit,
 .workspace-tree {
   display: grid;
   align-content: start;
@@ -1742,6 +1775,92 @@ textarea {
   min-height: 0;
   max-height: none;
   overflow-y: auto;
+}
+
+.production-audit {
+  display: grid;
+  align-content: start;
+  gap: 10px;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.audit-run-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.audit-run-head > div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.audit-run-head span,
+.audit-finding span {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.audit-lanes {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.audit-lane {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #f8faf8;
+  padding: 6px 8px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.audit-lane strong {
+  color: var(--accent-strong);
+}
+
+.audit-lane.audit-partial strong {
+  color: #a56612;
+}
+
+.audit-lane.audit-unavailable strong {
+  color: #b33f3f;
+}
+
+.audit-findings {
+  display: grid;
+  gap: 6px;
+}
+
+.audit-finding {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+  border-left: 3px solid #d08a2d;
+  padding-left: 8px;
+  font-size: 12px;
+}
+
+.audit-finding.audit-severity-critical,
+.audit-finding.audit-severity-high {
+  border-left-color: #c94747;
+}
+
+.audit-clear {
+  color: var(--accent-strong);
+  font-size: 12px;
 }
 
 .task-group {
