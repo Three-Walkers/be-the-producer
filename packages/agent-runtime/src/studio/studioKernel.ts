@@ -13,7 +13,11 @@ import type {
   ClaimRepair,
   ClaimVerification,
   ContextPacket,
+  InterventionLedgerEntry,
   MemoryRecord,
+  ProductionAuditFinding,
+  ProductionAuditRun,
+  ProductionEvidenceBundle,
   Project,
   ProjectId,
   Room,
@@ -22,6 +26,7 @@ import type {
   StageId,
   StudioMessage,
   Task,
+  TaskEpisode,
   TaskBoardSnapshot
 } from "@game-pipeline/shared-schemas";
 import { AgentRegistry } from "../agents/agentRegistry.js";
@@ -57,9 +62,14 @@ export interface StudioKernelState {
   agentSessions: AgentSessionRecord[];
   contextPackets: ContextPacket[];
   handoffCapsules: SessionHandoffCapsule[];
+  taskEpisodes: TaskEpisode[];
+  evidenceBundles: ProductionEvidenceBundle[];
+  productionAuditFindings: ProductionAuditFinding[];
+  productionAuditRuns: ProductionAuditRun[];
+  interventionLedger: InterventionLedgerEntry[];
 }
 
-export interface StudioKernelSnapshot extends Omit<StudioKernelState, "workflow" | "agentActivities" | "agentSessions" | "contextPackets" | "handoffCapsules"> {
+export interface StudioKernelSnapshot extends Omit<StudioKernelState, "workflow" | "agentActivities" | "agentSessions" | "contextPackets" | "handoffCapsules" | "taskEpisodes" | "evidenceBundles" | "productionAuditFindings" | "productionAuditRuns" | "interventionLedger"> {
   version: 1;
   savedAt: string;
   memoryRecords: MemoryRecord[];
@@ -70,6 +80,11 @@ export interface StudioKernelSnapshot extends Omit<StudioKernelState, "workflow"
   agentSessions?: AgentSessionRecord[];
   contextPackets?: ContextPacket[];
   handoffCapsules?: SessionHandoffCapsule[];
+  taskEpisodes?: TaskEpisode[];
+  evidenceBundles?: ProductionEvidenceBundle[];
+  productionAuditFindings?: ProductionAuditFinding[];
+  productionAuditRuns?: ProductionAuditRun[];
+  interventionLedger?: InterventionLedgerEntry[];
 }
 
 type AgentLoopUpdateFields = {
@@ -130,7 +145,12 @@ export class StudioKernel {
       claimRepairs: restoredState.claimRepairs ?? [],
       agentSessions: restoredState.agentSessions ?? [],
       contextPackets: restoredState.contextPackets ?? [],
-      handoffCapsules: restoredState.handoffCapsules ?? []
+      handoffCapsules: restoredState.handoffCapsules ?? [],
+      taskEpisodes: restoredState.taskEpisodes ?? [],
+      evidenceBundles: restoredState.evidenceBundles ?? [],
+      productionAuditFindings: restoredState.productionAuditFindings ?? [],
+      productionAuditRuns: restoredState.productionAuditRuns ?? [],
+      interventionLedger: restoredState.interventionLedger ?? []
     };
   }
 
@@ -500,11 +520,13 @@ export class StudioKernel {
     assertArtifactIdentityInvariant(existing, artifact);
 
     const updatedAt = artifact.updatedAt ?? new Date().toISOString();
+    const sourceTaskChanged = artifact.sourceTaskId !== undefined && artifact.sourceTaskId !== existing.sourceTaskId;
     const materialDefinitionChanged =
       artifact.version > existing.version ||
       artifact.path !== existing.path ||
       artifact.type !== existing.type ||
-      artifact.metadata.toolContent !== existing.metadata.toolContent;
+      artifact.metadata.toolContent !== existing.metadata.toolContent ||
+      sourceTaskChanged;
     existing.status = artifact.status;
     existing.version = Math.max(existing.version, artifact.version);
     if (artifact.sourceTaskId !== undefined) {
@@ -536,8 +558,11 @@ export class StudioKernel {
       this.state.artifactLedger.push(ledger);
     } else if (materialDefinitionChanged) {
       ledger.path = existing.path;
+      if (existing.sourceTaskId) {
+        ledger.taskId = existing.sourceTaskId;
+      }
       ledger.updatedAt = updatedAt;
-      ledger.sourceOperationId = this.createArtifactOperation(existing);
+      ledger.sourceOperationId = this.createArtifactOperation(existing, false);
       ledger.status = "pending";
       ledger.reason = "产物版本或内容定义已变化，旧文件证据已失效，等待重新物化。";
       delete ledger.hash;
@@ -546,6 +571,15 @@ export class StudioKernel {
       delete ledger.inputArtifacts;
       delete ledger.directoryManifest;
       delete existing.checksum;
+    }
+    if (
+      existing.sourceTaskId &&
+      !ledger.taskId &&
+      ledger.status === "pending" &&
+      !ledger.hash &&
+      !ledger.materializedAt
+    ) {
+      ledger.taskId = existing.sourceTaskId;
     }
 
     return existing;
@@ -579,6 +613,7 @@ export class StudioKernel {
       sizeBytes: number;
       materializedAt: string;
       directoryManifest?: ArtifactDirectoryManifest;
+      operationMetadata?: Record<string, unknown>;
     }
   ): ArtifactLedgerEntry {
     const artifact = this.state.artifacts.find((candidate) => candidate.artifactId === artifactId);
@@ -637,6 +672,12 @@ export class StudioKernel {
       operation.status = "completed";
       operation.updatedAt = input.materializedAt;
       operation.completedAt = input.materializedAt;
+      if (input.operationMetadata) {
+        operation.metadata = {
+          ...operation.metadata,
+          ...input.operationMetadata
+        };
+      }
     }
 
     if (!unchanged) {
@@ -1005,6 +1046,66 @@ export class StudioKernel {
     return this.auditLog.list(this.state.project.projectId);
   }
 
+  listTaskEpisodes(): TaskEpisode[] {
+    return this.state.taskEpisodes.map(cloneTaskEpisode);
+  }
+
+  upsertTaskEpisode(episode: TaskEpisode): TaskEpisode {
+    const index = this.state.taskEpisodes.findIndex((candidate) => candidate.episodeId === episode.episodeId);
+    const next = cloneTaskEpisode(episode);
+    if (index === -1) this.state.taskEpisodes.push(next);
+    else this.state.taskEpisodes[index] = next;
+    return cloneTaskEpisode(next);
+  }
+
+  listEvidenceBundles(): ProductionEvidenceBundle[] {
+    return this.state.evidenceBundles.map(cloneEvidenceBundle);
+  }
+
+  recordEvidenceBundle(bundle: ProductionEvidenceBundle): ProductionEvidenceBundle {
+    const existing = this.state.evidenceBundles.find((candidate) => candidate.bundleId === bundle.bundleId);
+    if (existing) return cloneEvidenceBundle(existing);
+    const next = cloneEvidenceBundle(bundle);
+    this.state.evidenceBundles.push(next);
+    return cloneEvidenceBundle(next);
+  }
+
+  listProductionAuditFindings(): ProductionAuditFinding[] {
+    return this.state.productionAuditFindings.map(cloneProductionAuditFinding);
+  }
+
+  upsertProductionAuditFinding(finding: ProductionAuditFinding): ProductionAuditFinding {
+    const index = this.state.productionAuditFindings.findIndex((candidate) => candidate.findingId === finding.findingId);
+    const next = cloneProductionAuditFinding(finding);
+    if (index === -1) this.state.productionAuditFindings.push(next);
+    else this.state.productionAuditFindings[index] = next;
+    return cloneProductionAuditFinding(next);
+  }
+
+  listProductionAuditRuns(): ProductionAuditRun[] {
+    return this.state.productionAuditRuns.map(cloneProductionAuditRun);
+  }
+
+  recordProductionAuditRun(run: ProductionAuditRun): ProductionAuditRun {
+    const existing = this.state.productionAuditRuns.find((candidate) => candidate.auditRunId === run.auditRunId);
+    if (existing) return cloneProductionAuditRun(existing);
+    const next = cloneProductionAuditRun(run);
+    this.state.productionAuditRuns.push(next);
+    return cloneProductionAuditRun(next);
+  }
+
+  listInterventionLedger(): InterventionLedgerEntry[] {
+    return this.state.interventionLedger.map(cloneIntervention);
+  }
+
+  upsertIntervention(entry: InterventionLedgerEntry): InterventionLedgerEntry {
+    const index = this.state.interventionLedger.findIndex((candidate) => candidate.interventionId === entry.interventionId);
+    const next = cloneIntervention(entry);
+    if (index === -1) this.state.interventionLedger.push(next);
+    else this.state.interventionLedger[index] = next;
+    return cloneIntervention(next);
+  }
+
   toSnapshot(savedAt = new Date().toISOString()): StudioKernelSnapshot {
     return {
       version: 1,
@@ -1024,19 +1125,25 @@ export class StudioKernel {
       agentSessions: this.state.agentSessions,
       contextPackets: this.state.contextPackets,
       handoffCapsules: this.state.handoffCapsules,
+      taskEpisodes: this.state.taskEpisodes,
+      evidenceBundles: this.state.evidenceBundles,
+      productionAuditFindings: this.state.productionAuditFindings,
+      productionAuditRuns: this.state.productionAuditRuns,
+      interventionLedger: this.state.interventionLedger,
       memoryRecords: this.memory.list(this.state.project.projectId),
       auditEvents: this.auditLog.list(this.state.project.projectId)
     };
   }
 
-  private createArtifactOperation(artifact: Artifact): string {
+  private createArtifactOperation(artifact: Artifact, reuseExisting = true): string {
     const existingLedger = this.state.artifactLedger.find((candidate) => candidate.artifactId === artifact.artifactId);
-    if (existingLedger) {
+    if (reuseExisting && existingLedger) {
       return existingLedger.sourceOperationId;
     }
 
     const now = new Date().toISOString();
-    const operationId = `op_write_artifact_${artifact.artifactId}_${Date.now()}`;
+    const operationId =
+      `op_write_artifact_${artifact.artifactId}_v${artifact.version}_${Date.now()}_${this.state.artifactOperations.length}`;
     const operation: ArtifactOperation = {
       operationId,
       projectId: artifact.projectId,
@@ -1180,6 +1287,11 @@ export function createStudioKernelFromSnapshot(snapshot: StudioKernelSnapshot): 
     agentSessions: snapshot.agentSessions ?? [],
     contextPackets: snapshot.contextPackets ?? [],
     handoffCapsules: snapshot.handoffCapsules ?? [],
+    taskEpisodes: snapshot.taskEpisodes ?? [],
+    evidenceBundles: snapshot.evidenceBundles ?? [],
+    productionAuditFindings: snapshot.productionAuditFindings ?? [],
+    productionAuditRuns: snapshot.productionAuditRuns ?? [],
+    interventionLedger: snapshot.interventionLedger ?? [],
     memoryRecords: snapshot.memoryRecords,
     auditEvents: snapshot.auditEvents
   });
@@ -1316,6 +1428,59 @@ function cloneHandoffCapsule(capsule: SessionHandoffCapsule): SessionHandoffCaps
     consumedBySessionKeys: [...capsule.consumedBySessionKeys],
     ...(capsule.contextHealth
       ? { contextHealth: { ...capsule.contextHealth, reasons: [...capsule.contextHealth.reasons] } }
+      : {})
+  };
+}
+
+function cloneTaskEpisode(episode: TaskEpisode): TaskEpisode {
+  return {
+    ...episode,
+    stageIds: [...episode.stageIds],
+    acceptanceBoundary: [...episode.acceptanceBoundary],
+    producerMessageIds: [...episode.producerMessageIds],
+    roomIds: [...episode.roomIds],
+    taskIds: [...episode.taskIds],
+    artifactIds: [...episode.artifactIds],
+    sessionKeys: [...episode.sessionKeys]
+  };
+}
+
+function cloneEvidenceBundle(bundle: ProductionEvidenceBundle): ProductionEvidenceBundle {
+  return {
+    ...bundle,
+    lanes: bundle.lanes.map((lane) => ({
+      ...lane,
+      facts: lane.facts.map((fact) => ({ ...fact })),
+      missing: [...lane.missing]
+    }))
+  };
+}
+
+function cloneProductionAuditFinding(finding: ProductionAuditFinding): ProductionAuditFinding {
+  return {
+    ...finding,
+    evidenceRefs: [...finding.evidenceRefs],
+    acceptanceChecks: [...finding.acceptanceChecks]
+  };
+}
+
+function cloneProductionAuditRun(run: ProductionAuditRun): ProductionAuditRun {
+  return {
+    ...run,
+    findingIds: [...run.findingIds],
+    findings: run.findings.map(cloneProductionAuditFinding),
+    ...(run.episodeSnapshot ? { episodeSnapshot: cloneTaskEpisode(run.episodeSnapshot) } : {}),
+    ...(run.evidenceBundleSnapshot ? { evidenceBundleSnapshot: cloneEvidenceBundle(run.evidenceBundleSnapshot) } : {}),
+    reportPaths: { ...run.reportPaths }
+  };
+}
+
+function cloneIntervention(entry: InterventionLedgerEntry): InterventionLedgerEntry {
+  return {
+    ...entry,
+    baseline: { ...entry.baseline, evidenceRefs: [...entry.baseline.evidenceRefs] },
+    ...(entry.comparison
+      ? { comparison: { ...entry.comparison, evidenceRefs: [...entry.comparison.evidenceRefs] } }
       : {})
   };
 }

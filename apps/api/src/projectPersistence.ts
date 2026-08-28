@@ -13,9 +13,14 @@ import {
   unlinkSync,
   writeFileSync
 } from "node:fs";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
-import { createStudioKernelFromSnapshot, type StudioKernel, type StudioKernelSnapshot } from "@game-pipeline/agent-runtime";
+import {
+  createStudioKernelFromSnapshot,
+  migrateLocalRuntimeSnapshot,
+  type StudioKernel,
+  type StudioKernelSnapshot
+} from "@game-pipeline/agent-runtime";
 import type { ProjectStateRepository, ProjectSummary } from "./projectStateRepository.js";
 
 export type { ProjectStateRepository, ProjectSummary } from "./projectStateRepository.js";
@@ -38,6 +43,7 @@ interface LoadedSnapshot {
   snapshot: StudioKernelSnapshot;
   kernel: StudioKernel;
   raw: string;
+  migrated: boolean;
 }
 
 /**
@@ -93,7 +99,11 @@ export class ProjectPersistenceStore implements ProjectStateRepository {
 
   load(projectId: string): StudioKernel | undefined {
     assertSafeProjectId(projectId);
-    return this.loadRecoverableSnapshot(projectId)?.kernel;
+    const loaded = this.loadRecoverableSnapshot(projectId);
+    if (loaded?.migrated) {
+      this.save(loaded.kernel);
+    }
+    return loaded?.kernel;
   }
 
   delete(projectId: string): void {
@@ -130,7 +140,11 @@ export class ProjectPersistenceStore implements ProjectStateRepository {
 
   private tryLoad(projectId: string): StudioKernel | undefined {
     try {
-      return this.loadRecoverableSnapshot(projectId)?.kernel;
+      const loaded = this.loadRecoverableSnapshot(projectId);
+      if (loaded?.migrated) {
+        this.save(loaded.kernel);
+      }
+      return loaded?.kernel;
     } catch (error) {
       this.recordIssue(projectId, "directory", "restore_failed", error);
       return undefined;
@@ -262,14 +276,22 @@ function readSnapshotFile(path: string, projectId: string): LoadedSnapshot {
 
   validateSnapshot(snapshot, projectId);
   try {
+    const migration = migrateLocalRuntimeSnapshot(snapshot, {
+      legacyArtifactIdFor: stableLegacyArtifactId
+    });
     return {
-      snapshot,
-      kernel: createStudioKernelFromSnapshot(snapshot),
-      raw
+      snapshot: migration.snapshot,
+      kernel: createStudioKernelFromSnapshot(migration.snapshot),
+      raw,
+      migrated: migration.changed
     };
   } catch (error) {
     throw new SnapshotRestoreError(error);
   }
+}
+
+function stableLegacyArtifactId(projectId: string, ownerAgentId: string, path: string): string {
+  return `artifact_${createHash("sha1").update(`${projectId}:${ownerAgentId}:${path}`).digest("hex").slice(0, 12)}`;
 }
 
 function validateSnapshot(value: unknown, expectedProjectId: string): asserts value is StudioKernelSnapshot {
