@@ -31,6 +31,7 @@
     "verify:claim-repair": "npm run build && node scripts/verify-claim-repair.mjs",
     "verify:concurrent-room": "npm run build && node scripts/verify-concurrent-room-replies.mjs",
     "verify:dashboard-progress": "node scripts/verify-dashboard-progress.mjs",
+    "verify:memory-view": "npm run build && node scripts/verify-memory-view.mjs",
     "verify:qa-gate": "npm run build && node scripts/verify-qa-playtest-gate.mjs",
     "verify:room-gates": "npm run build && node scripts/verify-room-gates.mjs",
     "verify:model-streaming": "npm run build && node scripts/verify-model-client-streaming.mjs",

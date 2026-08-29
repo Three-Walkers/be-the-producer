@@ -110,14 +110,18 @@ Agent 默认只读取 `active`，在需要追溯时读取 `superseded` 和 `reje
 
 上下文注入规则：
 
-- Orchestrator 获得全局摘要。
-- 角色 Agent 获得自身工作区和相关上下文。
-- QA 获得 GDD、Art Bible、构建和历史 Bug。
-- DevOps 获得发布状态和 Secret 工具能力，不获得明文密钥。
+- 只有 `active` 记录进入默认 durable memory。
+- `project`、`decision`、`producer_preference` 三类 active 记录作为共享事实进入每个 Agent 的 memory pack。
+- 带 `owner_agent` 的 active 记录只进入对应 Agent 的角色工作摘要。
+- `draft`、`superseded`、`rejected`、`archived` 保留用于追溯，不进入默认 durable memory。
+- 开放任务、阻塞、相关产物和最近 20 条审计事件与结构化记忆一起拼装，但它们仍由各自的 Registry 负责，不会伪装成 MemoryRecord。
+- durable memory 层当前有 10,000 字符上限；跨房间消息摘要是会话上下文层，不是长期记忆。
 
-## 8. 结构化记忆与向量检索
+## 8. 结构化记忆与检索边界
 
-结构化记忆是事实源。向量检索用于召回文档片段、历史报告和相似经验。
+结构化记忆是事实源。当前本地纵向 MVP 只实现按项目、阶段、作用域、Owner 和状态的确定性过滤，没有启用 embedding 或向量库。这样可保证 UI 展示、Agent 注入和审计读取的是同一批记录，不会把相似度召回误称为已确认事实。
+
+向量检索仍是目标能力，未来只用于召回文档片段、历史报告和相似经验：
 
 检索流程：
 
@@ -167,9 +171,16 @@ Agent 输出必须引用来源，不把向量检索结果直接当事实。
 下一步：生成 UI asset manifest
 ```
 
-## 11. 数据存储
+## 11. 当前数据存储与目标形态
 
-存储形式：
+当前实现：
+
+- 运行时：`StudioKernel` 内的 `InMemoryProductionMemory`。
+- 恢复源：项目 `studio-state.json` 快照中的 `memoryRecords`。
+- 人类可读镜像：工作空间 `shared/memory/project-memory.jsonl`。
+- 每次 `writeMemory` 同步追加 `MEMORY_WRITTEN` 审计事件。
+
+当前实现不包含 PostgreSQL、对象存储或向量库。生产多实例部署的目标形态才是：
 
 - PostgreSQL：结构化 Memory 记录。
 - 文件系统：workspace summary、GDD、Art Bible、QA 报告。
@@ -186,6 +197,8 @@ Agent 输出必须引用来源，不把向量检索结果直接当事实。
 - `status`
 - `created_at`
 
+迁移到数据库时，MemoryRecord 的 ID、状态、来源引用和 supersedes 关系必须保持不变，UI 不应因为存储适配器变化而改变语义。
+
 ## 12. 安全规则
 
 - Secret 不进入 Memory。
@@ -193,3 +206,16 @@ Agent 输出必须引用来源，不把向量检索结果直接当事实。
 - Producer Preference Memory 不记录个人隐私。
 - 模型调用上下文中只包含任务所需最小信息。
 - 记忆导出必须过滤 secret 和私密服务器信息。
+
+## 13. 记忆中枢 UI
+
+制作人界面的“记忆中枢”是只读的可观测面。它同时展示长期 `MemoryRecord` 与会话工作记忆（AgentSession、最近 ContextPacket 的层次、交接胶囊计数），并按 Agent 区分四种长期记忆关系：
+
+| 标记 | 含义 |
+| --- | --- |
+| Agent 自有 | `ownerAgent` 指向该 Agent；不等于当前有效。 |
+| 权限可读 | 记录作用域出现在 Agent Contract 的 `memoryScopes.read` 中。 |
+| 本轮注入 | 记录满足当前 `buildMemoryPack` 的 active 注入规则，会进入 durable memory。 |
+| 历史留档 | 非 active 状态，只供追溯，不影响默认决策。 |
+
+UI 同时展示来源消息、审计事件、来源产物、替换关系、运行状态、开放任务和阻塞数。编辑和状态迁移暂不放进 UI：生产事实必须通过带角色权限、来源校验和审计事件的领域命令写入，不能由前端直接覆盖 JSON。
