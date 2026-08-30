@@ -95,6 +95,13 @@ assert.equal(designer.context.sessionMemory.contextPacketCount, 1);
 assert.equal(designer.context.sessionMemory.latestSession?.contextTokensEstimate, 420);
 assert.equal(designer.context.sessionMemory.latestPacket?.layers[0]?.kind, "durable_memory");
 assert.equal(artDirector.context.sessionMemory.sessionCount, 0, "agents without sessions must still have an explicit zero-state view");
+assert.deepEqual(
+  designer.skills.available.map((skill) => skill.skillId),
+  ["level-design", "balance-analysis"],
+  "the memory view must expose the role Skill allowlist even when no Skill is active"
+);
+assert.equal(designer.skills.active.length, 0);
+assert.deepEqual(artDirector.skills.available.map((skill) => skill.skillId), ["cocos-mobile-ui"]);
 
 const projectRecord = view.records.find((record) => record.memoryId === "mem_project");
 const designDraft = view.records.find((record) => record.memoryId === "mem_design_draft");
@@ -143,6 +150,8 @@ for (const marker of ["memory-dialog", "memory-agent-list", "memory-feed", "memo
 }
 assert.match(app, /\/projects\/\$\{projectId\}\/memory/, "dashboard must load the current project's memory view");
 assert.match(css, /\.memory-layout\s*\{/, "memory dashboard must define a visual master-detail layout");
+assert.match(app, /ROLE SKILLS/, "the memory inspector must expose per-agent Skill activation");
+assert.match(css, /\.memory-skill-card[,\s]/, "the memory dashboard must style activated Skill receipts");
 assert.match(css, /@media \(max-width: 780px\)/, "memory dashboard must retain the existing mobile breakpoint");
 assert.match(server, /memory-dashboard\.js/, "the memory dashboard module must be available through the static boundary");
 

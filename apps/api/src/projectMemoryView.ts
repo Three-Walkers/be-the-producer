@@ -1,8 +1,11 @@
 import {
+  defaultAgentSkillRegistry,
   memoryRecordIsInjectedIntoDurablePack,
+  type AgentSkillAvailability,
   type StudioKernel
 } from "@game-pipeline/agent-runtime";
 import type {
+  ActivatedAgentSkill,
   AgentId,
   MemoryRecord,
   MemoryScope,
@@ -32,6 +35,11 @@ export interface ProjectMemoryAgentView {
   currentTaskId?: string;
   readableScopes: MemoryScope[];
   writableScopes: MemoryScope[];
+  skills: {
+    available: AgentSkillAvailability[];
+    active: ActivatedAgentSkill[];
+    latestPacketId?: string;
+  };
   ownedMemoryIds: string[];
   readableMemoryIds: string[];
   injectedMemoryIds: string[];
@@ -96,6 +104,7 @@ export interface ProjectMemoryView {
     persistence: string[];
     injection: string;
     search: string;
+    skillActivation: string;
   };
 }
 
@@ -138,6 +147,13 @@ export function buildProjectMemoryView(kernel: StudioKernel): ProjectMemoryView 
     );
     const latestSession = agentSessions[0];
     const latestPacket = agentPackets[0];
+    const currentTask = runtime?.taskId ? tasks.find((task) => task.taskId === runtime.taskId) : undefined;
+    const skillResolution = defaultAgentSkillRegistry.resolve({
+      agent,
+      stageId: kernel.project.currentStage,
+      ...(currentTask ? { task: currentTask } : {}),
+      artifacts
+    });
 
     return {
       agentId: agent.agentId,
@@ -149,6 +165,11 @@ export function buildProjectMemoryView(kernel: StudioKernel): ProjectMemoryView 
       ...(runtime?.taskId ? { currentTaskId: runtime.taskId } : {}),
       readableScopes: [...agent.memoryScopes.read],
       writableScopes: [...agent.memoryScopes.write],
+      skills: {
+        available: skillResolution.available,
+        active: latestPacket?.activatedSkills?.map((skill) => ({ ...skill })) ?? [],
+        ...(latestPacket ? { latestPacketId: latestPacket.packetId } : {})
+      },
       ownedMemoryIds: ownedRecords.map((record) => record.memoryId),
       readableMemoryIds: readableRecords.map((record) => record.memoryId),
       injectedMemoryIds: injectedRecords.map((record) => record.memoryId),
@@ -225,7 +246,8 @@ export function buildProjectMemoryView(kernel: StudioKernel): ProjectMemoryView 
       sourceOfTruth: "StudioKernel structured MemoryRecord",
       persistence: ["studio-state.json snapshot", "shared/memory/project-memory.jsonl"],
       injection: "active project/decision/producer preference + active owner memory -> durable_memory context layer",
-      search: "structured filters only; vector retrieval is not enabled in the local runtime"
+      search: "structured filters only; vector retrieval is not enabled in the local runtime",
+      skillActivation: "role allowlist + task/stage selectors; high-risk skills require workflow approval"
     }
   };
 }

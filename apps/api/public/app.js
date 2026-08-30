@@ -254,6 +254,20 @@ const memoryRuntimeLabels = {
   error: "异常"
 };
 
+const skillStatusLabels = {
+  active: "匹配激活",
+  available: "可手动指定",
+  awaiting_approval: "等待工作流批准",
+  disabled: "本轮禁用",
+  not_applicable: "当前不适用"
+};
+
+const skillActivationSourceLabels = {
+  automatic: "任务自动匹配",
+  producer_requested: "制作人指定",
+  workflow_approved: "工作流已批准"
+};
+
 const $ = (selector) => document.querySelector(selector);
 const settingsDialog = $("#settings-dialog");
 const startConfirmDialog = $("#start-confirm-dialog");
@@ -1233,6 +1247,28 @@ function renderMemoryInspector(agent, record, view) {
       <p class="memory-inspector-note">跨房间消息摘要在每次 Agent 调用时动态拼装，不属于这里展示的长期 MemoryRecord。</p>
     </section>
 
+    <section class="memory-inspector-section memory-skills-section">
+      <div class="memory-section-heading"><div><span>ROLE SKILLS</span><strong>专业 Skill 装载</strong></div><span>${agent.skills.active.length} 已注入 / ${agent.skills.available.length} 白名单</span></div>
+      <div class="memory-skill-summary">
+        <span>最近上下文实际注入</span>
+        ${agent.skills.active.length ? `<div class="memory-skill-active-list">${agent.skills.active.map((skill) => `<article class="memory-skill-card is-active">
+          <div><strong>${escapeHtml(skill.name)}</strong><span class="memory-skill-risk risk-${escapeHtml(skill.riskLevel)}">${skill.riskLevel === "high" ? "高风险" : "标准"}</span></div>
+          <code>${escapeHtml(skill.skillId)}@${escapeHtml(skill.version)}</code>
+          <p>${escapeHtml(skillActivationSourceLabels[skill.activationSource] ?? skill.activationSource)} · ${escapeHtml(skill.reason)}</p>
+          <small>SHA-256 ${escapeHtml(skill.contentHash.slice(0, 12))}</small>
+        </article>`).join("")}</div>` : '<p class="memory-inspector-note">最近一次 ContextPacket 没有注入专业 Skill；角色核心契约仍然生效。</p>'}
+      </div>
+      <div class="memory-skill-summary">
+        <span>角色白名单与当前解析</span>
+        ${agent.skills.available.length ? `<div class="memory-skill-availability-list">${agent.skills.available.map((skill) => `<div class="memory-skill-row status-${escapeHtml(skill.status)}">
+          <div><strong>${escapeHtml(skill.name)}</strong><code>${escapeHtml(skill.skillId)}@${escapeHtml(skill.version)}</code></div>
+          <span>${escapeHtml(skillStatusLabels[skill.status] ?? skill.status)}</span>
+          <p>${escapeHtml(skill.reason)}</p>
+        </div>`).join("")}</div>` : '<p class="memory-inspector-note">该角色没有专业 Skill 白名单，只使用核心 AgentContract。</p>'}
+      </div>
+      <p class="memory-inspector-note">Skill 只提供专业流程，不会扩大 Agent 的工具、路径、密钥或门禁权限。显式使用 <code>$skill-id</code> 只能在角色白名单和当前阶段内覆盖自动选择。</p>
+    </section>
+
     <section class="memory-inspector-section">
       <div class="memory-section-heading"><div><span>SESSION MEMORY</span><strong>会话工作记忆</strong></div><span>${agent.context.sessionMemory.activeSessionCount} 活跃</span></div>
       <dl class="memory-context-grid">
@@ -1258,7 +1294,7 @@ function renderMemoryInspector(agent, record, view) {
 
     <section class="memory-inspector-section memory-storage-note">
       <span>当前实现</span>
-      <p>${escapeHtml(view.architecture.sourceOfTruth)}；持久化到 ${escapeHtml(view.architecture.persistence.join(" + "))}。${escapeHtml(view.architecture.search)}</p>
+      <p>${escapeHtml(view.architecture.sourceOfTruth)}；持久化到 ${escapeHtml(view.architecture.persistence.join(" + "))}。${escapeHtml(view.architecture.search)}；${escapeHtml(view.architecture.skillActivation)}。</p>
     </section>
   </div>`;
   inspector.querySelectorAll("[data-memory-artifact]").forEach((button) => {
