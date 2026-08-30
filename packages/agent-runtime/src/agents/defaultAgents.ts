@@ -26,6 +26,15 @@ export const defaultAgentContracts: AgentContract[] = [
       read: ["project", "role", "decision", "artifact", "qa", "release", "producer_preference", "knowledge"],
       write: ["project", "role", "decision", "knowledge"]
     },
+    skillBindings: [
+      {
+        skillId: "game-generation-router",
+        activationPolicy: "automatic",
+        priority: 100,
+        stages: ["concept_discussion", "concept_review"],
+        activationKeywords: ["游戏", "玩法", "原型", "idea", "核心循环", "立项", "拆解"]
+      }
+    ],
     tools: [
       "create_room",
       "route_message",
@@ -68,6 +77,7 @@ export const defaultAgentContracts: AgentContract[] = [
       read: ["project", "role", "decision", "artifact", "qa", "release", "producer_preference"],
       write: ["role", "decision", "producer_preference"]
     },
+    skillBindings: [],
     tools: ["create_decision_request", "record_decision", "create_task", "update_task", "write_artifact"],
     forbiddenActions: ["write_gameplay_code", "generate_final_assets", "deploy_release"],
     handoffTargets: ["studio_orchestrator", "game_designer", "art_director", "qa_evaluator", "devops"],
@@ -90,6 +100,22 @@ export const defaultAgentContracts: AgentContract[] = [
       read: ["project", "decision", "producer_preference", "artifact", "qa"],
       write: ["role", "decision", "artifact", "knowledge"]
     },
+    skillBindings: [
+      {
+        skillId: "level-design",
+        activationPolicy: "automatic",
+        priority: 90,
+        stages: ["concept_discussion", "concept_review", "production"],
+        activationKeywords: ["关卡", "波次", "路线", "地图", "节奏", "阶段", "无尽", "level", "wave"]
+      },
+      {
+        skillId: "balance-analysis",
+        activationPolicy: "automatic",
+        priority: 85,
+        stages: ["concept_discussion", "concept_review", "production", "liveops"],
+        activationKeywords: ["数值", "平衡", "难度", "曲线", "经济", "升级", "掉落", "随机", "概率", "留存"]
+      }
+    ],
     tools: ["read_artifact", "write_artifact", "create_decision_request", "create_task", "update_task"],
     forbiddenActions: ["write_gameplay_code", "make_final_art_direction", "deploy_release", "read_secret_plaintext"],
     handoffTargets: ["producer", "design_quality_reviewer", "art_director", "cocos_tech_lead", "gameplay_programmer", "qa_evaluator"],
@@ -112,6 +138,7 @@ export const defaultAgentContracts: AgentContract[] = [
       read: ["project", "decision", "artifact", "qa", "producer_preference", "knowledge"],
       write: ["role", "artifact", "knowledge"]
     },
+    skillBindings: [],
     tools: ["read_artifact", "write_artifact"],
     forbiddenActions: [
       "modify_reviewed_artifacts",
@@ -140,6 +167,15 @@ export const defaultAgentContracts: AgentContract[] = [
       read: ["project", "decision", "producer_preference", "artifact", "qa"],
       write: ["role", "artifact", "decision", "knowledge"]
     },
+    skillBindings: [
+      {
+        skillId: "cocos-mobile-ui",
+        activationPolicy: "automatic",
+        priority: 80,
+        stages: ["concept_discussion", "concept_review", "production"],
+        activationKeywords: ["ui", "hud", "界面", "菜单", "按钮", "触控", "安全区", "小屏"]
+      }
+    ],
     tools: ["read_artifact", "write_artifact", "generate_raster_asset", "create_asset_spec", "create_task"],
     forbiddenActions: ["write_gameplay_code", "edit_cocos_scene_directly", "deploy_release", "read_secret_plaintext"],
     handoffTargets: ["visual_quality_reviewer", "asset_production", "cocos_automation", "qa_evaluator", "producer"],
@@ -162,6 +198,16 @@ export const defaultAgentContracts: AgentContract[] = [
       read: ["project", "decision", "artifact", "producer_preference"],
       write: ["role", "artifact", "knowledge"]
     },
+    skillBindings: [
+      {
+        skillId: "asset-production",
+        activationPolicy: "automatic",
+        priority: 100,
+        stages: ["production"],
+        activationKeywords: ["资产", "sprite", "精灵", "图集", "png", "美术", "contact sheet", "manifest"],
+        outputArtifactTypes: ["asset", "asset_manifest"]
+      }
+    ],
     tools: ["generate_raster_asset", "generate_image", "render_svg_to_png", "postprocess_asset", "write_asset_manifest", "create_task"],
     forbiddenActions: ["decide_art_direction", "write_gameplay_code", "read_provider_api_key", "deploy_release"],
     handoffTargets: ["art_director", "visual_quality_reviewer", "cocos_automation", "qa_evaluator"],
@@ -184,6 +230,7 @@ export const defaultAgentContracts: AgentContract[] = [
       read: ["project", "decision", "artifact", "qa", "producer_preference", "knowledge"],
       write: ["role", "artifact", "knowledge"]
     },
+    skillBindings: [],
     tools: ["read_artifact", "inspect_visual_assets", "write_artifact"],
     forbiddenActions: [
       "modify_reviewed_artifacts",
@@ -213,6 +260,16 @@ export const defaultAgentContracts: AgentContract[] = [
       read: ["project", "decision", "artifact", "qa", "knowledge"],
       write: ["role", "artifact", "knowledge"]
     },
+    skillBindings: [
+      {
+        skillId: "cocos-architecture",
+        activationPolicy: "automatic",
+        priority: 100,
+        stages: ["production"],
+        activationKeywords: ["架构", "场景", "prefab", "组件", "资源加载", "scene blueprint", "性能"],
+        outputArtifactTypes: ["scene_blueprint"]
+      }
+    ],
     tools: ["write_artifact", "create_scene_blueprint", "create_task", "review_code"],
     forbiddenActions: ["approve_release_gate", "read_secret_plaintext", "make_producer_decision"],
     handoffTargets: ["gameplay_programmer", "cocos_automation", "qa_evaluator", "wechat_platform"],
@@ -235,6 +292,23 @@ export const defaultAgentContracts: AgentContract[] = [
       read: ["project", "decision", "artifact", "qa", "knowledge"],
       write: ["role", "artifact", "knowledge"]
     },
+    skillBindings: [
+      {
+        skillId: "gameplay-logic",
+        activationPolicy: "automatic",
+        priority: 100,
+        stages: ["production"],
+        activationKeywords: ["代码", "typescript", "状态机", "玩法实现", "逻辑", "runtime signal", "bug"],
+        outputArtifactTypes: ["source_code"]
+      },
+      {
+        skillId: "cocos-mobile-ui",
+        activationPolicy: "automatic",
+        priority: 80,
+        stages: ["production"],
+        activationKeywords: ["ui", "hud", "界面", "菜单", "按钮", "触控", "安全区", "小屏"]
+      }
+    ],
     tools: ["write_code", "run_typecheck", "create_task", "update_task"],
     forbiddenActions: ["change_art_direction", "deploy_release", "read_secret_plaintext"],
     handoffTargets: ["cocos_automation", "qa_evaluator", "cocos_tech_lead"],
@@ -257,6 +331,7 @@ export const defaultAgentContracts: AgentContract[] = [
       read: ["project", "decision", "artifact", "qa", "knowledge"],
       write: ["role", "artifact", "knowledge"]
     },
+    skillBindings: [],
     tools: ["cocos_validate_project", "cocos_import_assets", "cocos_apply_blueprint", "cocos_build"],
     forbiddenActions: ["edit_scene_serialization_uncontrolled", "read_secret_plaintext", "approve_release_gate"],
     handoffTargets: ["gameplay_programmer", "qa_evaluator", "wechat_platform"],
@@ -279,6 +354,17 @@ export const defaultAgentContracts: AgentContract[] = [
       read: ["project", "decision", "artifact", "qa", "release", "producer_preference"],
       write: ["role", "qa", "artifact", "knowledge"]
     },
+    skillBindings: [
+      {
+        skillId: "game-playtest",
+        activationPolicy: "automatic",
+        priority: 100,
+        stages: ["production", "first_playable_review", "release_gate"],
+        activationKeywords: ["qa", "测试", "试玩", "playtest", "截图", "录屏", "回归", "bug"],
+        inputArtifactTypes: ["playtest_contract", "build"],
+        outputArtifactTypes: ["qa_report", "bug_report"]
+      }
+    ],
     tools: ["write_artifact", "run_playtest", "create_bug_report", "create_release_gate"],
     forbiddenActions: ["fix_code_directly", "approve_producer_decision", "read_secret_plaintext"],
     handoffTargets: ["gameplay_programmer", "art_director", "asset_production", "cocos_automation", "wechat_platform", "devops"],
@@ -301,6 +387,7 @@ export const defaultAgentContracts: AgentContract[] = [
       read: ["project", "decision", "artifact", "qa", "release"],
       write: ["role", "release", "artifact", "knowledge"]
     },
+    skillBindings: [],
     tools: ["check_wechat_package", "prepare_preview", "prepare_upload_report", "create_task"],
     forbiddenActions: ["deploy_server", "read_upload_secret_plaintext", "approve_release_gate"],
     handoffTargets: ["qa_evaluator", "devops", "liveops_analytics"],
@@ -323,6 +410,18 @@ export const defaultAgentContracts: AgentContract[] = [
       read: ["project", "decision", "artifact", "qa", "release"],
       write: ["role", "release", "knowledge"]
     },
+    skillBindings: [
+      {
+        skillId: "deploy-game",
+        activationPolicy: "workflow_gate",
+        priority: 100,
+        stages: ["release_preparation", "production_deploy"],
+        approvedStages: ["production_deploy"],
+        activationKeywords: ["部署", "发布", "上线", "健康检查", "回滚", "deploy"],
+        inputArtifactTypes: ["deployment_plan", "rollback_plan", "build"],
+        outputArtifactTypes: ["deployment_report"]
+      }
+    ],
     tools: ["create_deploy_plan", "run_deploy_tool", "write_redacted_log", "create_rollback_plan", "run_health_check"],
     forbiddenActions: ["show_secret_plaintext", "deploy_without_approval", "delete_audit_log"],
     handoffTargets: ["wechat_platform", "qa_evaluator", "liveops_analytics", "producer"],
@@ -345,6 +444,15 @@ export const defaultAgentContracts: AgentContract[] = [
       read: ["project", "decision", "artifact", "qa", "release", "producer_preference", "knowledge"],
       write: ["role", "release", "knowledge", "decision"]
     },
+    skillBindings: [
+      {
+        skillId: "game-analytics",
+        activationPolicy: "automatic",
+        priority: 100,
+        stages: ["liveops"],
+        activationKeywords: ["数据", "埋点", "留存", "漏斗", "版本", "调优", "dashboard", "analytics"]
+      }
+    ],
     tools: ["define_analytics_events", "analyze_liveops_data", "create_iteration_backlog", "create_task"],
     forbiddenActions: ["collect_private_personal_data", "auto_deploy_tuning", "read_secret_plaintext"],
     handoffTargets: ["producer", "game_designer", "gameplay_programmer", "qa_evaluator"],
