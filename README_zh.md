@@ -507,6 +507,7 @@ Game Pipeline Agents 的目标产品由一组相互连接的能力模块组成�
 | --- | --- |
 | Studio Chat | 制作人房间、按角色路由、Agent 回复、结构化消息类型和跨房间交接。 |
 | Agent Registry | 游戏开发角色、能力、权限、路由规则、可用性和工作空间归属。 |
+| Role Skill Registry | 按角色白名单、任务语义和阶段门禁自动装载版本化专业工作法，并把实际装载收据写入 Context Packet。 |
 | Workflow Orchestrator | 三阶段生产状态机、阶段门禁、任务创建、里程碑流转和制作人审批控制。 |
 | Task and Mission Hub | Backlog、负责人、状态、阻塞、验收标准、关联产物和里程碑可视化。 |
 | Production Memory System | 项目事实、角色进度、制作人决策、产物历史、QA 历史、发布记忆和可复用知识。 |
@@ -523,4 +524,4 @@ Game Pipeline Agents 的目标产品由一组相互连接的能力模块组成�
 
 ## 当前状态
 
-当前仓库处于本地纵向 MVP 阶段。版本化 GameContract、SceneBlueprint、PlaytestContract、Asset Manifest v2 和 ArtifactQualityReview 已落地严格校验与证据绑定门禁。策划/美术作者与独立质量审查员已经分离，服务端固定 rubric 可防止审查员自行降低阈值；美术链路已通过受控 DashScope 图片模型创作真实 PNG，再由独立视觉模型读取实际像素，记录 provider、request、prompt hash、seed、尺寸、语义审查及图片 hash 证据。PNG alpha policy 会按真实像素解码校验，Cocos build 也会绑定当前导入收据和源/目标资产字节。Cocos Bridge 已改为声明式通用渲染，QA 已能按契约执行多场景、公开事实断言和证据绑定。Workflow Aggregate 已把评审、制作人决策、变更、豁免、回滚和 LiveOps 迭代变成可重放的一等领域记录。工具执行已绑定 Agent、当前任务、产物身份和路径；Claude MCP 房间会话只读。Artifact Ledger 会冻结输入版本/hash，构建产物使用完整文件 manifest，旧构建、旧 QA、过期质量审查、外部篡改和符号链接越界都会在消费前失效。自动化 fixture 证明核心层不再依赖单一样例，但还没有三套真实 Cocos 游戏端到端交付。生产数据库与分布式队列/租约、项目媒体预算、隔离构建 worker、真实微信发布、高质量自动抠图/边缘后处理、Prefab 真实物化及生产 LiveOps 闭环仍在建设中，因此尚不能视为完整产品系统。
+当前仓库处于本地纵向 MVP 阶段。版本化 GameContract、SceneBlueprint、PlaytestContract、Asset Manifest v2 和 ArtifactQualityReview 已落地严格校验与证据绑定门禁。角色 Skill Registry 会按角色白名单、当前任务和 Workflow Stage 自动装载版本化专业工作法，并把版本/hash/来源写入 Context Packet；制作人可以显式指定或禁用普通 Skill，但不能借此获得角色外权限或绕过部署门禁。策划/美术作者与独立质量审查员已经分离，服务端固定 rubric 可防止审查员自行降低阈值；美术链路已通过受控 DashScope 图片模型创作真实 PNG，再由独立视觉模型读取实际像素，记录 provider、request、prompt hash、seed、尺寸、语义审查及图片 hash 证据。PNG alpha policy 会按真实像素解码校验，Cocos build 也会绑定当前导入收据和源/目标资产字节。Cocos Bridge 已改为声明式通用渲染，QA 已能按契约执行多场景、公开事实断言和证据绑定。Workflow Aggregate 已把评审、制作人决策、变更、豁免、回滚和 LiveOps 迭代变成可重放的一等领域记录。工具执行已绑定 Agent、当前任务、产物身份和路径；Claude MCP 房间会话只读。Artifact Ledger 会冻结输入版本/hash，构建产物使用完整文件 manifest，旧构建、旧 QA、过期质量审查、外部篡改和符号链接越界都会在消费前失效。自动化 fixture 证明核心层不再依赖单一样例，但还没有三套真实 Cocos 游戏端到端交付。生产数据库与分布式队列/租约、项目媒体预算、隔离构建 worker、真实微信发布、高质量自动抠图/边缘后处理、Prefab 真实物化及生产 LiveOps 闭环仍在建设中，因此尚不能视为完整产品系统。
