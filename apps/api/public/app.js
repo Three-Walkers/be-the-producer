@@ -1,4 +1,10 @@
-import { selectTeamTasks, summarizeTaskProgress, taskProgressPercent } from "/dashboard-progress.js";
+import {
+  groupProjectDeliverables,
+  selectTeamTasks,
+  summarizeProjectDashboard,
+  summarizeTaskProgress,
+  taskProgressPercent
+} from "/dashboard-progress.js";
 import { filterMemoryRecords, memoryRelation, summarizeAgentMemory } from "/memory-dashboard.js";
 
 const state = {
@@ -29,7 +35,9 @@ const state = {
   apiToken: "",
   pendingAgentResponses: [],
   roomSettingsKind: null,
-  selectedModelProviderId: "dashscope"
+  selectedModelProviderId: "dashscope",
+  dashboardTaskFilter: "all",
+  expandedArtifactFamilies: new Set()
 };
 
 const agentTypingIndicatorTimeoutMs = 2 * 60 * 1000;
@@ -86,6 +94,17 @@ const stageLabels = {
   production_deploy: "生产部署",
   liveops: "持续运营"
 };
+
+const dashboardStages = [
+  "concept_discussion",
+  "concept_review",
+  "production",
+  "first_playable_review",
+  "release_preparation",
+  "release_gate",
+  "production_deploy",
+  "liveops"
+];
 
 const roomLabels = {
   "studio-main": "主群聊",
@@ -275,6 +294,8 @@ const deleteConfirmDialog = $("#delete-confirm-dialog");
 const artifactPreviewDialog = $("#artifact-preview-dialog");
 const roomSettingsDialog = $("#room-settings-dialog");
 const memoryDialog = $("#memory-dialog");
+const appShell = $(".app-shell");
+const projectDashboardPage = $("#project-dashboard-page");
 const messageContentInput = $("#message-content");
 const mentionSuggestions = $("#mention-suggestions");
 let pendingStartProjectId = null;
@@ -304,7 +325,10 @@ settingsDialog.addEventListener("click", (event) => {
   }
 });
 
-$("#open-memory").addEventListener("click", () => {
+$("#open-memory").addEventListener("click", openMemoryDashboard);
+$("#dashboard-open-memory").addEventListener("click", openMemoryDashboard);
+
+function openMemoryDashboard() {
   if (!state.projectId) {
     showToast("请先创建或打开一个项目。");
     return;
@@ -315,7 +339,76 @@ $("#open-memory").addEventListener("click", () => {
     renderMemoryDashboard();
     showToast(`记忆加载失败：${error.message}`);
   });
+}
+
+$("#open-project-dashboard").addEventListener("click", openProjectDashboard);
+$("#close-project-dashboard").addEventListener("click", closeProjectDashboard);
+$("#refresh-project-dashboard").addEventListener("click", async () => {
+  const button = $("#refresh-project-dashboard");
+  button.disabled = true;
+  button.setAttribute("aria-busy", "true");
+  try {
+    await refreshProject();
+    showToast("Dashboard 已刷新。");
+  } catch (error) {
+    showToast(`Dashboard 刷新失败：${error.message}`);
+  } finally {
+    button.disabled = false;
+    button.removeAttribute("aria-busy");
+  }
 });
+
+document.querySelectorAll("[data-dashboard-target]").forEach((button) => {
+  button.addEventListener("click", () => {
+    document.getElementById(button.dataset.dashboardTarget)?.scrollIntoView({ behavior: reducedMotion() ? "auto" : "smooth", block: "start" });
+  });
+});
+
+document.querySelectorAll("[data-dashboard-task-filter]").forEach((button) => {
+  button.addEventListener("click", () => {
+    state.dashboardTaskFilter = button.dataset.dashboardTaskFilter;
+    renderTaskBoard();
+  });
+});
+
+window.addEventListener("popstate", syncProjectDashboardRoute);
+window.addEventListener("hashchange", syncProjectDashboardRoute);
+
+function openProjectDashboard() {
+  if (!state.projectId) {
+    showToast("请先创建或打开一个项目。");
+    return;
+  }
+  history.pushState({ ...(history.state ?? {}), btpView: "project-dashboard" }, "", "#project-dashboard");
+  syncProjectDashboardRoute();
+}
+
+function closeProjectDashboard() {
+  if (history.state?.btpView === "project-dashboard") {
+    history.back();
+    return;
+  }
+  history.replaceState({}, "", `${location.pathname}${location.search}`);
+  syncProjectDashboardRoute();
+}
+
+function syncProjectDashboardRoute() {
+  const open = location.hash === "#project-dashboard";
+  projectDashboardPage.hidden = !open;
+  appShell.inert = open;
+  appShell.setAttribute("aria-hidden", String(open));
+  document.body.classList.toggle("dashboard-page-open", open);
+  if (open) {
+    renderProjectDashboardSummary();
+    requestAnimationFrame(() => $("#close-project-dashboard").focus());
+  } else if (document.activeElement && projectDashboardPage.contains(document.activeElement)) {
+    requestAnimationFrame(() => $("#open-project-dashboard").focus());
+  }
+}
+
+function reducedMotion() {
+  return window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+}
 
 $("#close-memory").addEventListener("click", () => memoryDialog.close());
 memoryDialog.addEventListener("click", (event) => {
@@ -1021,12 +1114,16 @@ async function loadProject(projectId) {
   state.memoryView = null;
   state.memorySelectedAgentId = null;
   state.memorySelectedRecordId = null;
+  state.dashboardTaskFilter = "all";
+  state.expandedArtifactFamilies.clear();
   await refreshProject();
 }
 
 function render() {
   renderModelSettings();
   renderProjectHeader();
+  renderProjectOverview();
+  renderProjectDashboardSummary();
   renderProjectList();
   renderQuickActions();
   renderRooms();
@@ -1794,6 +1891,86 @@ function renderProjectHeader() {
   renderAgentLoopStatus();
 }
 
+function projectDashboardSummary() {
+  return summarizeProjectDashboard({
+    taskBoard: state.taskBoard,
+    artifacts: state.artifacts,
+    productionAudit: state.productionAudit,
+    teamOwnerGroups: teamDefinitions.map((team) => team.taskOwners ?? team.agents)
+  });
+}
+
+function renderProjectOverview() {
+  const summary = projectDashboardSummary();
+  const started = isProjectStarted();
+  const stage = state.project?.currentStage;
+  $("#project-overview-status").textContent = state.project ? executionLabel(currentExecutionStatus()) : "未启动";
+  $("#project-overview-status").className = `overview-status-pill status-${escapeHtml(currentExecutionStatus())}`;
+  $("#project-overview-stage").textContent = state.project
+    ? started
+      ? stageLabels[stage] ?? stage
+      : "等待项目启动"
+    : "等待创建项目";
+  $("#project-overview-progress-value").textContent = `${summary.progressPercent}%`;
+  $("#project-overview-progress-bar").style.width = `${summary.progressPercent}%`;
+  $("#project-overview-tasks").textContent = `${summary.doneCount} / ${summary.taskTotal}`;
+  $("#project-overview-artifacts").textContent = String(summary.deliverableCount);
+  $("#project-overview-blockers").textContent = String(summary.blockerCount);
+  $("#project-overview-teams").textContent = String(summary.activeTeamCount);
+  $("#project-overview-next").textContent = summary.nextTask
+    ? `${localStatus(summary.nextTask.status)}：${summary.nextTask.title}`
+    : state.project
+      ? started
+        ? "当前阶段暂无待处理任务"
+        : "启动项目后由 Agents 拆解任务"
+      : "创建或选择项目后查看推进重点";
+  $("#open-project-dashboard").disabled = !state.project;
+}
+
+function renderProjectDashboardSummary() {
+  const summary = projectDashboardSummary();
+  const started = isProjectStarted();
+  const projectName = state.project?.name ?? "未选择项目";
+  const stage = state.project?.currentStage;
+  const stageLabel = state.project ? stageLabels[stage] ?? stage : "等待 idea";
+  $("#dashboard-header-project-name").textContent = projectName;
+  $("#dashboard-page-title").textContent = projectName;
+  $("#dashboard-page-summary").textContent = state.project?.initialIdea
+    ? summarizeText(state.project.initialIdea, 150)
+    : "在一个页面查看阶段目标、任务执行、交付证据和团队协作状态。";
+  $("#dashboard-stage-pill").textContent = stageLabel;
+  $("#dashboard-execution-pill").textContent = state.project ? executionLabel(currentExecutionStatus()) : "未启动";
+  $("#dashboard-execution-pill").className = `dashboard-execution-pill status-${escapeHtml(currentExecutionStatus())}`;
+  $("#dashboard-progress-value").textContent = `${summary.progressPercent}%`;
+  $("#dashboard-progress-bar").style.width = `${summary.progressPercent}%`;
+  $("#dashboard-next-action").textContent = summary.nextTask
+    ? `当前焦点 · ${localStatus(summary.nextTask.status)}：${summary.nextTask.title}`
+    : started
+      ? "当前阶段暂无待处理任务。"
+      : "启动项目后，这里会显示最需要制作人关注的下一步。";
+  $("#dashboard-metric-tasks").textContent = String(summary.taskTotal);
+  $("#dashboard-metric-tasks-note").textContent = `已完成 ${summary.doneCount} · 核心进度 ${summary.progressPercent}%`;
+  $("#dashboard-metric-artifacts").textContent = String(summary.deliverableCount);
+  $("#dashboard-metric-blockers").textContent = String(summary.blockerCount);
+  $("#dashboard-metric-blockers-note").textContent = summary.blockerCount
+    ? `任务 ${summary.blockedTaskCount} · 审计 ${summary.auditBlockingCount}`
+    : "当前无阻塞";
+  $("#dashboard-metric-teams").textContent = String(summary.activeTeamCount);
+  $("#dashboard-stage-summary").textContent = state.project
+    ? `${stageLabel} · ${executionLabel(currentExecutionStatus())}`
+    : "等待项目启动";
+
+  const currentStageIndex = started ? dashboardStages.indexOf(stage) : -1;
+  $("#dashboard-stage-track").innerHTML = dashboardStages.map((stageId, index) => {
+    const status = index < currentStageIndex ? "complete" : index === currentStageIndex ? "current" : "upcoming";
+    return `<div class="dashboard-stage-step ${status}"${status === "current" ? ' aria-current="step"' : ""}>
+      <span>${status === "complete" ? checkIcon() : String(index + 1)}</span>
+      <strong>${escapeHtml(stageLabels[stageId] ?? stageId)}</strong>
+      <small>${status === "complete" ? "已完成" : status === "current" ? "当前阶段" : "待推进"}</small>
+    </div>`;
+  }).join("");
+}
+
 function renderAgentLoopStatus() {
   const container = $("#agent-loop-status");
   const text = $("#agent-loop-status-text");
@@ -2016,12 +2193,18 @@ function clearCurrentProject() {
   state.memorySelectedAgentId = null;
   state.memorySelectedRecordId = null;
   state.workspace = null;
+  state.dashboardTaskFilter = "all";
+  state.expandedArtifactFamilies.clear();
   state.roomSettingsKind = null;
   if (roomSettingsDialog.open) {
     roomSettingsDialog.close();
   }
   if (memoryDialog.open) {
     memoryDialog.close();
+  }
+  if (location.hash === "#project-dashboard") {
+    history.replaceState({}, "", `${location.pathname}${location.search}`);
+    syncProjectDashboardRoute();
   }
   render();
 }
@@ -2530,6 +2713,11 @@ function renderTypingIndicator(indicator) {
 
 function renderTaskBoard() {
   const board = $("#task-board");
+  document.querySelectorAll("[data-dashboard-task-filter]").forEach((button) => {
+    const active = button.dataset.dashboardTaskFilter === state.dashboardTaskFilter;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
+  });
   if (!isProjectStarted()) {
     $("#task-summary").textContent = "未启动";
     board.innerHTML = `<div class="producer-empty-panel">
@@ -2547,7 +2735,13 @@ function renderTaskBoard() {
 
   const buckets = state.taskBoard.buckets;
   $("#task-summary").textContent = `${state.taskBoard.total} 项 · 完成 ${buckets.done}`;
-  board.innerHTML = state.taskBoard.taskGroups
+  const visibleGroups = state.taskBoard.taskGroups
+    .map((group) => ({
+      ...group,
+      tasks: group.tasks.filter((task) => dashboardTaskMatches(task, state.dashboardTaskFilter))
+    }))
+    .filter((group) => group.tasks.length > 0);
+  board.innerHTML = visibleGroups
     .map((group) => `<section class="task-group">
       <div class="task-title">
         <span>${escapeHtml(group.title)}</span>
@@ -2561,7 +2755,21 @@ function renderTaskBoard() {
         </div>`)
         .join("")}
     </section>`)
-    .join("");
+    .join("") || '<div class="producer-empty-panel"><strong>该筛选下暂无任务</strong><span>切换状态筛选查看其他任务。</span></div>';
+}
+
+function dashboardTaskMatches(task, filter) {
+  const statuses = filter === "active"
+    ? ["doing", "review"]
+    : filter === "blocked"
+      ? ["blocked"]
+      : filter === "done"
+        ? ["done"]
+        : null;
+  if (!statuses || statuses.includes(task.status)) {
+    return true;
+  }
+  return (task.subtasks ?? []).some((subtask) => dashboardTaskMatches(subtask, filter));
 }
 
 function renderArtifacts() {
@@ -2575,19 +2783,13 @@ function renderArtifacts() {
   }
 
   const deliverables = state.artifacts.filter((artifact) => artifact.status !== "superseded" && artifact.status !== "rejected");
-  $("#artifact-summary").textContent = String(deliverables.length);
+  const families = groupProjectDeliverables(deliverables);
+  $("#artifact-summary").textContent = deliverables.length
+    ? `${deliverables.length} 个版本 · ${families.length} 组`
+    : "0";
   $("#artifact-list").innerHTML =
-    deliverables
-      .map((artifact) => `<div class="deliverable-row" data-artifact-id="${escapeHtml(artifact.artifactId)}">
-        <button class="deliverable-item" data-preview-artifact type="button" title="预览交付物">
-          <div>
-            <strong>${escapeHtml(deliverableName(artifact))}</strong>
-            <span>${escapeHtml(agentName(artifact.ownerAgentId))} · ${escapeHtml(stageLabels[artifact.stageId] ?? artifact.stageId)}</span>
-          </div>
-          <span class="status-pill status-${escapeHtml(artifact.status)}">${escapeHtml(localStatus(artifact.status))}</span>
-        </button>
-        <button class="deliverable-action-button" data-open-artifact type="button" title="在 Finder 打开" aria-label="在 Finder 打开">${folderIcon()}</button>
-      </div>`)
+    families
+      .map(renderDeliverableFamily)
       .join("") || `<div class="producer-empty-panel">
         <strong>暂无可评审交付物</strong>
         <span>Agent 完成阶段输出后会在这里出现。</span>
@@ -2603,6 +2805,49 @@ function renderArtifacts() {
       openArtifactInFinder(button.closest("[data-artifact-id]").dataset.artifactId).catch((error) => showToast(error.message));
     });
   });
+  $("#artifact-list").querySelectorAll("[data-deliverable-family-toggle]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const familyId = button.dataset.deliverableFamilyToggle;
+      const history = document.getElementById(button.getAttribute("aria-controls"));
+      const expanded = button.getAttribute("aria-expanded") !== "true";
+      button.setAttribute("aria-expanded", String(expanded));
+      button.querySelector("[data-deliverable-toggle-label]").textContent = expanded
+        ? "收起历史版本"
+        : `查看 ${button.dataset.historyCount} 个历史版本`;
+      button.querySelector("svg").classList.toggle("expanded", expanded);
+      history.hidden = !expanded;
+      if (expanded) state.expandedArtifactFamilies.add(familyId);
+      else state.expandedArtifactFamilies.delete(familyId);
+    });
+  });
+}
+
+function renderDeliverableFamily(family, index) {
+  const expanded = state.expandedArtifactFamilies.has(family.familyId);
+  const historyId = `deliverable-history-${index}`;
+  return `<section class="deliverable-family">
+    ${renderDeliverableRow(family.latest, { latest: true })}
+    ${family.history.length ? `<button class="deliverable-family-toggle" data-deliverable-family-toggle="${escapeHtml(family.familyId)}" data-history-count="${family.history.length}" type="button" aria-expanded="${expanded}" aria-controls="${historyId}">
+      <span data-deliverable-toggle-label>${expanded ? "收起历史版本" : `查看 ${family.history.length} 个历史版本`}</span>
+      <svg class="${expanded ? "expanded" : ""}" aria-hidden="true" viewBox="0 0 24 24" width="16" height="16"><path d="m7.4 8.6 4.6 4.6 4.6-4.6L18 10l-6 6-6-6 1.4-1.4Z" fill="currentColor"></path></svg>
+    </button>
+    <div id="${historyId}" class="deliverable-history"${expanded ? "" : " hidden"}>
+      ${family.history.map((artifact) => renderDeliverableRow(artifact, { compact: true })).join("")}
+    </div>` : ""}
+  </section>`;
+}
+
+function renderDeliverableRow(artifact, { latest = false, compact = false } = {}) {
+  return `<div class="deliverable-row${compact ? " deliverable-row-compact" : ""}" data-artifact-id="${escapeHtml(artifact.artifactId)}">
+    <button class="deliverable-item" data-preview-artifact type="button" title="预览${escapeHtml(deliverableName(artifact))}">
+      <div>
+        <div class="deliverable-title-line"><strong>${escapeHtml(deliverableName(artifact))}</strong>${latest ? '<span class="deliverable-latest-label">最新</span>' : ""}</div>
+        <span>${escapeHtml(agentName(artifact.ownerAgentId))} · ${escapeHtml(stageLabels[artifact.stageId] ?? artifact.stageId)}</span>
+      </div>
+      <span class="status-pill status-${escapeHtml(artifact.status)}">${escapeHtml(localStatus(artifact.status))}</span>
+    </button>
+    <button class="deliverable-action-button" data-open-artifact type="button" title="在 Finder 打开" aria-label="在 Finder 打开${escapeHtml(deliverableName(artifact))}">${folderIcon()}</button>
+  </div>`;
 }
 
 function renderProductionAudit() {
@@ -2973,6 +3218,10 @@ function pauseIcon() {
   return '<svg aria-hidden="true" viewBox="0 0 24 24" width="16" height="16"><path d="M7 5h4v14H7V5Zm6 0h4v14h-4V5Z" fill="currentColor"></path></svg>';
 }
 
+function checkIcon() {
+  return '<svg aria-hidden="true" viewBox="0 0 24 24" width="13" height="13"><path d="m9.2 16.2-4-4L6.6 10.8l2.6 2.6 8.2-8.2 1.4 1.4-9.6 9.6Z" fill="currentColor"></path></svg>';
+}
+
 function folderIcon() {
   return '<svg aria-hidden="true" viewBox="0 0 24 24" width="16" height="16"><path d="M3 6a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v1H3V6Zm0 5h18l-2 8H5l-2-8Z" fill="currentColor"></path></svg>';
 }
@@ -2991,6 +3240,7 @@ function escapeHtml(value) {
 }
 
 render();
+syncProjectDashboardRoute();
 loadModelProviders().catch((error) => showToast(error.message));
 loadProjects().catch((error) => showToast(error.message));
 
