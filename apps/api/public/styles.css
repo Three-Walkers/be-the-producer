@@ -458,24 +458,68 @@ textarea {
   margin: 0;
 }
 
-.project-overview-metrics > div {
+.overview-metric-card {
+  position: relative;
   display: grid;
+  align-content: center;
+  justify-items: start;
+  min-height: 76px;
   gap: 4px;
   border: 1px solid #e1e6e2;
   border-radius: 8px;
   background: #f8faf8;
-  padding: 10px;
+  color: var(--text);
+  padding: 10px 32px 10px 10px;
+  text-align: left;
 }
 
-.project-overview-metrics dt {
+.overview-metric-card:hover {
+  border-color: #b8d2c6;
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
+.overview-metric-card:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.overview-metric-card:disabled:hover {
+  border-color: #e1e6e2;
+  background: #f8faf8;
+}
+
+.overview-metric-label {
   color: var(--muted);
   font-size: 11px;
+  font-weight: 500;
+  line-height: 1.4;
 }
 
-.project-overview-metrics dd {
-  margin: 0;
+.overview-metric-value {
   font-size: 17px;
   font-weight: 750;
+  line-height: 1.25;
+}
+
+.metric-card-arrow {
+  position: absolute;
+  top: 12px;
+  right: 10px;
+  color: var(--accent-strong);
+  opacity: 0.42;
+  transform: translateX(-2px);
+  transition:
+    opacity 120ms ease,
+    transform 120ms ease;
+}
+
+.overview-metric-card:hover .metric-card-arrow,
+.overview-metric-card:focus-visible .metric-card-arrow,
+.dashboard-metric-card:hover .metric-card-arrow,
+.dashboard-metric-card:focus-visible .metric-card-arrow {
+  opacity: 1;
+  transform: translateX(0);
 }
 
 .project-dashboard-open {
@@ -3366,7 +3410,7 @@ body.dashboard-page-open {
 
 .dashboard-hero-copy,
 .dashboard-progress-card,
-.dashboard-metric-grid article,
+.dashboard-metric-card,
 .dashboard-stage-section,
 .dashboard-card {
   border: 1px solid var(--line);
@@ -3474,16 +3518,29 @@ body.dashboard-page-open {
   gap: 12px;
 }
 
-.dashboard-metric-grid article {
+.dashboard-metric-card {
+  position: relative;
   display: grid;
+  align-content: center;
+  justify-items: start;
+  min-height: 112px;
   gap: 5px;
-  padding: 18px 20px;
+  color: var(--text);
+  padding: 18px 44px 18px 20px;
+  text-align: left;
 }
 
-.dashboard-metric-grid article > span,
+.dashboard-metric-card:hover {
+  border-color: #b8d2c6;
+  background: #f5faf7;
+  color: var(--text);
+}
+
+.dashboard-metric-card > span,
 .dashboard-metric-grid small {
   color: var(--muted);
   font-size: 12px;
+  line-height: 1.4;
 }
 
 .dashboard-metric-grid strong {
@@ -3635,6 +3692,12 @@ body.dashboard-page-open {
   min-width: 0;
   gap: 16px;
   scroll-margin-top: 70px;
+}
+
+.dashboard-card:focus-visible {
+  border-color: var(--focus);
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.16);
+  outline: 0;
 }
 
 .dashboard-card-heading,

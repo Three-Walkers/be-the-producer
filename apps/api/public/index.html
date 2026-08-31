@@ -124,12 +124,36 @@
             </div>
           </div>
 
-          <dl class="project-overview-metrics">
-            <div><dt>任务</dt><dd id="project-overview-tasks">0 / 0</dd></div>
-            <div><dt>交付物</dt><dd id="project-overview-artifacts">0</dd></div>
-            <div><dt>阻塞</dt><dd id="project-overview-blockers">0</dd></div>
-            <div><dt>活跃团队</dt><dd id="project-overview-teams">0</dd></div>
-          </dl>
+          <div class="project-overview-metrics" aria-label="项目核心指标">
+            <button type="button" class="overview-metric-card" data-open-dashboard-target="dashboard-tasks" disabled>
+              <span class="overview-metric-label">任务</span>
+              <strong id="project-overview-tasks" class="overview-metric-value">0 / 0</strong>
+              <svg class="metric-card-arrow" aria-hidden="true" viewBox="0 0 24 24" width="16" height="16">
+                <path d="M8.6 5.4 15.2 12l-6.6 6.6L10 20l8-8-8-8-1.4 1.4Z" fill="currentColor"></path>
+              </svg>
+            </button>
+            <button type="button" class="overview-metric-card" data-open-dashboard-target="dashboard-artifacts" disabled>
+              <span class="overview-metric-label">交付物</span>
+              <strong id="project-overview-artifacts" class="overview-metric-value">0</strong>
+              <svg class="metric-card-arrow" aria-hidden="true" viewBox="0 0 24 24" width="16" height="16">
+                <path d="M8.6 5.4 15.2 12l-6.6 6.6L10 20l8-8-8-8-1.4 1.4Z" fill="currentColor"></path>
+              </svg>
+            </button>
+            <button type="button" class="overview-metric-card" data-open-dashboard-target="dashboard-audit" disabled>
+              <span class="overview-metric-label">阻塞</span>
+              <strong id="project-overview-blockers" class="overview-metric-value">0</strong>
+              <svg class="metric-card-arrow" aria-hidden="true" viewBox="0 0 24 24" width="16" height="16">
+                <path d="M8.6 5.4 15.2 12l-6.6 6.6L10 20l8-8-8-8-1.4 1.4Z" fill="currentColor"></path>
+              </svg>
+            </button>
+            <button type="button" class="overview-metric-card" data-open-dashboard-target="dashboard-teams" disabled>
+              <span class="overview-metric-label">活跃团队</span>
+              <strong id="project-overview-teams" class="overview-metric-value">0</strong>
+              <svg class="metric-card-arrow" aria-hidden="true" viewBox="0 0 24 24" width="16" height="16">
+                <path d="M8.6 5.4 15.2 12l-6.6 6.6L10 20l8-8-8-8-1.4 1.4Z" fill="currentColor"></path>
+              </svg>
+            </button>
+          </div>
 
           <div class="project-overview-next">
             <span>当前焦点</span>
@@ -199,26 +223,38 @@
           </section>
 
           <section class="dashboard-metric-grid" aria-label="项目核心指标">
-            <article>
+            <button type="button" class="dashboard-metric-card" data-dashboard-target="dashboard-tasks">
               <span>全部任务</span>
               <strong id="dashboard-metric-tasks">0</strong>
               <small id="dashboard-metric-tasks-note">完成 0</small>
-            </article>
-            <article>
+              <svg class="metric-card-arrow" aria-hidden="true" viewBox="0 0 24 24" width="17" height="17">
+                <path d="M8.6 5.4 15.2 12l-6.6 6.6L10 20l8-8-8-8-1.4 1.4Z" fill="currentColor"></path>
+              </svg>
+            </button>
+            <button type="button" class="dashboard-metric-card" data-dashboard-target="dashboard-artifacts">
               <span>当前交付物</span>
               <strong id="dashboard-metric-artifacts">0</strong>
               <small>可预览与审批</small>
-            </article>
-            <article>
+              <svg class="metric-card-arrow" aria-hidden="true" viewBox="0 0 24 24" width="17" height="17">
+                <path d="M8.6 5.4 15.2 12l-6.6 6.6L10 20l8-8-8-8-1.4 1.4Z" fill="currentColor"></path>
+              </svg>
+            </button>
+            <button type="button" class="dashboard-metric-card" data-dashboard-target="dashboard-audit">
               <span>阻塞与高风险</span>
               <strong id="dashboard-metric-blockers">0</strong>
               <small id="dashboard-metric-blockers-note">当前无阻塞</small>
-            </article>
-            <article>
+              <svg class="metric-card-arrow" aria-hidden="true" viewBox="0 0 24 24" width="17" height="17">
+                <path d="M8.6 5.4 15.2 12l-6.6 6.6L10 20l8-8-8-8-1.4 1.4Z" fill="currentColor"></path>
+              </svg>
+            </button>
+            <button type="button" class="dashboard-metric-card" data-dashboard-target="dashboard-teams">
               <span>活跃团队</span>
               <strong id="dashboard-metric-teams">0</strong>
               <small>正在推进或评审</small>
-            </article>
+              <svg class="metric-card-arrow" aria-hidden="true" viewBox="0 0 24 24" width="17" height="17">
+                <path d="M8.6 5.4 15.2 12l-6.6 6.6L10 20l8-8-8-8-1.4 1.4Z" fill="currentColor"></path>
+              </svg>
+            </button>
           </section>
 
           <section class="dashboard-stage-section" aria-labelledby="dashboard-stage-title">
@@ -237,7 +273,7 @@
           </nav>
 
           <div class="dashboard-content-grid">
-            <section id="dashboard-tasks" class="dashboard-card dashboard-card-wide">
+            <section id="dashboard-tasks" class="dashboard-card dashboard-card-wide" tabindex="-1">
               <div class="dashboard-card-heading">
                 <div><span>DELIVERY PLAN</span><h2>任务板</h2></div>
                 <span id="task-summary">0</span>
@@ -251,7 +287,7 @@
               <div id="task-board" class="task-board"></div>
             </section>
 
-            <section id="dashboard-audit" class="dashboard-card">
+            <section id="dashboard-audit" class="dashboard-card" tabindex="-1">
               <div class="dashboard-card-heading">
                 <div><span>EVIDENCE</span><h2>生产审计</h2></div>
                 <span id="audit-summary">待启动</span>
@@ -259,7 +295,7 @@
               <div id="production-audit" class="production-audit"></div>
             </section>
 
-            <section id="dashboard-artifacts" class="dashboard-card">
+            <section id="dashboard-artifacts" class="dashboard-card" tabindex="-1">
               <div class="dashboard-card-heading">
                 <div><span>DELIVERABLES</span><h2>交付物</h2></div>
                 <span id="artifact-summary">0</span>
@@ -267,7 +303,7 @@
               <div id="artifact-list" class="artifact-list"></div>
             </section>
 
-            <section id="dashboard-teams" class="dashboard-card dashboard-card-wide">
+            <section id="dashboard-teams" class="dashboard-card dashboard-card-wide" tabindex="-1">
               <div class="dashboard-card-heading">
                 <div><span>COLLABORATION</span><h2>团队进展</h2></div>
                 <span id="workspace-root">制作人视图</span>

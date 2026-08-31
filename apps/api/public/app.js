@@ -360,8 +360,12 @@ $("#refresh-project-dashboard").addEventListener("click", async () => {
 
 document.querySelectorAll("[data-dashboard-target]").forEach((button) => {
   button.addEventListener("click", () => {
-    document.getElementById(button.dataset.dashboardTarget)?.scrollIntoView({ behavior: reducedMotion() ? "auto" : "smooth", block: "start" });
+    focusDashboardSection(button.dataset.dashboardTarget);
   });
+});
+
+document.querySelectorAll("[data-open-dashboard-target]").forEach((button) => {
+  button.addEventListener("click", () => openDashboardSection(button.dataset.openDashboardTarget));
 });
 
 document.querySelectorAll("[data-dashboard-task-filter]").forEach((button) => {
@@ -381,6 +385,25 @@ function openProjectDashboard() {
   }
   history.pushState({ ...(history.state ?? {}), btpView: "project-dashboard" }, "", "#project-dashboard");
   syncProjectDashboardRoute();
+}
+
+function openDashboardSection(targetId) {
+  if (!state.projectId) {
+    showToast("请先创建或打开一个项目。");
+    return;
+  }
+  if (location.hash !== "#project-dashboard") {
+    history.pushState({ ...(history.state ?? {}), btpView: "project-dashboard" }, "", "#project-dashboard");
+    syncProjectDashboardRoute();
+  }
+  requestAnimationFrame(() => requestAnimationFrame(() => focusDashboardSection(targetId)));
+}
+
+function focusDashboardSection(targetId) {
+  const target = document.getElementById(targetId);
+  if (!target) return;
+  target.scrollIntoView({ behavior: reducedMotion() ? "auto" : "smooth", block: "start" });
+  target.focus({ preventScroll: true });
 }
 
 function closeProjectDashboard() {
@@ -1925,6 +1948,9 @@ function renderProjectOverview() {
         : "启动项目后由 Agents 拆解任务"
       : "创建或选择项目后查看推进重点";
   $("#open-project-dashboard").disabled = !state.project;
+  document.querySelectorAll("[data-open-dashboard-target]").forEach((button) => {
+    button.disabled = !state.project;
+  });
 }
 
 function renderProjectDashboardSummary() {

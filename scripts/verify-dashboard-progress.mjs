@@ -109,13 +109,23 @@ for (const marker of [
 ]) {
   assert.match(html, new RegExp(`id="${marker}"`), `missing project dashboard marker #${marker}`);
 }
+for (const target of ["dashboard-tasks", "dashboard-artifacts", "dashboard-audit", "dashboard-teams"]) {
+  assert.match(html, new RegExp(`data-open-dashboard-target="${target}"`), `main overview must open #${target}`);
+  assert.match(html, new RegExp(`class="dashboard-metric-card" data-dashboard-target="${target}"`), `dashboard metric must open #${target}`);
+  assert.match(html, new RegExp(`id="${target}"[^>]*tabindex="-1"`), `#${target} must accept programmatic focus`);
+}
 assert.match(app, /#project-dashboard/, "the dashboard must have a page-level URL state");
 assert.match(app, /history\.pushState/, "opening the dashboard must preserve browser back navigation");
 assert.match(app, /summarizeProjectDashboard/, "main overview and dashboard metrics must share one summary rule");
 assert.match(app, /data-dashboard-task-filter/, "the detailed task board must support status filtering");
 assert.match(app, /groupProjectDeliverables/, "deliverable versions must use progressive grouping");
 assert.match(app, /data-deliverable-family-toggle/, "historical versions must remain available on demand");
+assert.match(app, /function openDashboardSection/, "main overview metrics must deep-link into dashboard details");
+assert.match(app, /function focusDashboardSection/, "dashboard metric cards must focus their detail section");
 assert.match(css, /\.project-dashboard-page\s*\{/);
+assert.match(css, /\.overview-metric-card\s*\{/, "overview metrics must communicate clickability");
+assert.match(css, /\.dashboard-metric-card\s*\{/, "dashboard metrics must communicate clickability");
+assert.match(css, /\.dashboard-card:focus-visible\s*\{/, "focused dashboard details must remain visible to keyboard users");
 assert.match(css, /\.project-dashboard-page\[hidden\]\s*\{\s*display:\s*none/, "the route-owned dashboard must stay hidden on the main page");
 assert.match(css, /\.deliverable-history\[hidden\]\s*\{\s*display:\s*none/, "collapsed artifact history must not consume dashboard height");
 assert.match(css, /@media \(max-width: 780px\)/, "the dashboard must retain a mobile layout");
