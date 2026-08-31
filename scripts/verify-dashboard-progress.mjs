@@ -1,5 +1,12 @@
 import assert from "node:assert/strict";
-import { selectTeamTasks, summarizeTaskProgress, taskProgressPercent } from "../apps/api/public/dashboard-progress.js";
+import { readFile } from "node:fs/promises";
+import {
+  groupProjectDeliverables,
+  selectTeamTasks,
+  summarizeProjectDashboard,
+  summarizeTaskProgress,
+  taskProgressPercent
+} from "../apps/api/public/dashboard-progress.js";
 
 const designTask = {
   taskId: "design",

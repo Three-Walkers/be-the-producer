@@ -102,40 +102,182 @@
         </section>
       </main>
 
-      <aside class="workspace-column">
-        <section class="panel">
-          <div class="panel-heading">
-            <h2>任务板</h2>
-            <span id="task-summary">0</span>
-          </div>
-          <div id="task-board" class="task-board"></div>
-        </section>
+      <aside class="workspace-column" aria-label="项目概览">
+        <section class="panel project-overview-panel" aria-labelledby="project-overview-title">
+          <header class="project-overview-header">
+            <div>
+              <span>PROJECT OVERVIEW</span>
+              <h2 id="project-overview-title">项目概览</h2>
+            </div>
+            <span id="project-overview-status" class="overview-status-pill">未启动</span>
+          </header>
 
-        <section class="panel">
-          <div class="panel-heading">
-            <h2>交付物</h2>
-            <span id="artifact-summary">0</span>
+          <div class="project-overview-stage">
+            <span>当前阶段</span>
+            <strong id="project-overview-stage">等待创建项目</strong>
           </div>
-          <div id="artifact-list" class="artifact-list"></div>
-        </section>
 
-        <section class="panel">
-          <div class="panel-heading">
-            <h2>生产审计</h2>
-            <span id="audit-summary">待启动</span>
+          <div class="project-overview-progress">
+            <div><span>核心任务进度</span><strong id="project-overview-progress-value">0%</strong></div>
+            <div class="overview-progress-track" aria-label="项目核心任务进度">
+              <span id="project-overview-progress-bar" style="width: 0%"></span>
+            </div>
           </div>
-          <div id="production-audit" class="production-audit"></div>
-        </section>
 
-        <section class="panel">
-          <div class="panel-heading">
-            <h2>团队进展</h2>
-            <span id="workspace-root">制作人视图</span>
+          <dl class="project-overview-metrics">
+            <div><dt>任务</dt><dd id="project-overview-tasks">0 / 0</dd></div>
+            <div><dt>交付物</dt><dd id="project-overview-artifacts">0</dd></div>
+            <div><dt>阻塞</dt><dd id="project-overview-blockers">0</dd></div>
+            <div><dt>活跃团队</dt><dd id="project-overview-teams">0</dd></div>
+          </dl>
+
+          <div class="project-overview-next">
+            <span>当前焦点</span>
+            <strong id="project-overview-next">创建或选择项目后查看推进重点</strong>
           </div>
-          <div id="workspace-tree" class="workspace-tree"></div>
+
+          <button id="open-project-dashboard" class="project-dashboard-open" type="button" disabled>
+            <span>查看项目 Dashboard</span>
+            <svg aria-hidden="true" viewBox="0 0 24 24" width="17" height="17">
+              <path d="M8.6 5.4 15.2 12l-6.6 6.6L10 20l8-8-8-8-1.4 1.4Z" fill="currentColor"></path>
+            </svg>
+          </button>
+          <p class="project-overview-note">任务、交付物、审计证据和团队详情已集中到 Dashboard。</p>
         </section>
       </aside>
     </div>
+
+    <section id="project-dashboard-page" class="project-dashboard-page" aria-labelledby="dashboard-page-title" hidden>
+      <header class="dashboard-page-header">
+        <div class="dashboard-header-inner">
+          <button id="close-project-dashboard" class="dashboard-back-button" type="button" aria-label="返回工作室">
+            <svg aria-hidden="true" viewBox="0 0 24 24" width="18" height="18">
+              <path d="m15.4 5.4-1.4-1.4-8 8 8 8 1.4-1.4L8.8 12l6.6-6.6Z" fill="currentColor"></path>
+            </svg>
+            <span>返回工作室</span>
+          </button>
+          <div class="dashboard-header-project">
+            <span>PROJECT DASHBOARD</span>
+            <strong id="dashboard-header-project-name">未选择项目</strong>
+          </div>
+          <div class="dashboard-header-actions">
+            <button id="dashboard-open-memory" class="dashboard-secondary-button" type="button">
+              <svg aria-hidden="true" viewBox="0 0 24 24" width="16" height="16">
+                <path d="M5 5.5C5 4.12 8.13 3 12 3s7 1.12 7 2.5S15.87 8 12 8 5 6.88 5 5.5Zm0 4C5 10.88 8.13 12 12 12s7-1.12 7-2.5V13c0 1.38-3.13 2.5-7 2.5S5 14.38 5 13V9.5Zm0 7.5v-3.5C5 14.88 8.13 16 12 16s7-1.12 7-2.5V17c0 1.38-3.13 2.5-7 2.5S5 18.38 5 17Z" fill="currentColor"></path>
+              </svg>
+              记忆中枢
+            </button>
+            <button id="refresh-project-dashboard" class="dashboard-primary-button" type="button">
+              <svg aria-hidden="true" viewBox="0 0 24 24" width="16" height="16">
+                <path d="M18.7 7.3A8 8 0 1 0 20 14h-2.1A6 6 0 1 1 16.6 8.6L14 11h7V4l-2.3 2.3Z" fill="currentColor"></path>
+              </svg>
+              <span>刷新数据</span>
+            </button>
+          </div>
+        </div>
+      </header>
+
+      <div class="dashboard-page-scroll">
+        <main class="dashboard-page-main">
+          <section class="dashboard-hero" aria-labelledby="dashboard-page-title">
+            <div class="dashboard-hero-copy">
+              <span class="dashboard-kicker">项目推进总览</span>
+              <h1 id="dashboard-page-title">未选择项目</h1>
+              <p id="dashboard-page-summary">在一个页面查看阶段目标、任务执行、交付证据和团队协作状态。</p>
+              <div class="dashboard-hero-status">
+                <span id="dashboard-stage-pill" class="dashboard-stage-pill">等待 idea</span>
+                <span id="dashboard-execution-pill" class="dashboard-execution-pill">未启动</span>
+              </div>
+            </div>
+            <div class="dashboard-progress-card">
+              <div><span>核心任务进度</span><strong id="dashboard-progress-value">0%</strong></div>
+              <div class="dashboard-progress-track" aria-label="项目核心任务进度">
+                <span id="dashboard-progress-bar" style="width: 0%"></span>
+              </div>
+              <p id="dashboard-next-action">等待项目启动后生成下一步。</p>
+            </div>
+          </section>
+
+          <section class="dashboard-metric-grid" aria-label="项目核心指标">
+            <article>
+              <span>全部任务</span>
+              <strong id="dashboard-metric-tasks">0</strong>
+              <small id="dashboard-metric-tasks-note">完成 0</small>
+            </article>
+            <article>
+              <span>当前交付物</span>
+              <strong id="dashboard-metric-artifacts">0</strong>
+              <small>可预览与审批</small>
+            </article>
+            <article>
+              <span>阻塞与高风险</span>
+              <strong id="dashboard-metric-blockers">0</strong>
+              <small id="dashboard-metric-blockers-note">当前无阻塞</small>
+            </article>
+            <article>
+              <span>活跃团队</span>
+              <strong id="dashboard-metric-teams">0</strong>
+              <small>正在推进或评审</small>
+            </article>
+          </section>
+
+          <section class="dashboard-stage-section" aria-labelledby="dashboard-stage-title">
+            <div class="dashboard-section-title">
+              <div><span>WORKFLOW</span><h2 id="dashboard-stage-title">生产阶段</h2></div>
+              <span id="dashboard-stage-summary">等待项目启动</span>
+            </div>
+            <div id="dashboard-stage-track" class="dashboard-stage-track"></div>
+          </section>
+
+          <nav class="dashboard-section-nav" aria-label="Dashboard 分区导航">
+            <button type="button" data-dashboard-target="dashboard-tasks">任务板</button>
+            <button type="button" data-dashboard-target="dashboard-artifacts">交付物</button>
+            <button type="button" data-dashboard-target="dashboard-audit">生产审计</button>
+            <button type="button" data-dashboard-target="dashboard-teams">团队进展</button>
+          </nav>
+
+          <div class="dashboard-content-grid">
+            <section id="dashboard-tasks" class="dashboard-card dashboard-card-wide">
+              <div class="dashboard-card-heading">
+                <div><span>DELIVERY PLAN</span><h2>任务板</h2></div>
+                <span id="task-summary">0</span>
+              </div>
+              <div class="dashboard-task-filters" role="group" aria-label="任务状态筛选">
+                <button type="button" data-dashboard-task-filter="all" aria-pressed="true">全部</button>
+                <button type="button" data-dashboard-task-filter="active" aria-pressed="false">进行中</button>
+                <button type="button" data-dashboard-task-filter="blocked" aria-pressed="false">阻塞</button>
+                <button type="button" data-dashboard-task-filter="done" aria-pressed="false">已完成</button>
+              </div>
+              <div id="task-board" class="task-board"></div>
+            </section>
+
+            <section id="dashboard-audit" class="dashboard-card">
+              <div class="dashboard-card-heading">
+                <div><span>EVIDENCE</span><h2>生产审计</h2></div>
+                <span id="audit-summary">待启动</span>
+              </div>
+              <div id="production-audit" class="production-audit"></div>
+            </section>
+
+            <section id="dashboard-artifacts" class="dashboard-card">
+              <div class="dashboard-card-heading">
+                <div><span>DELIVERABLES</span><h2>交付物</h2></div>
+                <span id="artifact-summary">0</span>
+              </div>
+              <div id="artifact-list" class="artifact-list"></div>
+            </section>
+
+            <section id="dashboard-teams" class="dashboard-card dashboard-card-wide">
+              <div class="dashboard-card-heading">
+                <div><span>COLLABORATION</span><h2>团队进展</h2></div>
+                <span id="workspace-root">制作人视图</span>
+              </div>
+              <div id="workspace-tree" class="workspace-tree dashboard-team-grid"></div>
+            </section>
+          </div>
+        </main>
+      </div>
+    </section>
 
     <dialog id="memory-dialog" class="memory-dialog">
       <section class="memory-surface" aria-labelledby="memory-dialog-title">
