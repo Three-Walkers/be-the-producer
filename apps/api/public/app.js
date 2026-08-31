@@ -2783,19 +2783,13 @@ function renderArtifacts() {
   }
 
   const deliverables = state.artifacts.filter((artifact) => artifact.status !== "superseded" && artifact.status !== "rejected");
-  $("#artifact-summary").textContent = String(deliverables.length);
+  const families = groupProjectDeliverables(deliverables);
+  $("#artifact-summary").textContent = deliverables.length
+    ? `${deliverables.length} 个版本 · ${families.length} 组`
+    : "0";
   $("#artifact-list").innerHTML =
-    deliverables
-      .map((artifact) => `<div class="deliverable-row" data-artifact-id="${escapeHtml(artifact.artifactId)}">
-        <button class="deliverable-item" data-preview-artifact type="button" title="预览交付物">
-          <div>
-            <strong>${escapeHtml(deliverableName(artifact))}</strong>
-            <span>${escapeHtml(agentName(artifact.ownerAgentId))} · ${escapeHtml(stageLabels[artifact.stageId] ?? artifact.stageId)}</span>
-          </div>
-          <span class="status-pill status-${escapeHtml(artifact.status)}">${escapeHtml(localStatus(artifact.status))}</span>
-        </button>
-        <button class="deliverable-action-button" data-open-artifact type="button" title="在 Finder 打开" aria-label="在 Finder 打开">${folderIcon()}</button>
-      </div>`)
+    families
+      .map(renderDeliverableFamily)
       .join("") || `<div class="producer-empty-panel">
         <strong>暂无可评审交付物</strong>
         <span>Agent 完成阶段输出后会在这里出现。</span>
@@ -2811,6 +2805,49 @@ function renderArtifacts() {
       openArtifactInFinder(button.closest("[data-artifact-id]").dataset.artifactId).catch((error) => showToast(error.message));
     });
   });
+  $("#artifact-list").querySelectorAll("[data-deliverable-family-toggle]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const familyId = button.dataset.deliverableFamilyToggle;
+      const history = document.getElementById(button.getAttribute("aria-controls"));
+      const expanded = button.getAttribute("aria-expanded") !== "true";
+      button.setAttribute("aria-expanded", String(expanded));
+      button.querySelector("[data-deliverable-toggle-label]").textContent = expanded
+        ? "收起历史版本"
+        : `查看 ${button.dataset.historyCount} 个历史版本`;
+      button.querySelector("svg").classList.toggle("expanded", expanded);
+      history.hidden = !expanded;
+      if (expanded) state.expandedArtifactFamilies.add(familyId);
+      else state.expandedArtifactFamilies.delete(familyId);
+    });
+  });
+}
+
+function renderDeliverableFamily(family, index) {
+  const expanded = state.expandedArtifactFamilies.has(family.familyId);
+  const historyId = `deliverable-history-${index}`;
+  return `<section class="deliverable-family">
+    ${renderDeliverableRow(family.latest, { latest: true })}
+    ${family.history.length ? `<button class="deliverable-family-toggle" data-deliverable-family-toggle="${escapeHtml(family.familyId)}" data-history-count="${family.history.length}" type="button" aria-expanded="${expanded}" aria-controls="${historyId}">
+      <span data-deliverable-toggle-label>${expanded ? "收起历史版本" : `查看 ${family.history.length} 个历史版本`}</span>
+      <svg class="${expanded ? "expanded" : ""}" aria-hidden="true" viewBox="0 0 24 24" width="16" height="16"><path d="m7.4 8.6 4.6 4.6 4.6-4.6L18 10l-6 6-6-6 1.4-1.4Z" fill="currentColor"></path></svg>
+    </button>
+    <div id="${historyId}" class="deliverable-history"${expanded ? "" : " hidden"}>
+      ${family.history.map((artifact) => renderDeliverableRow(artifact, { compact: true })).join("")}
+    </div>` : ""}
+  </section>`;
+}
+
+function renderDeliverableRow(artifact, { latest = false, compact = false } = {}) {
+  return `<div class="deliverable-row${compact ? " deliverable-row-compact" : ""}" data-artifact-id="${escapeHtml(artifact.artifactId)}">
+    <button class="deliverable-item" data-preview-artifact type="button" title="预览${escapeHtml(deliverableName(artifact))}">
+      <div>
+        <div class="deliverable-title-line"><strong>${escapeHtml(deliverableName(artifact))}</strong>${latest ? '<span class="deliverable-latest-label">最新</span>' : ""}</div>
+        <span>${escapeHtml(agentName(artifact.ownerAgentId))} · ${escapeHtml(stageLabels[artifact.stageId] ?? artifact.stageId)}</span>
+      </div>
+      <span class="status-pill status-${escapeHtml(artifact.status)}">${escapeHtml(localStatus(artifact.status))}</span>
+    </button>
+    <button class="deliverable-action-button" data-open-artifact type="button" title="在 Finder 打开" aria-label="在 Finder 打开${escapeHtml(deliverableName(artifact))}">${folderIcon()}</button>
+  </div>`;
 }
 
 function renderProductionAudit() {
