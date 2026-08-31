@@ -19,6 +19,15 @@ export interface MemoryQuery {
   status?: MemoryStatus | MemoryStatus[];
 }
 
+const defaultSharedDurableScopes: readonly MemoryScope[] = ["project", "decision", "producer_preference"];
+
+export function memoryRecordIsInjectedIntoDurablePack(record: MemoryRecord, agentId?: AgentId): boolean {
+  return (
+    record.status === "active" &&
+    (defaultSharedDurableScopes.includes(record.scope) || Boolean(agentId && record.ownerAgent === agentId))
+  );
+}
+
 export class InMemoryProductionMemory {
   private readonly records: MemoryRecord[];
 
@@ -64,12 +73,11 @@ export class InMemoryProductionMemory {
       projectId: input.projectId,
       status: "active"
     });
+    const injectedRecords = activeRecords.filter((record) =>
+      memoryRecordIsInjectedIntoDurablePack(record, input.agentId)
+    );
     const roleRecords = input.agentId
-      ? this.query({
-          projectId: input.projectId,
-          ownerAgent: input.agentId,
-          status: "active"
-        })
+      ? injectedRecords.filter((record) => record.ownerAgent === input.agentId)
       : [];
 
     const openTasks = input.tasks.filter(
@@ -81,13 +89,13 @@ export class InMemoryProductionMemory {
     const blockers = openTasks.filter((task) => task.status === "blocked");
 
     return {
-      projectBrief: activeRecords
+      projectBrief: injectedRecords
         .filter((record) => record.scope === "project")
         .map((record) => record.content)
         .join("\n"),
       stageSnapshot: `Current stage: ${input.stageId}`,
-      activeDecisions: activeRecords.filter((record) => record.scope === "decision"),
-      producerPreferences: activeRecords.filter((record) => record.scope === "producer_preference"),
+      activeDecisions: injectedRecords.filter((record) => record.scope === "decision"),
+      producerPreferences: injectedRecords.filter((record) => record.scope === "producer_preference"),
       ...(roleRecords.length > 0 ? { roleWorkspaceSummary: roleRecords.map((record) => record.content).join("\n") } : {}),
       openTasks,
       blockers,

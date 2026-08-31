@@ -63,7 +63,16 @@
               </div>
             </div>
           </div>
-          <div class="stage-pill" id="project-stage">等待 idea</div>
+          <div class="topbar-actions">
+            <button id="open-memory" class="memory-open-button" type="button" aria-label="打开 Agent 记忆中枢" title="查看每个 Agent 的持久记忆与上下文注入">
+              <svg aria-hidden="true" viewBox="0 0 24 24" width="16" height="16">
+                <path d="M5 5.5C5 4.12 8.13 3 12 3s7 1.12 7 2.5S15.87 8 12 8 5 6.88 5 5.5Zm0 4C5 10.88 8.13 12 12 12s7-1.12 7-2.5V13c0 1.38-3.13 2.5-7 2.5S5 14.38 5 13V9.5Zm0 7.5v-3.5C5 14.88 8.13 16 12 16s7-1.12 7-2.5V17c0 1.38-3.13 2.5-7 2.5S5 18.38 5 17Z" fill="currentColor"></path>
+              </svg>
+              <span>记忆中枢</span>
+              <span id="memory-count-badge" class="memory-count-badge" aria-label="记忆条数">0</span>
+            </button>
+            <div class="stage-pill" id="project-stage">等待 idea</div>
+          </div>
         </header>
 
         <section class="chat-panel">
@@ -127,6 +136,118 @@
         </section>
       </aside>
     </div>
+
+    <dialog id="memory-dialog" class="memory-dialog">
+      <section class="memory-surface" aria-labelledby="memory-dialog-title">
+        <header class="memory-header">
+          <div>
+            <div class="memory-kicker">PRODUCTION MEMORY / READ ONLY</div>
+            <h2 id="memory-dialog-title">Agent 记忆中枢</h2>
+            <p id="memory-dialog-summary">查看结构化长期记忆、归属关系，以及本轮真正进入 Agent 上下文的内容。</p>
+          </div>
+          <button id="close-memory" class="icon-button" type="button" aria-label="关闭记忆中枢" title="关闭">
+            <svg aria-hidden="true" viewBox="0 0 24 24" width="18" height="18">
+              <path d="m6.4 5 5.6 5.6L17.6 5 19 6.4 13.4 12l5.6 5.6-1.4 1.4-5.6-5.6L6.4 19 5 17.6l5.6-5.6L5 6.4 6.4 5Z" fill="currentColor"></path>
+            </svg>
+          </button>
+        </header>
+
+        <div class="memory-metrics" aria-label="记忆概览">
+          <div><span>全部记录</span><strong id="memory-metric-total">0</strong></div>
+          <div><span>当前有效</span><strong id="memory-metric-active">0</strong></div>
+          <div><span>当前注入</span><strong id="memory-metric-injected">0</strong></div>
+          <div><span>历史留档</span><strong id="memory-metric-history">0</strong></div>
+        </div>
+
+        <div class="memory-toolbar" aria-label="记忆筛选">
+          <label class="memory-search-field">
+            <span>搜索</span>
+            <input id="memory-search" type="search" autocomplete="off" placeholder="内容、类型、ID 或来源" />
+          </label>
+          <label>
+            <span>关系</span>
+            <select id="memory-relation-filter">
+              <option value="all">全部相关记录</option>
+              <option value="injected">本轮会注入</option>
+              <option value="owned">Agent 自有</option>
+              <option value="readable">权限可读</option>
+              <option value="historical">历史状态</option>
+            </select>
+          </label>
+          <label>
+            <span>作用域</span>
+            <select id="memory-scope-filter">
+              <option value="all">全部作用域</option>
+              <option value="project">项目</option>
+              <option value="role">角色</option>
+              <option value="decision">决策</option>
+              <option value="artifact">产物</option>
+              <option value="qa">测试</option>
+              <option value="release">发布</option>
+              <option value="producer_preference">制作人偏好</option>
+              <option value="knowledge">知识</option>
+            </select>
+          </label>
+          <label>
+            <span>状态</span>
+            <select id="memory-status-filter">
+              <option value="all">全部状态</option>
+              <option value="active">当前有效</option>
+              <option value="draft">草案</option>
+              <option value="superseded">已替换</option>
+              <option value="rejected">已否决</option>
+              <option value="archived">已归档</option>
+            </select>
+          </label>
+          <button id="refresh-memory" class="memory-refresh-button" type="button" title="重新读取当前项目记忆">
+            <svg aria-hidden="true" viewBox="0 0 24 24" width="15" height="15">
+              <path d="M18.7 7.3A8 8 0 1 0 20 14h-2.1A6 6 0 1 1 16.6 8.6L14 11h7V4l-2.3 2.3Z" fill="currentColor"></path>
+            </svg>
+            刷新
+          </button>
+        </div>
+
+        <div class="memory-layout">
+          <aside class="memory-agent-panel" aria-label="Agent 列表">
+            <div class="memory-section-heading">
+              <div>
+                <span>AGENTS</span>
+                <strong>逐角色查看</strong>
+              </div>
+              <span id="memory-agent-count">0</span>
+            </div>
+            <div id="memory-agent-list" class="memory-agent-list"></div>
+          </aside>
+
+          <main class="memory-feed-panel">
+            <div class="memory-section-heading">
+              <div>
+                <span id="memory-feed-kicker">MEMORY RECORDS</span>
+                <strong id="memory-feed-title">请选择 Agent</strong>
+              </div>
+              <span id="memory-feed-count" aria-live="polite">0 条</span>
+            </div>
+            <div id="memory-feed" class="memory-feed">
+              <div class="memory-empty"><strong>尚未加载记忆</strong><span>选择项目后打开记忆中枢。</span></div>
+            </div>
+          </main>
+
+          <aside id="memory-inspector" class="memory-inspector" aria-label="记忆详情">
+            <div class="memory-empty"><strong>记录详情</strong><span>选择中间的记忆卡片查看来源、状态和注入关系。</span></div>
+          </aside>
+        </div>
+
+        <footer class="memory-flow" aria-label="记忆处理流程">
+          <div><span>1</span><strong>事实写入</strong><small>MemoryRecord + 来源引用</small></div>
+          <i aria-hidden="true"></i>
+          <div><span>2</span><strong>持久化</strong><small>项目快照 + JSONL</small></div>
+          <i aria-hidden="true"></i>
+          <div><span>3</span><strong>上下文拼装</strong><small>active + 角色/共享规则</small></div>
+          <i aria-hidden="true"></i>
+          <div><span>4</span><strong>模型调用</strong><small>durable_memory · 10k 字符上限</small></div>
+        </footer>
+      </section>
+    </dialog>
 
     <dialog id="settings-dialog" class="settings-dialog">
       <div class="settings-surface">

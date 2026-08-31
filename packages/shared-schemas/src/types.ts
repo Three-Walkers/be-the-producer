@@ -22,6 +22,7 @@ export type ContextHealthStatus = "healthy" | "degraded" | "stale" | "oversized"
 export type ContextPacketLayerKind =
   | "identity"
   | "durable_memory"
+  | "skill_guidance"
   | "role_cross_room_memory"
   | "task_state"
   | "artifact_evidence"
@@ -68,6 +69,8 @@ export interface ContextPacket {
   cursorBefore: RoomContextCursor;
   cursorAfter: RoomContextCursor;
   layers: ContextPacketLayer[];
+  /** Skills actually injected into this model call. Optional for legacy snapshots. */
+  activatedSkills?: ActivatedAgentSkill[];
   health: ContextHealth;
   createdAt: string;
 }
@@ -339,6 +342,51 @@ export interface AgentMemoryScopes {
   write: MemoryScope[];
 }
 
+export type AgentSkillRiskLevel = "standard" | "high";
+export type AgentSkillActivationPolicy = "automatic" | "workflow_gate" | "manual_only";
+export type AgentSkillActivationSource = "automatic" | "producer_requested" | "workflow_approved";
+export type AgentSkillAvailabilityStatus = "active" | "available" | "awaiting_approval" | "disabled" | "not_applicable";
+
+export type ArtifactType =
+  | "gdd"
+  | "game_contract"
+  | "art_bible"
+  | "asset_spec"
+  | "asset"
+  | "asset_manifest"
+  | "scene_blueprint"
+  | "playtest_contract"
+  | "source_code"
+  | "build"
+  | "qa_report"
+  | "quality_review"
+  | "bug_report"
+  | "deployment_plan"
+  | "deployment_report"
+  | "rollback_plan"
+  | "release_notes";
+
+export interface AgentSkillBinding {
+  skillId: string;
+  activationPolicy: AgentSkillActivationPolicy;
+  priority: number;
+  stages?: StageId[];
+  approvedStages?: StageId[];
+  activationKeywords?: string[];
+  inputArtifactTypes?: ArtifactType[];
+  outputArtifactTypes?: ArtifactType[];
+}
+
+export interface ActivatedAgentSkill {
+  skillId: string;
+  name: string;
+  version: string;
+  contentHash: string;
+  riskLevel: AgentSkillRiskLevel;
+  activationSource: AgentSkillActivationSource;
+  reason: string;
+}
+
 export interface AgentContract {
   agentId: AgentId;
   displayName: string;
@@ -348,6 +396,8 @@ export interface AgentContract {
   modelProfile: AgentModelProfile;
   workspace: string;
   memoryScopes: AgentMemoryScopes;
+  /** Role allowlist. A binding never grants tools or workspace access. */
+  skillBindings: AgentSkillBinding[];
   tools: string[];
   forbiddenActions: string[];
   handoffTargets: AgentId[];
@@ -436,24 +486,7 @@ export interface Decision {
 export interface Artifact {
   artifactId: ArtifactId;
   projectId: ProjectId;
-  type:
-    | "gdd"
-    | "game_contract"
-    | "art_bible"
-    | "asset_spec"
-    | "asset"
-    | "asset_manifest"
-    | "scene_blueprint"
-    | "playtest_contract"
-    | "source_code"
-    | "build"
-    | "qa_report"
-    | "quality_review"
-    | "bug_report"
-    | "deployment_plan"
-    | "deployment_report"
-    | "rollback_plan"
-    | "release_notes";
+  type: ArtifactType;
   path: string;
   ownerAgentId: AgentId;
   stageId: StageId;

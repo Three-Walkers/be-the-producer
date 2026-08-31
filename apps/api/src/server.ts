@@ -17,6 +17,7 @@ import {
   type ApiSecurityConfig
 } from "./apiSecurity.js";
 import { resolvePathWithinRoot } from "./pathSafety.js";
+import { buildProjectMemoryView } from "./projectMemoryView.js";
 
 const defaultPort = 8787;
 const publicRoot = join(resolveRepoRoot(), "apps", "api", "public");
@@ -122,7 +123,11 @@ export async function handleRequest(
 
     if (
       request.method === "GET" &&
-      (url.pathname === "/" || url.pathname === "/app.js" || url.pathname === "/dashboard-progress.js" || url.pathname === "/styles.css")
+      (url.pathname === "/" ||
+        url.pathname === "/app.js" ||
+        url.pathname === "/dashboard-progress.js" ||
+        url.pathname === "/memory-dashboard.js" ||
+        url.pathname === "/styles.css")
     ) {
       await sendStatic(response, url.pathname === "/" ? "index.html" : url.pathname.slice(1));
       return;
@@ -396,12 +401,7 @@ export async function handleRequest(
     }
 
     if (request.method === "GET" && resource === "memory") {
-      sendJson(response, 200, {
-        memory: kernel.memory.query({
-          projectId: projectRoute.projectId,
-          status: ["active", "draft", "superseded", "rejected"]
-        })
-      });
+      sendJson(response, 200, buildProjectMemoryView(kernel));
       return;
     }
 

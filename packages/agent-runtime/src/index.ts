@@ -5,6 +5,7 @@ export * from "./audit/auditLog.js";
 export * from "./chat/defaultRooms.js";
 export * from "./chat/router.js";
 export * from "./memory/memoryStore.js";
+export * from "./skills/index.js";
 export * from "./studio/studioKernel.js";
 export * from "./tasks/taskBoard.js";
 export * from "./templates/index.js";

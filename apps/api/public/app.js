@@ -1,4 +1,5 @@
 import { selectTeamTasks, summarizeTaskProgress, taskProgressPercent } from "/dashboard-progress.js";
+import { filterMemoryRecords, memoryRelation, summarizeAgentMemory } from "/memory-dashboard.js";
 
 const state = {
   projectId: null,
@@ -13,6 +14,10 @@ const state = {
   taskBoard: null,
   artifacts: [],
   productionAudit: null,
+  memoryView: null,
+  memorySelectedAgentId: null,
+  memorySelectedRecordId: null,
+  memoryLoading: false,
   workspace: null,
   agentLoop: null,
   modelProviders: [],
@@ -221,12 +226,55 @@ const statusLabels = {
   superseded: "已替换"
 };
 
+const memoryScopeLabels = {
+  project: "项目",
+  role: "角色",
+  decision: "决策",
+  artifact: "产物",
+  qa: "测试",
+  release: "发布",
+  producer_preference: "制作人偏好",
+  knowledge: "知识"
+};
+
+const memoryStatusLabels = {
+  active: "当前有效",
+  draft: "草案",
+  superseded: "已替换",
+  rejected: "已否决",
+  archived: "已归档"
+};
+
+const memoryRuntimeLabels = {
+  idle: "空闲",
+  queued: "排队",
+  working: "工作中",
+  waiting: "等待",
+  blocked: "阻塞",
+  error: "异常"
+};
+
+const skillStatusLabels = {
+  active: "匹配激活",
+  available: "可手动指定",
+  awaiting_approval: "等待工作流批准",
+  disabled: "本轮禁用",
+  not_applicable: "当前不适用"
+};
+
+const skillActivationSourceLabels = {
+  automatic: "任务自动匹配",
+  producer_requested: "制作人指定",
+  workflow_approved: "工作流已批准"
+};
+
 const $ = (selector) => document.querySelector(selector);
 const settingsDialog = $("#settings-dialog");
 const startConfirmDialog = $("#start-confirm-dialog");
 const deleteConfirmDialog = $("#delete-confirm-dialog");
 const artifactPreviewDialog = $("#artifact-preview-dialog");
 const roomSettingsDialog = $("#room-settings-dialog");
+const memoryDialog = $("#memory-dialog");
 const messageContentInput = $("#message-content");
 const mentionSuggestions = $("#mention-suggestions");
 let pendingStartProjectId = null;
@@ -255,6 +303,35 @@ settingsDialog.addEventListener("click", (event) => {
     settingsDialog.close();
   }
 });
+
+$("#open-memory").addEventListener("click", () => {
+  if (!state.projectId) {
+    showToast("请先创建或打开一个项目。");
+    return;
+  }
+  memoryDialog.showModal();
+  loadMemoryView().catch((error) => {
+    state.memoryLoading = false;
+    renderMemoryDashboard();
+    showToast(`记忆加载失败：${error.message}`);
+  });
+});
+
+$("#close-memory").addEventListener("click", () => memoryDialog.close());
+memoryDialog.addEventListener("click", (event) => {
+  if (event.target === memoryDialog) {
+    memoryDialog.close();
+  }
+});
+
+$("#refresh-memory").addEventListener("click", () => {
+  loadMemoryView({ preserveSelection: true }).catch((error) => showToast(`记忆刷新失败：${error.message}`));
+});
+
+$("#memory-search").addEventListener("input", renderMemoryDashboard);
+$("#memory-relation-filter").addEventListener("change", renderMemoryDashboard);
+$("#memory-scope-filter").addEventListener("change", renderMemoryDashboard);
+$("#memory-status-filter").addEventListener("change", renderMemoryDashboard);
 
 function closeStartConfirmation() {
   pendingStartProjectId = null;
@@ -941,6 +1018,9 @@ async function loadProject(projectId) {
   state.activeRoomKind = "studio-main";
   state.pendingAgentResponses = [];
   state.agentActivities = [];
+  state.memoryView = null;
+  state.memorySelectedAgentId = null;
+  state.memorySelectedRecordId = null;
   await refreshProject();
 }
 
@@ -955,6 +1035,283 @@ function render() {
   renderArtifacts();
   renderProductionAudit();
   renderWorkspace();
+}
+
+async function loadMemoryView({ preserveSelection = false } = {}) {
+  ensureProject();
+  const projectId = state.projectId;
+  state.memoryLoading = true;
+  renderMemoryDashboard();
+  const memoryView = await request(`/projects/${projectId}/memory`);
+  if (state.projectId !== projectId) {
+    return;
+  }
+
+  state.memoryView = memoryView;
+  state.memoryLoading = false;
+  const selectionStillExists = memoryView.agents.some((agent) => agent.agentId === state.memorySelectedAgentId);
+  if (!preserveSelection || !selectionStillExists) {
+    const activeAgentId = state.agentLoop?.activeAgentIds?.find((agentId) =>
+      memoryView.agents.some((agent) => agent.agentId === agentId)
+    );
+    const firstWithMemory = memoryView.agents.find((agent) => agent.ownedMemoryIds.length > 0 || agent.injectedMemoryIds.length > 0);
+    state.memorySelectedAgentId = activeAgentId ?? firstWithMemory?.agentId ?? memoryView.agents[0]?.agentId ?? null;
+    state.memorySelectedRecordId = null;
+  }
+  renderProjectHeader();
+  renderMemoryDashboard();
+}
+
+function renderMemoryDashboard() {
+  const view = state.memoryView;
+  const agentList = $("#memory-agent-list");
+  const feed = $("#memory-feed");
+  const inspector = $("#memory-inspector");
+  $("#refresh-memory").disabled = state.memoryLoading || !state.projectId;
+
+  if (state.memoryLoading && !view) {
+    $("#memory-dialog-summary").textContent = "正在从当前项目快照读取结构化记忆与 Agent 上下文视图。";
+    agentList.innerHTML = memoryLoadingRows(7);
+    feed.innerHTML = '<div class="memory-empty"><strong>正在装载记忆</strong><span>正在计算每个 Agent 的所有权、读取范围和实际注入集合。</span></div>';
+    inspector.innerHTML = '<div class="memory-empty"><strong>正在建立上下文视图</strong><span>这一步不会调用模型，也不会修改任何记忆。</span></div>';
+    return;
+  }
+
+  if (!view) {
+    $("#memory-dialog-summary").textContent = "打开项目后，可查看每个 Agent 的长期记忆与上下文注入。";
+    $("#memory-agent-count").textContent = "0";
+    agentList.innerHTML = '<div class="memory-empty compact"><strong>暂无数据</strong><span>请先打开一个项目。</span></div>';
+    feed.innerHTML = '<div class="memory-empty"><strong>尚未加载记忆</strong><span>选择项目后点击刷新。</span></div>';
+    inspector.innerHTML = '<div class="memory-empty"><strong>记录详情</strong><span>选择一条记忆后显示来源与注入关系。</span></div>';
+    return;
+  }
+
+  const selectedAgent = view.agents.find((agent) => agent.agentId === state.memorySelectedAgentId) ?? view.agents[0];
+  if (selectedAgent && selectedAgent.agentId !== state.memorySelectedAgentId) {
+    state.memorySelectedAgentId = selectedAgent.agentId;
+  }
+  const agentSummary = summarizeAgentMemory(selectedAgent, view.records);
+  $("#memory-dialog-summary").textContent = `${view.projectName} · ${stageLabels[view.currentStage] ?? view.currentStage}。结构化事实来自项目快照；会话摘要在模型调用时另行拼装。`;
+  $("#memory-metric-total").textContent = String(view.summary.total);
+  $("#memory-metric-active").textContent = String(view.summary.active);
+  $("#memory-metric-injected").textContent = String(agentSummary.injected);
+  $("#memory-metric-history").textContent = String(view.summary.total - view.summary.active);
+  $("#memory-agent-count").textContent = String(view.agents.length);
+
+  agentList.innerHTML = view.agents
+    .map((agent) => {
+      const summary = summarizeAgentMemory(agent, view.records);
+      const active = agent.agentId === selectedAgent?.agentId;
+      return `<button class="memory-agent-row${active ? " active" : ""}" data-memory-agent="${escapeHtml(agent.agentId)}" type="button" aria-pressed="${active}">
+        ${avatarMarkup(agent.agentId, agent.displayName)}
+        <span class="memory-agent-identity">
+          <strong>${escapeHtml(agentName(agent.agentId))}</strong>
+          <small>${escapeHtml(agent.agentId)}</small>
+        </span>
+        <span class="memory-agent-stats">
+          <small><b>${summary.injected}</b> 注入</small>
+          <small><b>${summary.owned}</b> 自有</small>
+        </span>
+        <span class="memory-runtime-dot ${escapeHtml(agent.runtimeStatus)}" title="${escapeHtml(memoryRuntimeLabels[agent.runtimeStatus] ?? agent.runtimeStatus)}"></span>
+      </button>`;
+    })
+    .join("");
+  agentList.querySelectorAll("[data-memory-agent]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.memorySelectedAgentId = button.dataset.memoryAgent;
+      state.memorySelectedRecordId = null;
+      renderMemoryDashboard();
+    });
+  });
+
+  const filters = {
+    agentId: selectedAgent?.agentId,
+    query: $("#memory-search").value,
+    relation: $("#memory-relation-filter").value,
+    scope: $("#memory-scope-filter").value,
+    status: $("#memory-status-filter").value
+  };
+  const records = filterMemoryRecords(view, filters);
+  const selectedRecord = records.find((record) => record.memoryId === state.memorySelectedRecordId) ?? records[0];
+  state.memorySelectedRecordId = selectedRecord?.memoryId ?? null;
+  $("#memory-feed-title").textContent = selectedAgent ? agentName(selectedAgent.agentId) : "Agent 记忆";
+  $("#memory-feed-kicker").textContent = selectedAgent ? `${memoryRuntimeLabels[selectedAgent.runtimeStatus] ?? selectedAgent.runtimeStatus} · ${selectedAgent.capability}` : "MEMORY RECORDS";
+  $("#memory-feed-count").textContent = `${records.length} 条`;
+
+  if (!records.length) {
+    feed.innerHTML = `<div class="memory-empty"><strong>没有匹配的记忆</strong><span>${selectedAgent ? `${escapeHtml(agentName(selectedAgent.agentId))} 在当前筛选条件下没有相关记录。` : "请调整筛选条件。"}</span></div>`;
+  } else {
+    feed.innerHTML = records
+      .map((record) => memoryRecordCard(record, selectedAgent, record.memoryId === selectedRecord?.memoryId))
+      .join("");
+    feed.querySelectorAll("[data-memory-record]").forEach((button) => {
+      button.addEventListener("click", () => {
+        state.memorySelectedRecordId = button.dataset.memoryRecord;
+        renderMemoryDashboard();
+      });
+    });
+  }
+
+  renderMemoryInspector(selectedAgent, selectedRecord, view);
+}
+
+function memoryRecordCard(record, agent, selected) {
+  const relation = memoryRelation(record, agent);
+  const relationBadges = [
+    relation.injected ? '<span class="memory-relation-badge injected">本轮注入</span>' : "",
+    relation.owned ? '<span class="memory-relation-badge owned">Agent 自有</span>' : "",
+    !relation.injected && relation.readable ? '<span class="memory-relation-badge readable">权限可读</span>' : "",
+    relation.historical ? '<span class="memory-relation-badge historical">历史留档</span>' : ""
+  ].filter(Boolean).join("");
+  return `<button class="memory-record-card${selected ? " active" : ""}" data-memory-record="${escapeHtml(record.memoryId)}" type="button" aria-pressed="${selected}">
+    <span class="memory-record-tags">
+      <span class="memory-scope-badge scope-${escapeHtml(record.scope)}">${escapeHtml(memoryScopeLabels[record.scope] ?? record.scope)}</span>
+      <span class="memory-status-badge status-${escapeHtml(record.status)}">${escapeHtml(memoryStatusLabels[record.status] ?? record.status)}</span>
+      ${relationBadges}
+    </span>
+    <strong>${escapeHtml(record.type)}</strong>
+    <span class="memory-record-content">${escapeHtml(summarizeText(record.content, 220))}</span>
+    <span class="memory-record-meta"><code>${escapeHtml(record.memoryId)}</code><time datetime="${escapeHtml(record.updatedAt)}">${escapeHtml(formatMemoryTime(record.updatedAt))}</time></span>
+  </button>`;
+}
+
+function renderMemoryInspector(agent, record, view) {
+  const inspector = $("#memory-inspector");
+  if (!agent) {
+    inspector.innerHTML = '<div class="memory-empty"><strong>Agent 上下文</strong><span>选择 Agent 后显示其记忆边界。</span></div>';
+    return;
+  }
+
+  const relation = record ? memoryRelation(record, agent) : null;
+  const sources = record
+    ? [
+        record.sourceMessageId ? { label: "来源消息", value: record.sourceMessageId } : null,
+        record.sourceEventId ? { label: "审计事件", value: record.sourceEventId } : null,
+        record.sourceArtifactId ? { label: "来源产物", value: record.sourceArtifactId, artifact: true } : null,
+        record.supersedes ? { label: "替换记录", value: record.supersedes } : null
+      ].filter(Boolean)
+    : [];
+  const blockerCount = agent.context.openTasks.filter((task) => task.status === "blocked").length;
+  const relationExplanation = !record
+    ? "选择一条记录查看它是否进入当前上下文。"
+    : relation.injected
+      ? "该记录当前会进入 durable_memory 上下文层。"
+      : relation.historical
+        ? "该记录仅用于历史追溯，不参与默认上下文。"
+        : relation.readable
+          ? "Agent 具备读取此作用域的权限，但默认上下文不会自动注入。"
+          : "该记录不属于此 Agent 的默认读取与注入集合。";
+
+  inspector.innerHTML = `<div class="memory-inspector-scroll">
+    <section class="memory-inspector-section">
+      <div class="memory-section-heading">
+        <div><span>SELECTED RECORD</span><strong>${record ? escapeHtml(record.type) : "未选择记录"}</strong></div>
+        ${record ? `<span class="memory-status-badge status-${escapeHtml(record.status)}">${escapeHtml(memoryStatusLabels[record.status] ?? record.status)}</span>` : ""}
+      </div>
+      ${record ? `<p class="memory-inspector-content">${escapeHtml(record.content)}</p>
+        <dl class="memory-detail-list">
+          <div><dt>记忆 ID</dt><dd><code>${escapeHtml(record.memoryId)}</code></dd></div>
+          <div><dt>归属</dt><dd>${record.ownerAgent ? escapeHtml(agentName(record.ownerAgent)) : "项目共享"}</dd></div>
+          <div><dt>阶段</dt><dd>${record.stageId ? escapeHtml(stageLabels[record.stageId] ?? record.stageId) : "跨阶段"}</dd></div>
+          <div><dt>创建</dt><dd>${escapeHtml(formatMemoryTime(record.createdAt))}</dd></div>
+          <div><dt>更新</dt><dd>${escapeHtml(formatMemoryTime(record.updatedAt))}</dd></div>
+        </dl>` : '<p class="memory-inspector-content muted">当前筛选结果为空。</p>'}
+    </section>
+
+    <section class="memory-inspector-section memory-injection-callout ${relation?.injected ? "is-injected" : ""}">
+      <span>CONTEXT RELATION</span>
+      <strong>${relation?.injected ? "会注入当前调用" : relation?.owned ? "Agent 自有记忆" : relation?.readable ? "权限可读" : "未自动注入"}</strong>
+      <p>${escapeHtml(relationExplanation)}</p>
+    </section>
+
+    <section class="memory-inspector-section">
+      <div class="memory-section-heading"><div><span>PROVENANCE</span><strong>来源链</strong></div><span>${sources.length}</span></div>
+      ${sources.length ? `<div class="memory-source-list">${sources.map((source) => source.artifact && state.artifacts.some((artifact) => artifact.artifactId === source.value)
+        ? `<button class="memory-source-row" data-memory-artifact="${escapeHtml(source.value)}" type="button"><span>${escapeHtml(source.label)}</span><code>${escapeHtml(source.value)}</code></button>`
+        : `<div class="memory-source-row"><span>${escapeHtml(source.label)}</span><code>${escapeHtml(source.value)}</code></div>`).join("")}</div>` : '<p class="memory-inspector-note">未绑定消息、事件或产物来源；这类记录应谨慎作为生产事实使用。</p>'}
+    </section>
+
+    <section class="memory-inspector-section">
+      <div class="memory-section-heading"><div><span>AGENT CONTEXT</span><strong>${escapeHtml(agentName(agent.agentId))}</strong></div><span class="memory-runtime-label ${escapeHtml(agent.runtimeStatus)}">${escapeHtml(memoryRuntimeLabels[agent.runtimeStatus] ?? agent.runtimeStatus)}</span></div>
+      <p class="memory-agent-role">${escapeHtml(agent.roleScope)}</p>
+      <dl class="memory-context-grid">
+        <div><dt>开放任务</dt><dd>${agent.context.openTasks.length}</dd></div>
+        <div><dt>阻塞任务</dt><dd>${blockerCount}</dd></div>
+        <div><dt>相关产物</dt><dd>${agent.context.relevantArtifactIds.length}</dd></div>
+        <div><dt>近期审计</dt><dd>${agent.context.recentAuditEventIds.length}</dd></div>
+      </dl>
+      <div class="memory-scope-groups">
+        <div><span>可读作用域</span><p>${agent.readableScopes.map((scope) => `<b>${escapeHtml(memoryScopeLabels[scope] ?? scope)}</b>`).join("")}</p></div>
+        <div><span>可写作用域</span><p>${agent.writableScopes.map((scope) => `<b>${escapeHtml(memoryScopeLabels[scope] ?? scope)}</b>`).join("")}</p></div>
+      </div>
+      <p class="memory-inspector-note">跨房间消息摘要在每次 Agent 调用时动态拼装，不属于这里展示的长期 MemoryRecord。</p>
+    </section>
+
+    <section class="memory-inspector-section memory-skills-section">
+      <div class="memory-section-heading"><div><span>ROLE SKILLS</span><strong>专业 Skill 装载</strong></div><span>${agent.skills.active.length} 已注入 / ${agent.skills.available.length} 白名单</span></div>
+      <div class="memory-skill-summary">
+        <span>最近上下文实际注入</span>
+        ${agent.skills.active.length ? `<div class="memory-skill-active-list">${agent.skills.active.map((skill) => `<article class="memory-skill-card is-active">
+          <div><strong>${escapeHtml(skill.name)}</strong><span class="memory-skill-risk risk-${escapeHtml(skill.riskLevel)}">${skill.riskLevel === "high" ? "高风险" : "标准"}</span></div>
+          <code>${escapeHtml(skill.skillId)}@${escapeHtml(skill.version)}</code>
+          <p>${escapeHtml(skillActivationSourceLabels[skill.activationSource] ?? skill.activationSource)} · ${escapeHtml(skill.reason)}</p>
+          <small>SHA-256 ${escapeHtml(skill.contentHash.slice(0, 12))}</small>
+        </article>`).join("")}</div>` : '<p class="memory-inspector-note">最近一次 ContextPacket 没有注入专业 Skill；角色核心契约仍然生效。</p>'}
+      </div>
+      <div class="memory-skill-summary">
+        <span>角色白名单与当前解析</span>
+        ${agent.skills.available.length ? `<div class="memory-skill-availability-list">${agent.skills.available.map((skill) => `<div class="memory-skill-row status-${escapeHtml(skill.status)}">
+          <div><strong>${escapeHtml(skill.name)}</strong><code>${escapeHtml(skill.skillId)}@${escapeHtml(skill.version)}</code></div>
+          <span>${escapeHtml(skillStatusLabels[skill.status] ?? skill.status)}</span>
+          <p>${escapeHtml(skill.reason)}</p>
+        </div>`).join("")}</div>` : '<p class="memory-inspector-note">该角色没有专业 Skill 白名单，只使用核心 AgentContract。</p>'}
+      </div>
+      <p class="memory-inspector-note">Skill 只提供专业流程，不会扩大 Agent 的工具、路径、密钥或门禁权限。显式使用 <code>$skill-id</code> 只能在角色白名单和当前阶段内覆盖自动选择。</p>
+    </section>
+
+    <section class="memory-inspector-section">
+      <div class="memory-section-heading"><div><span>SESSION MEMORY</span><strong>会话工作记忆</strong></div><span>${agent.context.sessionMemory.activeSessionCount} 活跃</span></div>
+      <dl class="memory-context-grid">
+        <div><dt>会话</dt><dd>${agent.context.sessionMemory.sessionCount}</dd></div>
+        <div><dt>上下文包</dt><dd>${agent.context.sessionMemory.contextPacketCount}</dd></div>
+        <div><dt>交接胶囊</dt><dd>${agent.context.sessionMemory.handoffCapsuleCount}</dd></div>
+        <div><dt>Token 估算</dt><dd>${agent.context.sessionMemory.latestSession?.contextTokensEstimate ?? 0}</dd></div>
+      </dl>
+      ${agent.context.sessionMemory.latestSession ? `<dl class="memory-detail-list">
+        <div><dt>最近会话</dt><dd><code>${escapeHtml(agent.context.sessionMemory.latestSession.sessionKey)}</code></dd></div>
+        <div><dt>会话状态</dt><dd>${escapeHtml(agent.context.sessionMemory.latestSession.status)} · ${escapeHtml(agent.context.sessionMemory.latestSession.model)}</dd></div>
+        <div><dt>所在房间</dt><dd><code>${escapeHtml(agent.context.sessionMemory.latestSession.roomId)}</code></dd></div>
+      </dl>` : '<p class="memory-inspector-note">该 Agent 尚未建立持久会话。</p>'}
+      ${agent.context.sessionMemory.latestPacket ? `<div class="memory-context-layers">
+        <span>最近上下文包 · <code>${escapeHtml(agent.context.sessionMemory.latestPacket.packetId)}</code></span>
+        ${agent.context.sessionMemory.latestPacket.layers.map((layer) => `<div>
+          <strong>${escapeHtml(layer.title)}</strong>
+          <small>${escapeHtml(layer.kind)} · ${layer.characterCount} 字符 · ${layer.sourceRefCount} 来源${layer.truncated ? " · 已截断" : ""}</small>
+        </div>`).join("")}
+      </div>` : ""}
+      <p class="memory-inspector-note">会话工作记忆记录 ContextPacket 的层次与健康度；长期事实仍以 MemoryRecord 为准。</p>
+    </section>
+
+    <section class="memory-inspector-section memory-storage-note">
+      <span>当前实现</span>
+      <p>${escapeHtml(view.architecture.sourceOfTruth)}；持久化到 ${escapeHtml(view.architecture.persistence.join(" + "))}。${escapeHtml(view.architecture.search)}；${escapeHtml(view.architecture.skillActivation)}。</p>
+    </section>
+  </div>`;
+  inspector.querySelectorAll("[data-memory-artifact]").forEach((button) => {
+    button.addEventListener("click", () => {
+      memoryDialog.close();
+      previewArtifact(button.dataset.memoryArtifact).catch((error) => showToast(error.message));
+    });
+  });
+}
+
+function memoryLoadingRows(count) {
+  return Array.from({ length: count }, () => '<div class="memory-agent-row memory-skeleton"><span></span><i></i></div>').join("");
+}
+
+function formatMemoryTime(value) {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString("zh-CN", { hour12: false });
 }
 
 function renderQuickActions() {
@@ -1423,6 +1780,8 @@ function resizeAvatarImage(source, mimeType) {
 function renderProjectHeader() {
   $("#project-title").textContent = state.project?.name ?? "未创建";
   $("#active-room-title").textContent = `当前房间 · ${activeRoomName()}`;
+  $("#open-memory").disabled = !state.project;
+  $("#memory-count-badge").textContent = state.memoryView ? String(state.memoryView.summary.total) : "—";
   if (!state.project) {
     $("#project-stage").textContent = "等待 idea";
     renderAgentLoopStatus();
@@ -1653,10 +2012,16 @@ function clearCurrentProject() {
   state.pendingAgentResponses = [];
   state.taskBoard = null;
   state.artifacts = [];
+  state.memoryView = null;
+  state.memorySelectedAgentId = null;
+  state.memorySelectedRecordId = null;
   state.workspace = null;
   state.roomSettingsKind = null;
   if (roomSettingsDialog.open) {
     roomSettingsDialog.close();
+  }
+  if (memoryDialog.open) {
+    memoryDialog.close();
   }
   render();
 }

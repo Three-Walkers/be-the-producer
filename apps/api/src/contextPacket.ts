@@ -1,5 +1,9 @@
 import { randomUUID } from "node:crypto";
-import type { StudioKernel } from "@game-pipeline/agent-runtime";
+import {
+  defaultAgentSkillRegistry,
+  extractProducerSkillDirectives,
+  type StudioKernel
+} from "@game-pipeline/agent-runtime";
 import type {
   AgentContract,
   AgentSessionRecord,
@@ -61,6 +65,21 @@ export function buildContextPacket(kernel: StudioKernel, input: BuildContextPack
   });
   const incomingCapsules = pendingCapsules(kernel, input.session);
   const layers: ContextPacketLayer[] = [];
+  const producerTexts = deltaMessages
+    .filter((message) => message.senderType === "producer")
+    .map((message) => message.content);
+  const skillDirectives = extractProducerSkillDirectives(
+    producerTexts,
+    defaultAgentSkillRegistry.list().map((skill) => skill.skillId)
+  );
+  const skillResolution = defaultAgentSkillRegistry.resolve({
+    agent: input.agent,
+    stageId: kernel.project.currentStage,
+    ...(input.task ? { task: input.task } : {}),
+    artifacts: kernel.listArtifacts(),
+    ...(producerTexts.length > 0 ? { recentText: producerTexts.join("\n") } : {}),
+    ...skillDirectives
+  });
 
   layers.push(layer("identity", "身份、项目与房间", [
     `项目：${kernel.project.name} (${kernel.project.projectId})`,
@@ -74,6 +93,17 @@ export function buildContextPacket(kernel: StudioKernel, input: BuildContextPack
 
   const durableMemory = renderMemoryPack(memoryPack);
   layers.push(layer("durable_memory", "持久记忆与已确认事实", limitText(durableMemory, 10_000), memoryRefs(memoryPack), durableMemory.length > 10_000));
+
+  if (skillResolution.active.length > 0) {
+    const guidance = defaultAgentSkillRegistry.renderGuidance(skillResolution.active);
+    layers.push(layer(
+      "skill_guidance",
+      `本轮专业 Skill（${skillResolution.active.length}）`,
+      limitText(guidance, 8_000),
+      skillResolution.active.map((skill) => `skill:${skill.skillId}@${skill.version}#${skill.contentHash}`),
+      guidance.length > 8_000
+    ));
+  }
 
   const roleCrossRoomMemory = renderRoleCrossRoomMemory(
     kernel,
@@ -153,6 +183,7 @@ export function buildContextPacket(kernel: StudioKernel, input: BuildContextPack
     cursorBefore,
     cursorAfter,
     layers,
+    activatedSkills: skillResolution.active,
     health,
     createdAt: now
   };

@@ -1413,6 +1413,7 @@ function cloneContextPacket(packet: ContextPacket): ContextPacket {
     cursorBefore: { ...packet.cursorBefore },
     cursorAfter: { ...packet.cursorAfter },
     layers: packet.layers.map((layer) => ({ ...layer, sourceRefs: [...layer.sourceRefs] })),
+    ...(packet.activatedSkills ? { activatedSkills: packet.activatedSkills.map((skill) => ({ ...skill })) } : {}),
     health: { ...packet.health, reasons: [...packet.health.reasons] }
   };
 }
