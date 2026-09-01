@@ -19,6 +19,8 @@ export interface AgentHarnessProgressEvent {
 export interface AgentHarnessRunInput {
   projectId: string;
   projectRoot: string;
+  /** Persistent harness/session state root. Defaults to projectRoot. */
+  stateRoot?: string;
   agent: AgentContract;
   provider: ModelProviderConfig;
   model: string;

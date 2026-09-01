@@ -29,7 +29,7 @@ for await (const chunk of process.stdin) prompt += chunk;
 if (prompt.includes("ROOM_TIMEOUT_FALLBACK")) {
   await new Promise((resolve) => setTimeout(resolve, 5000));
 }
-const counterPath = join(process.cwd(), ".be-the-producer", "runtime-test-count.txt");
+const counterPath = join(process.env.CLAUDE_CONFIG_DIR, "runtime-test-count.txt");
 mkdirSync(dirname(counterPath), { recursive: true });
 const count = existsSync(counterPath) ? Number(readFileSync(counterPath, "utf8")) + 1 : 1;
 writeFileSync(counterPath, String(count));
@@ -100,7 +100,7 @@ assert.equal(active.resumeFailureCount, 1);
 assert.ok(kernel.listHandoffCapsules(active.sessionKey).some((capsule) => capsule.kind === "resume_recovery"));
 
 const projectRoot = join(process.env.STUDIO_WORKSPACE_ROOT, kernel.project.projectId);
-assert.equal(readFileSync(join(projectRoot, ".be-the-producer", "runtime-test-count.txt"), "utf8"), "3");
+assert.equal(readFileSync(join(projectRoot, ".be-the-producer", "harness", "game_designer", "runtime-test-count.txt"), "utf8"), "3");
 
 let fallbackRequestCount = 0;
 const fallbackServer = createServer((_request, response) => {

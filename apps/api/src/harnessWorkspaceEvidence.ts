@@ -42,6 +42,12 @@ export interface HarnessEvidenceResult {
   toolExecutions: ToolExecutionResult[];
 }
 
+export interface HarnessWorkspaceAnalysis {
+  changedPaths: string[];
+  deletedPaths: string[];
+  violations: string[];
+}
+
 function buildHarnessVisionAuthoritativeContext(
   kernel: StudioKernel,
   contract: QualityReviewArtifactContract,
@@ -125,64 +131,34 @@ export function recordHarnessWorkspaceChanges(
   after: WorkspaceSnapshot,
   invocationId: string,
   invocationChangedPaths?: string[],
-  invocationToolOperations?: AgentHarnessToolOperation[]
+  invocationToolOperations?: AgentHarnessToolOperation[],
+  options: { authoritativeWorkspace?: boolean } = {}
 ): HarnessEvidenceResult {
-  const workspaceChangedPaths = [...after.values()]
-    .filter((file) => before.get(file.path)?.hash !== file.hash)
-    .map((file) => file.path)
-    .sort();
-  const successfulOperationPaths = new Set(
-    (invocationToolOperations ?? [])
-      .filter((operation) => toolOperationSucceeded(operation) && operationWritesWorkspace(operation))
-      .map((operation) => operation.path)
+  const analysis = analyzeHarnessWorkspaceChanges(
+    kernel,
+    task,
+    agent,
+    before,
+    after,
+    invocationChangedPaths,
+    invocationToolOperations,
+    options
   );
-  const failedOnlyOperationPaths = new Set(
-    (invocationToolOperations ?? [])
-      .filter((operation) =>
-        operationWritesWorkspace(operation) &&
-        !toolOperationSucceeded(operation) &&
-        !successfulOperationPaths.has(operation.path)
-      )
-      .map((operation) => operation.path)
-  );
-  const readOnlyOperationPaths = new Set(
-    (invocationToolOperations ?? [])
-      .filter((operation) => operation.access === "read" && !successfulOperationPaths.has(operation.path))
-      .map((operation) => operation.path)
-  );
-  const failedMutationPaths = [...failedOnlyOperationPaths]
-    .filter((path) => after.has(path) && before.get(path)?.hash !== after.get(path)?.hash)
-    .sort();
-  const changedPaths = (invocationChangedPaths
-    ? [...new Set([...invocationChangedPaths, ...failedMutationPaths])].filter((path) => after.has(path)).sort()
-    : workspaceChangedPaths)
-    .filter((path) =>
-      !readOnlyOperationPaths.has(path) || before.get(path)?.hash !== after.get(path)?.hash
-    )
-    .filter((path) => !failedOnlyOperationPaths.has(path) || failedMutationPaths.includes(path));
-  const deletedPaths = [...before.keys()].filter((path) => !after.has(path)).sort();
-  const protectedMutationPaths = changedPaths.filter((path) => {
-    if (!isQaHarnessManagedPath(path)) return false;
-    return invocationToolOperations
-      ?.filter((operation) =>
-        operation.path === path && toolOperationSucceeded(operation) && operationWritesWorkspace(operation)
-      )
-      .at(-1)?.toolName !== "run_playtest";
-  });
-  const violations = [
-    ...changedPaths.filter((path) => !isAllowedAgentPath(kernel, task, agent, path)),
-    ...protectedMutationPaths.map((path) => `受保护 QA 机器证据被非 run_playtest 工具修改：${path}`),
-    ...failedMutationPaths.map((path) => `失败工具仍修改了工作区，拒绝物化：${path}`),
-    ...deletedPaths.map((path) => `删除：${path}`)
-  ];
+  const { changedPaths, deletedPaths, violations } = analysis;
+  if (violations.length > 0) {
+    return {
+      changedPaths,
+      deletedPaths,
+      violations,
+      artifactIds: [],
+      toolExecutions: failedHarnessToolExecutions(invocationToolOperations)
+    };
+  }
   const artifactIds = new Set<string>();
   const toolExecutions: ToolExecutionResult[] = [];
   const now = new Date().toISOString();
 
   for (const path of changedPaths) {
-    if (violations.includes(path) || protectedMutationPaths.includes(path) || failedMutationPaths.includes(path)) {
-      continue;
-    }
     const file = after.get(path);
     if (!file) {
       continue;
@@ -427,6 +403,80 @@ export function recordHarnessWorkspaceChanges(
     artifactIds: [...artifactIds],
     toolExecutions
   };
+}
+
+export function analyzeHarnessWorkspaceChanges(
+  kernel: StudioKernel,
+  task: Task,
+  agent: AgentContract,
+  before: WorkspaceSnapshot,
+  after: WorkspaceSnapshot,
+  invocationChangedPaths?: string[],
+  invocationToolOperations?: AgentHarnessToolOperation[],
+  options: { authoritativeWorkspace?: boolean } = {}
+): HarnessWorkspaceAnalysis {
+  const workspaceChangedPaths = [...after.values()]
+    .filter((file) => before.get(file.path)?.hash !== file.hash)
+    .map((file) => file.path)
+    .sort();
+  const successfulOperationPaths = new Set(
+    (invocationToolOperations ?? [])
+      .filter((operation) => toolOperationSucceeded(operation) && operationWritesWorkspace(operation))
+      .map((operation) => operation.path)
+  );
+  const failedOnlyOperationPaths = new Set(
+    (invocationToolOperations ?? [])
+      .filter((operation) =>
+        operationWritesWorkspace(operation) &&
+        !toolOperationSucceeded(operation) &&
+        !successfulOperationPaths.has(operation.path)
+      )
+      .map((operation) => operation.path)
+  );
+  const readOnlyOperationPaths = new Set(
+    (invocationToolOperations ?? [])
+      .filter((operation) => operation.access === "read" && !successfulOperationPaths.has(operation.path))
+      .map((operation) => operation.path)
+  );
+  const failedMutationPaths = [...failedOnlyOperationPaths]
+    .filter((path) => after.has(path) && before.get(path)?.hash !== after.get(path)?.hash)
+    .sort();
+  const candidateChangedPaths = options.authoritativeWorkspace || !invocationChangedPaths
+    ? workspaceChangedPaths
+    : [...new Set([...invocationChangedPaths, ...failedMutationPaths])].filter((path) => after.has(path)).sort();
+  const changedPaths = candidateChangedPaths
+    .filter((path) => !readOnlyOperationPaths.has(path) || before.get(path)?.hash !== after.get(path)?.hash)
+    .filter((path) => !failedOnlyOperationPaths.has(path) || failedMutationPaths.includes(path));
+  const deletedPaths = [...before.keys()].filter((path) => !after.has(path)).sort();
+  const protectedMutationPaths = changedPaths.filter((path) => {
+    if (!isQaHarnessManagedPath(path)) return false;
+    return invocationToolOperations
+      ?.filter((operation) =>
+        operation.path === path && toolOperationSucceeded(operation) && operationWritesWorkspace(operation)
+      )
+      .at(-1)?.toolName !== "run_playtest";
+  });
+  const violations = [
+    ...changedPaths.filter((path) => !isAllowedAgentPath(kernel, task, agent, path)).map((path) => `未授权写入：${path}`),
+    ...protectedMutationPaths.map((path) => `受保护 QA 机器证据被非 run_playtest 工具修改：${path}`),
+    ...failedMutationPaths.map((path) => `失败工具仍修改了工作区，拒绝物化：${path}`),
+    ...deletedPaths.map((path) => `删除：${path}`)
+  ];
+  return { changedPaths, deletedPaths, violations };
+}
+
+function failedHarnessToolExecutions(
+  invocationToolOperations?: AgentHarnessToolOperation[]
+): ToolExecutionResult[] {
+  return (invocationToolOperations ?? []).flatMap((operation) => {
+    if (toolOperationSucceeded(operation) || !failedToolExecutionName(operation.toolName)) return [];
+    return [{
+      toolName: operation.toolName as "write_artifact" | "append_document" | "generate_raster_asset" | "inspect_visual_assets",
+      status: "failed" as const,
+      path: operation.path,
+      ...(operation.error ? { error: operation.error } : {})
+    }];
+  });
 }
 
 export function attachHarnessEvidenceToMessage(message: StudioMessage, evidence: HarnessEvidenceResult): StudioMessage {

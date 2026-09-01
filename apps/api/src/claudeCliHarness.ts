@@ -126,7 +126,7 @@ export class ClaudeCliHarness implements AgentHarness {
       throw new Error(`Harness authorization mode=${input.authorization.mode} 与 toolMode=${input.toolMode ?? "task"} 不一致。`);
     }
     const invocationId = `inv_${randomUUID()}`;
-    const configDir = join(input.projectRoot, ".be-the-producer", "harness", input.agent.agentId);
+    const configDir = join(input.stateRoot ?? input.projectRoot, ".be-the-producer", "harness", input.agent.agentId);
     const controlPath = join(configDir, `control-${invocationId}.json`);
     const operationLogPath = join(configDir, `operations-${invocationId}.jsonl`);
     mkdirSync(configDir, { recursive: true, mode: 0o700 });

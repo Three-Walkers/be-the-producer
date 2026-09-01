@@ -1,5 +1,6 @@
 import {
   defaultAgentContracts,
+  createStudioKernelFromSnapshot,
   getQualityReviewArtifactContracts,
   type RoutePlan,
   type StudioKernel
@@ -15,7 +16,15 @@ import {
   ClaudeSessionResumeError,
   claudeCliHarness
 } from "./claudeCliHarness.js";
-import { attachHarnessEvidenceToMessage, captureWorkspaceSnapshot, recordHarnessWorkspaceChanges } from "./harnessWorkspaceEvidence.js";
+import {
+  analyzeHarnessWorkspaceChanges,
+  attachHarnessEvidenceToMessage,
+  captureWorkspaceSnapshot,
+  recordHarnessWorkspaceChanges,
+  type HarnessEvidenceResult,
+  type WorkspaceSnapshot
+} from "./harnessWorkspaceEvidence.js";
+import { createIsolatedWorkspace, stageWorkspaceCommit } from "./isolatedWorkspace.js";
 import { readArtifactContentForModel, resolveProjectWorkspaceRoot, syncProjectWorkspace } from "./workspaceWriter.js";
 import {
   artifactReadyForConsumption,
@@ -192,19 +201,17 @@ export class ModelAgentRuntime {
     return sessionCoordinator.runExclusive(kernel, initialSession, async (lockedSession) => {
       activity.transition("task_context", "任务上下文与证据已装载", 16, "working");
       let prepared = sessionCoordinator.prepareContext(kernel, lockedSession, agent, roomId, task, input.triggerMessageId);
-      const before = captureWorkspaceSnapshot(projectRoot);
       try {
-        let result;
+        let execution: Awaited<ReturnType<typeof runClaudeTaskSession>>;
         try {
-          result = await runClaudeTaskSession(kernel, task, agent, provider, model, input, projectRoot, prepared.session, prepared.context.prompt, (event) => activity.onHarnessProgress(event));
+          execution = await runClaudeTaskSession(kernel, task, agent, provider, model, input, projectRoot, prepared.session, prepared.context.prompt, (event) => activity.onHarnessProgress(event));
         } catch (error) {
           if (!(error instanceof ClaudeSessionResumeError)) throw error;
           const recovered = sessionCoordinator.recoverResumeFailure(kernel, prepared.session, error.message);
           prepared = sessionCoordinator.prepareContext(kernel, recovered, agent, roomId, task, input.triggerMessageId);
-          result = await runClaudeTaskSession(kernel, task, agent, provider, model, input, projectRoot, prepared.session, prepared.context.prompt, (event) => activity.onHarnessProgress(event));
+          execution = await runClaudeTaskSession(kernel, task, agent, provider, model, input, projectRoot, prepared.session, prepared.context.prompt, (event) => activity.onHarnessProgress(event));
         }
-        const after = captureWorkspaceSnapshot(projectRoot);
-        const evidence = recordHarnessWorkspaceChanges(kernel, task, agent, before, after, result.invocationId, result.changedPaths, result.toolOperations);
+        const { result, evidence } = execution;
         const outputsVerified = taskOutputsVerified(kernel, task);
         const reportedControl = result.loopControl;
         const loopControl = evidence.violations.length > 0
@@ -253,6 +260,8 @@ export class ModelAgentRuntime {
           metadata: {
             generatedBy: "claude_cli_harness",
             harnessId: result.harnessId,
+            workerIsolation: "process",
+            workspaceIsolation: "staging_transaction",
             sessionStrategy: "persistent_task_child",
             sessionKey: committed.sessionKey,
             sessionScope: committed.scope,
@@ -383,6 +392,8 @@ export class ModelAgentRuntime {
             latencyMs: result.latencyMs,
             executionPath: "claude_cli_room_session",
             configuredHarnessId: assignment.harnessId,
+            workerIsolation: "process",
+            workspaceIsolation: "staging_read_only",
             sessionStrategy: "persistent_room",
             sessionKey: committed.sessionKey,
             sessionScope: committed.scope,
@@ -535,29 +546,113 @@ async function runClaudeTaskSession(
     const type = kernel.listArtifacts().find((artifact) => artifact.artifactId === artifactId)?.type;
     return type === "game_contract" || type === "scene_blueprint" || type === "playtest_contract" || type === "quality_review";
   });
-  return claudeCliHarness.run({
-    projectId: kernel.project.projectId,
-    projectRoot,
+  const isolated = createIsolatedWorkspace(projectRoot, `${agent.agentId}-${task.taskId}`);
+  const before = captureWorkspaceSnapshot(isolated.root);
+  try {
+    const result = await claudeCliHarness.run({
+      projectId: kernel.project.projectId,
+      projectRoot: isolated.root,
+      stateRoot: projectRoot,
+      agent,
+      provider,
+      model,
+      systemPrompt: buildClaudeHarnessSystemPrompt(agent),
+      userPrompt: buildClaudeHarnessTaskPrompt(kernel, task, agent, input, contextPrompt),
+      authorization: createTaskHarnessAuthorization(kernel, task, agent, taskHarnessServicePaths(kernel, task, agent)),
+      expectedPaths: expectedHarnessOutputPaths(kernel, task),
+      taskInputEvidence: captureCurrentTaskInputProvenance(kernel, task),
+      requireToolProgress: true,
+      // Strict contracts require a complete, cross-referenced document before the
+      // first accepted write. Slower compatible providers routinely need more than
+      // the generic three-minute first-tool budget, so avoid destructive retry loops.
+      ...(hasStrictContractOutput ? { initialProgressTimeoutMs: 6 * 60_000 } : {}),
+      toolMode: "task",
+      sessionKey: session.sessionKey,
+      sessionScope: session.scope,
+      onProgress,
+      ...(session.sessionId ? { sessionId: session.sessionId } : {}),
+      ...(input.abortSignal ? { abortSignal: input.abortSignal } : {})
+    });
+    const after = captureWorkspaceSnapshot(isolated.root);
+    const evidence = commitHarnessWorkspaceTransaction(kernel, task, agent, projectRoot, isolated.root, before, after, result);
+    return { result, evidence };
+  } finally {
+    isolated.dispose();
+  }
+}
+
+function commitHarnessWorkspaceTransaction(
+  kernel: StudioKernel,
+  task: Task,
+  agent: AgentContract,
+  projectRoot: string,
+  stagingRoot: string,
+  before: WorkspaceSnapshot,
+  after: WorkspaceSnapshot,
+  result: Awaited<ReturnType<typeof claudeCliHarness.run>>
+): HarnessEvidenceResult {
+  const analysis = analyzeHarnessWorkspaceChanges(
+    kernel,
+    task,
     agent,
-    provider,
-    model,
-    systemPrompt: buildClaudeHarnessSystemPrompt(agent),
-    userPrompt: buildClaudeHarnessTaskPrompt(kernel, task, agent, input, contextPrompt),
-    authorization: createTaskHarnessAuthorization(kernel, task, agent, taskHarnessServicePaths(kernel, task, agent)),
-    expectedPaths: expectedHarnessOutputPaths(kernel, task),
-    taskInputEvidence: captureCurrentTaskInputProvenance(kernel, task),
-    requireToolProgress: true,
-    // Strict contracts require a complete, cross-referenced document before the
-    // first accepted write. Slower compatible providers routinely need more than
-    // the generic three-minute first-tool budget, so avoid destructive retry loops.
-    ...(hasStrictContractOutput ? { initialProgressTimeoutMs: 6 * 60_000 } : {}),
-    toolMode: "task",
-    sessionKey: session.sessionKey,
-    sessionScope: session.scope,
-    onProgress,
-    ...(session.sessionId ? { sessionId: session.sessionId } : {}),
-    ...(input.abortSignal ? { abortSignal: input.abortSignal } : {})
-  });
+    before,
+    after,
+    result.changedPaths,
+    result.toolOperations,
+    { authoritativeWorkspace: true }
+  );
+  if (analysis.violations.length > 0) {
+    return recordHarnessWorkspaceChanges(
+      kernel,
+      task,
+      agent,
+      before,
+      after,
+      result.invocationId,
+      result.changedPaths,
+      result.toolOperations,
+      { authoritativeWorkspace: true }
+    );
+  }
+
+  // Validate every artifact/quality receipt against a cloned kernel before the
+  // canonical workspace or live project state can be mutated.
+  const previewKernel = createStudioKernelFromSnapshot(structuredClone(kernel.toSnapshot()));
+  const preview = recordHarnessWorkspaceChanges(
+    previewKernel,
+    task,
+    agent,
+    before,
+    after,
+    result.invocationId,
+    result.changedPaths,
+    result.toolOperations,
+    { authoritativeWorkspace: true }
+  );
+  if (preview.violations.length > 0) return preview;
+
+  const transaction = stageWorkspaceCommit(projectRoot, stagingRoot, analysis.changedPaths);
+  try {
+    const evidence = recordHarnessWorkspaceChanges(
+      kernel,
+      task,
+      agent,
+      before,
+      after,
+      result.invocationId,
+      result.changedPaths,
+      result.toolOperations,
+      { authoritativeWorkspace: true }
+    );
+    if (evidence.violations.length > 0) {
+      throw new Error(`Agent staging 提交在最终校验中失败：${evidence.violations.join("；")}`);
+    }
+    transaction.finalize();
+    return evidence;
+  } catch (error) {
+    transaction.rollback();
+    throw error;
+  }
 }
 
 function taskHarnessServicePaths(
@@ -719,27 +814,48 @@ async function runClaudeRoomSession(
 ) {
   const projectRoot = resolveProjectWorkspaceRoot(kernel.project.projectId);
   syncProjectWorkspace(kernel);
-  return claudeCliHarness.run({
-    projectId: kernel.project.projectId,
-    projectRoot,
-    agent,
-    provider,
-    model,
-    systemPrompt: buildClaudeRoomSystemPrompt(agent),
-    userPrompt: buildRoomUserPrompt(kernel, producerMessage, routeReasons, contextPrompt),
-    authorization: createConversationHarnessAuthorization(kernel, agent),
-    expectedPaths: [],
-    requireToolProgress: false,
-    toolMode: "conversation",
-    timeoutMs: roomHarnessTimeoutMs(),
-    idleTimeoutMs: roomHarnessIdleTimeoutMs(),
-    effort: "low",
-    includePartialMessages: true,
-    onProgress,
-    sessionKey: session.sessionKey,
-    sessionScope: session.scope,
-    ...(session.sessionId ? { sessionId: session.sessionId } : {})
-  });
+  const isolated = createIsolatedWorkspace(projectRoot, `${agent.agentId}-room`);
+  const before = captureWorkspaceSnapshot(isolated.root);
+  try {
+    const result = await claudeCliHarness.run({
+      projectId: kernel.project.projectId,
+      projectRoot: isolated.root,
+      stateRoot: projectRoot,
+      agent,
+      provider,
+      model,
+      systemPrompt: buildClaudeRoomSystemPrompt(agent),
+      userPrompt: buildRoomUserPrompt(kernel, producerMessage, routeReasons, contextPrompt),
+      authorization: createConversationHarnessAuthorization(kernel, agent),
+      expectedPaths: [],
+      requireToolProgress: false,
+      toolMode: "conversation",
+      timeoutMs: roomHarnessTimeoutMs(),
+      idleTimeoutMs: roomHarnessIdleTimeoutMs(),
+      effort: "low",
+      includePartialMessages: true,
+      onProgress,
+      sessionKey: session.sessionKey,
+      sessionScope: session.scope,
+      ...(session.sessionId ? { sessionId: session.sessionId } : {})
+    });
+    const after = captureWorkspaceSnapshot(isolated.root);
+    const mutation = describeWorkspaceMutation(before, after);
+    if (mutation.length > 0) {
+      throw new Error(`只读房间 Worker 尝试修改 staging 工作区：${mutation.join("；")}`);
+    }
+    return result;
+  } finally {
+    isolated.dispose();
+  }
+}
+
+function describeWorkspaceMutation(before: WorkspaceSnapshot, after: WorkspaceSnapshot): string[] {
+  const changed = [...after.values()]
+    .filter((file) => before.get(file.path)?.hash !== file.hash)
+    .map((file) => `修改：${file.path}`);
+  const deleted = [...before.keys()].filter((path) => !after.has(path)).map((path) => `删除：${path}`);
+  return [...changed, ...deleted].sort();
 }
 
 function buildRoomUserPrompt(

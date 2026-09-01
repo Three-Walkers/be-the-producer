@@ -29,6 +29,7 @@
     "verify:path-safety": "npm run build && node scripts/verify-path-safety.mjs",
     "verify:release-topology": "npm run build && node scripts/verify-release-topology.mjs",
     "verify:workflow": "npm run build && node scripts/verify-workflow-aggregate.mjs",
+    "verify:workspace-isolation": "npm run build && node scripts/verify-workspace-isolation.mjs",
     "verify:cocos-bridge": "npm run build && node scripts/verify-cocos-engine-bridge.mjs",
     "verify:claim-repair": "npm run build && node scripts/verify-claim-repair.mjs",
     "verify:concurrent-room": "npm run build && node scripts/verify-concurrent-room-replies.mjs",
