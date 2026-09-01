@@ -37,6 +37,7 @@ import { sessionCoordinator } from "./sessionCoordinator.js";
 import { AgentActivityReporter } from "./agentActivity.js";
 import type { AgentHarnessProgressEvent } from "./agentHarness.js";
 import { createConversationHarnessAuthorization, createTaskHarnessAuthorization } from "./toolAuthorization.js";
+import { agentExecutionPool } from "./agentExecutionPool.js";
 
 export interface ModelAgentRunResult {
   agentMessages: StudioMessage[];
@@ -549,7 +550,10 @@ async function runClaudeTaskSession(
   const isolated = createIsolatedWorkspace(projectRoot, `${agent.agentId}-${task.taskId}`);
   const before = captureWorkspaceSnapshot(isolated.root);
   try {
-    const result = await claudeCliHarness.run({
+    const result = await agentExecutionPool.run({
+      ...(input.abortSignal ? { abortSignal: input.abortSignal } : {}),
+      queueTimeoutMs: 60_000
+    }, () => claudeCliHarness.run({
       projectId: kernel.project.projectId,
       projectRoot: isolated.root,
       stateRoot: projectRoot,
@@ -572,7 +576,7 @@ async function runClaudeTaskSession(
       onProgress,
       ...(session.sessionId ? { sessionId: session.sessionId } : {}),
       ...(input.abortSignal ? { abortSignal: input.abortSignal } : {})
-    });
+    }));
     const after = captureWorkspaceSnapshot(isolated.root);
     const evidence = commitHarnessWorkspaceTransaction(kernel, task, agent, projectRoot, isolated.root, before, after, result);
     return { result, evidence };
@@ -817,7 +821,7 @@ async function runClaudeRoomSession(
   const isolated = createIsolatedWorkspace(projectRoot, `${agent.agentId}-room`);
   const before = captureWorkspaceSnapshot(isolated.root);
   try {
-    const result = await claudeCliHarness.run({
+    const result = await agentExecutionPool.run({ queueTimeoutMs: 60_000 }, () => claudeCliHarness.run({
       projectId: kernel.project.projectId,
       projectRoot: isolated.root,
       stateRoot: projectRoot,
@@ -838,7 +842,7 @@ async function runClaudeRoomSession(
       sessionKey: session.sessionKey,
       sessionScope: session.scope,
       ...(session.sessionId ? { sessionId: session.sessionId } : {})
-    });
+    }));
     const after = captureWorkspaceSnapshot(isolated.root);
     const mutation = describeWorkspaceMutation(before, after);
     if (mutation.length > 0) {

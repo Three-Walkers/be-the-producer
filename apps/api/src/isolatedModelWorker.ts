@@ -10,6 +10,7 @@ import {
 } from "./modelClient.js";
 import type { ModelProviderConfig } from "./modelSettings.js";
 import { isModelWorkerEvent, type ModelWorkerRequest } from "./modelWorkerProtocol.js";
+import { agentExecutionPool } from "./agentExecutionPool.js";
 
 const maxWorkerOutputBytes = 16 * 1024 * 1024;
 const workerShutdownGraceMs = 2_000;
@@ -22,6 +23,17 @@ export function runIsolatedModelChat(
   provider: ModelProviderConfig,
   input: ModelChatInput,
   options: IsolatedModelWorkerOptions = {}
+): Promise<ModelChatResult> {
+  return agentExecutionPool.run(
+    { ...(input.abortSignal ? { abortSignal: input.abortSignal } : {}), queueTimeoutMs: input.queueWaitTimeoutMs ?? 30_000 },
+    () => runModelWorkerProcess(provider, input, options)
+  );
+}
+
+function runModelWorkerProcess(
+  provider: ModelProviderConfig,
+  input: ModelChatInput,
+  options: IsolatedModelWorkerOptions
 ): Promise<ModelChatResult> {
   const requestId = `worker_${randomUUID()}`;
   const request: ModelWorkerRequest = {
