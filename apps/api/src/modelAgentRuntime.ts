@@ -5,7 +5,8 @@ import {
   type StudioKernel
 } from "@game-pipeline/agent-runtime";
 import type { AgentContract, AgentId, AgentLoopControl, AgentSessionRecord, MessageType, StudioMessage, Task } from "@game-pipeline/shared-schemas";
-import { generateModelChat, ModelRequestError, type ModelChatInput, type ModelRequestTrace } from "./modelClient.js";
+import { ModelRequestError, type ModelChatInput, type ModelRequestTrace } from "./modelClient.js";
+import { runIsolatedModelChat } from "./isolatedModelWorker.js";
 import { modelSettingsStore } from "./modelSettings.js";
 import { executableToolsForAgent, type ToolExecutionResult } from "./toolExecutor.js";
 import {
@@ -115,7 +116,7 @@ export class ModelAgentRuntime {
         activity.transition("task_context", "任务上下文与证据已装载", 16, "working");
         const prepared = sessionCoordinator.prepareContext(kernel, currentSession, agent, room.roomId, task, input.triggerMessageId);
         try {
-          const result = await generateModelChat(provider, {
+          const result = await runIsolatedModelChat(provider, {
             model,
             systemPrompt: buildSystemPrompt(agent),
             userPrompt: buildTaskLoopPrompt(kernel, task, agent, input, prepared.context.prompt),
@@ -145,6 +146,7 @@ export class ModelAgentRuntime {
             relatedArtifactIds: [],
             metadata: {
               generatedBy: "agent_loop",
+              workerIsolation: "process",
               providerId: result.providerId,
               model: result.model,
               latencyMs: result.latencyMs,
@@ -332,7 +334,7 @@ export class ModelAgentRuntime {
             }
           }
           if (!result) {
-            const fallback = await generateModelChat(provider, {
+            const fallback = await runIsolatedModelChat(provider, {
               systemPrompt: buildClaudeRoomSystemPrompt(agent),
               userPrompt: buildRoomUserPrompt(kernel, producerMessage, route?.reasons ?? [], prepared.context.prompt),
               ...roomModelRequestOptions(provider, model, `room_fallback:${producerMessage.messageId}:${agent.agentId}`),
@@ -350,6 +352,7 @@ export class ModelAgentRuntime {
               model: fallback.model,
               latencyMs: fallback.latencyMs,
               executionPath: "direct_model_api_fallback",
+              workerIsolation: "process",
               configuredHarnessId: assignment.harnessId,
               harnessFallback: true,
               harnessFailure: fallbackReason ?? "Claude CLI 房间会话未返回结果。",
@@ -395,7 +398,7 @@ export class ModelAgentRuntime {
             ...guarded.metadata
           });
         }
-        const result = await generateModelChat(provider, {
+        const result = await runIsolatedModelChat(provider, {
           systemPrompt: buildSystemPrompt(agent),
           userPrompt: buildUserPrompt(kernel, producerMessage, agent, route?.reasons ?? [], prepared.context.prompt),
           ...roomModelRequestOptions(provider, model, `room_direct:${producerMessage.messageId}:${agent.agentId}`),
@@ -413,6 +416,7 @@ export class ModelAgentRuntime {
           model: result.model,
           latencyMs: result.latencyMs,
           executionPath: "direct_model_api",
+          workerIsolation: "process",
           configuredHarnessId: assignment.harnessId,
           sessionStrategy: "persistent_room_cursor",
           sessionKey: committed.sessionKey,

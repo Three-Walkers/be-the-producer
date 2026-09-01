@@ -11,6 +11,7 @@
     "build": "tsc -b packages/shared-schemas packages/agent-runtime apps/api",
     "typecheck": "tsc -b packages/shared-schemas packages/agent-runtime apps/api --pretty false",
     "verify:agent-loop": "npm run build && node scripts/verify-agent-loop.mjs",
+    "verify:agent-worker": "npm run build && node scripts/verify-agent-worker.mjs",
     "verify:agent-skills": "npm run build && node scripts/verify-agent-skills.mjs",
     "verify:artifact-provenance": "npm run build && node scripts/verify-artifact-provenance.mjs",
     "verify:api-security": "npm run build && node scripts/verify-api-security.mjs",
