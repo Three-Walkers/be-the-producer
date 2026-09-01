@@ -35,13 +35,14 @@
 | 21 | [独立质量评审与多模态美术](./21_quality_review_and_multimodal_art.md) | 设计/视觉独立评审、质量收据、多模态资产生产。 |
 | 22 | [Task Episode 与生产证据审计](./22_task_episode_and_production_audit.md) | 四通道 Evidence Bundle、Finding、Intervention Ledger、不可变审计报告和门禁集成。 |
 | 23 | [角色 Skill Registry 与受控装载](./23_role_skill_registry_and_activation.md) | 角色白名单、任务自动匹配、高风险阶段门禁、Context Packet 收据和 UI 可观测性。 |
+| 24 | [Agent Worker 与事务工作区隔离](./24_agent_worker_and_workspace_isolation.md) | Direct API 子进程、全局执行池、Claude staging、预检、原子提交与回滚。 |
 
 ## 阅读顺序
 
 1. 先读 01 到 06，理解产品、角色、群聊、阶段、记忆和工作空间。
 2. 再读 07 到 12，理解模型调用、策划、美术、Cocos、微信和 QA。
 3. 再读 13 到 15，理解运维、数据模型和可追溯性。
-4. 最后读 16 到 23，理解开源适配、工程任务拆解、持久会话、契约、质量评审、生产证据审计和角色 Skill 装载。
+4. 最后读 16 到 24，理解开源适配、工程任务拆解、持久会话、契约、质量评审、生产证据审计、角色 Skill 装载和 Worker 隔离。
 
 ## 01. 产品范围与用户旅程
 
