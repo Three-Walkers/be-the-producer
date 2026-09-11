@@ -203,3 +203,20 @@ of reopening its contract authoring and independent review tasks as well.
 An implementation review explicitly marked `change_requested` cannot complete
 from an unchanged previous receipt; a newly submitted grounded negative verdict
 still completes independent reviewer work without approving the implementation.
+
+## Native scene identity and immutable QA history
+
+Real QA captured a corrupted Canvas component: the generated scene serialized
+the bootstrap's compressed script UUID, but the headless compiler registered the
+class by its name without a UUID `_RF` frame. The generator now registers the
+exact serialized identifier through Cocos `js.setClassAlias`, retaining its
+primary identity. The generated-module regression executes both compiler modes;
+real startup still requires the independent QA run. See Cocos' official
+[class serialization documentation](https://docs.cocos.com/creator/3.4/manual/zh/scripting/ccclass.html)
+and the installed 3.8.8 engine's `js-typed.ts` alias implementation.
+
+Workspace synchronization no longer re-materializes receipt-ingested QA reports
+and evidence. Those bytes and their input provenance describe the historical
+run. Recapturing inputs after QA invalidates a build for repair previously threw
+and terminated the API; it could also rebind old evidence to a different build.
+Only a fresh trusted QA execution/receipt may publish new execution evidence.

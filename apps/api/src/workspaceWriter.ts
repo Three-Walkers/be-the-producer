@@ -1007,6 +1007,10 @@ function writeArtifactFile(
   }
 
   if (artifact.metadata.nativeHarnessManaged === true) {
+    // A QA receipt records the inputs of a completed historical execution.
+    // Syncing UI/project state must not re-materialize it against a repaired
+    // (or now pending) build, bless new bytes, or crash while capturing inputs.
+    if (artifact.metadata.generatedBy === "qa_result_ingestion") return;
     const absolutePath = resolvePathWithinRoot(projectRoot, safeWorkspacePath(targetPath), {
       allowMissing: true,
       expectedKind: "file",

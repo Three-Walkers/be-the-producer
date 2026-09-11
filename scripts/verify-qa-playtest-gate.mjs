@@ -8,7 +8,8 @@ const tempRoot = mkdtempSync(join(tmpdir(), "be-the-producer-qa-gate-"));
 process.env.STUDIO_WORKSPACE_ROOT = join(tempRoot, "studio");
 process.env.GAME_PIPELINE_DATA_ROOT = join(tempRoot, "data");
 
-const { createStudioKernel } = await import("../packages/agent-runtime/dist/index.js");
+const { createStudioKernel, createStudioKernelFromSnapshot } = await import("../packages/agent-runtime/dist/index.js");
+const { syncProjectWorkspace } = await import("../apps/api/dist/workspaceWriter.js");
 const { resumeQaTasksAfterVerifiedRepairs, materializeQaFailureRepairs } = await import("../apps/api/dist/qaRepairFlow.js");
 const { executeAgentToolRequests } = await import("../apps/api/dist/toolExecutor.js");
 const { writeQaPlaytestReceipt } = await import("../apps/api/dist/qaPlaytestReceipt.js");
@@ -201,6 +202,11 @@ writeQaPlaytestReceipt(
 const ingestion = reconcileQaPlaytestResults(kernel);
 assert.deepEqual(ingestion.processedOperationIds, [failingResult.operationId], "服务端必须摄取外部 Harness 生成的受保护收据");
 assert.deepEqual(ingestion.failedOperationIds, [failingResult.operationId]);
+const historicalQa = createStudioKernelFromSnapshot(structuredClone(kernel.toSnapshot()));
+historicalQa.updateTask(taskId, { inputArtifacts: ["not_yet_rebuilt"] });
+const oldQaLedger = JSON.stringify(historicalQa.listArtifactLedger().find((item) => item.artifactId === reportArtifactId));
+assert.doesNotThrow(() => syncProjectWorkspace(historicalQa), "checkpoint after repair invalidates a build must retain historical QA evidence without recapturing its inputs");
+assert.equal(JSON.stringify(historicalQa.listArtifactLedger().find((item) => item.artifactId === reportArtifactId)), oldQaLedger);
 assert.deepEqual(new Set(ingestion.queuedAgentIds), new Set(["gameplay_programmer", "cocos_tech_lead"]));
 assert.equal(kernel.findTask(taskId).status, "blocked", "失败试玩摄取后 QA 任务必须立即阻塞");
 const repairTasks = kernel.listTasks().filter((task) => task.taskId.startsWith("task_qa_repair_"));
