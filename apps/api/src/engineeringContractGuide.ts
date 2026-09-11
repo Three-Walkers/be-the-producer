@@ -34,6 +34,7 @@ export function engineeringContractGuide(types: string[]): string[] {
   if (types.includes("playtest_contract")) guide.push(
     "PlaytestContract 精确格式（示例仅说明字段，必须替换全部示例状态/动作，并覆盖真实成功、失败、重试、暂停、经济与升级路径）：",
     JSON.stringify(parsePlaytestContract(playtestContractExample)),
+    '执行语义：每个 scenario 都重新加载游戏，不继承前一个用例的塔、波次、暂停或终局。startState 是对重载后状态的断言，不是状态设置命令，所有 scenario 必须使用相同起始状态。每个用例必须在自己的 steps 中通过真实输入到达建造、战斗、胜负等前置状态；不得调用隐藏作弊接口。qualityGates 对整次运行的全部快照聚合，没有按 scenario/state 隐式筛选。胜利 HP>0、失败 HP=0 等分场景标准必须写在对应 steps.assertions，不能同时声明为全局 last(HP) 门禁，也不能删除失败/胜利覆盖来消除冲突。',
     'action只能为 {type:"input",actionId,phase:"start|perform|end",value?:number|string}、{type:"wait",durationMs:正整数} 或 {type:"system",command:"start|restart|pause|resume"}。assertions可为 {type:"state",stateId}、{type:"signal",signalId,operator:"eq|not_eq|gt|gte|lt|lte|exists|not_exists",expected?:string|number|boolean}、{type:"node",testId,expectation:"visible|hidden|enabled|disabled"}。exists/not_exists不带expected。',
     'step可增加 repeat:{maxIterations:1到100,until:[上述assertion]}；timeoutMs最多60000，maxScenarioDurationMs最多300000。qualityGates条目 {gateId,signalId,aggregation:"last|min|max|average|sum",operator:"eq|not_eq|gt|gte|lt|lte",expected}。全部引用必须属于当前GameContract/SceneBlueprint。不得新增脚本或JavaScript表达式，不能使用隐藏作弊动作替代真实玩法。'
   );

@@ -115,6 +115,8 @@ GameContract 不负责场景布局、Prefab 路径、Cocos 组件名、截图坐
 
 ### 5.1 必需项与有界执行
 
+- 每个 scenario 都重新加载游戏，不继承前一个用例的运行状态。v1 没有隐藏 fixture/set-state 接口；所有 `startState` 必须相同，各用例通过自己的真实输入步骤建立建造、战斗、暂停或终局前置条件。`startState` 是断言，不是导航指令。
+- `qualityGates` 聚合整次运行的全部快照，没有按用例名或状态隐式筛选。互相矛盾的全局等值/阈值条件会被拒绝；胜利 HP>0 与失败 HP=0 这类分支标准应保留在各自步骤断言中，不能为了通过校验删除必要覆盖。
 - Release gate 至少需要一个 `required: true` scenario。
 - Required scenario 至少需要一个 `required: true` step。
 - 非 required 项可以提供探索性覆盖，但失败不能伪装为 required gate 通过。
