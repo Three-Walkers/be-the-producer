@@ -618,7 +618,7 @@ export type ClaimVerdict = "verified" | "mismatch" | "insufficient";
 export type ClaimType = "artifact_written" | "completion" | "path_reference";
 export type ClaimRepairStatus = "open" | "resolved";
 export type ClaimRepairAction = "supply_evidence" | "correct_claim";
-export type ClaimRepairResolution = "evidence_verified" | "claim_corrected";
+export type ClaimRepairResolution = "evidence_verified" | "claim_corrected" | "claim_retracted";
 
 export interface ClaimVerification {
   claimId: ClaimId;
@@ -653,6 +653,7 @@ export interface ClaimRepair {
   resolvedAt?: string;
   resolution?: ClaimRepairResolution;
   resolutionClaimId?: ClaimId;
+  resolutionMessageId?: MessageId;
 }
 
 export type TaskEpisodeStatus = "open" | "reviewing" | "accepted" | "rework" | "closed";

@@ -53,7 +53,62 @@ assert.equal(migration.kernel.listClaimRepairs().length, 1, "clean reconciliatio
 assert.equal(guardianMessages(migration.kernel).length, 1);
 assert.equal(guardianMessages(migration.kernel)[0].metadata.claimRepairProtocolVersion, 2);
 
-console.log("Claim repair smoke passed: no recursion, semantic dedupe, clean migration");
+const retractionKernel = createStudioKernel(`game_retraction_${Date.now()}`, "Retraction", "producer_test", "test");
+const source = { ...agentMessage("unsupported_completion", "文档规范已写入。"), projectId: retractionKernel.project.projectId,
+  roomId: retractionKernel.getRoom("design-room").roomId, createdAt: "2026-09-01T00:00:00.000Z" };
+retractionKernel.recordMessage(source);
+verifyProjectClaims(retractionKernel);
+reconcileClaimRepairs(retractionKernel);
+const repair = retractionKernel.listClaimRepairs()[0];
+assert.ok(repair);
+const retract = { ...source, messageId: "msg_retract", content: `撤回声明：${repair.claimId}\n此条仅为计划，尚未落盘。`, createdAt: "2026-09-01T00:01:00.000Z" };
+retractionKernel.recordMessage({ ...retract, messageId: "wrong_author", senderId: "art_director" });
+retractionKernel.recordMessage({ ...retract, messageId: "quoted", content: `有人建议：${retract.content}` });
+reconcileClaimRepairs(retractionKernel);
+assert.equal(retractionKernel.listClaimRepairs()[0].status, "open", "only an explicit retraction by the original agent is valid");
+retractionKernel.recordMessage(retract);
+verifyProjectClaims(retractionKernel);
+reconcileClaimRepairs(retractionKernel);
+assert.equal(retractionKernel.listClaimRepairs()[0].resolution, "claim_retracted");
+assert.equal(retractionKernel.findTask(repair.taskId).status, "done");
+assert.equal(retractionKernel.listArtifacts().length, 0, "retraction must never fabricate completion evidence");
+assert.notEqual(retractionKernel.listClaimVerifications().find((claim) => claim.claimId === repair.claimId).verdict, "verified");
+retractionKernel.updateTask(repair.taskId, {status: "blocked", blockers: ["late stale loop reply"]});
+reconcileClaimRepairs(retractionKernel);
+assert.equal(retractionKernel.findTask(repair.taskId).status, "done", "grounded resolved audit work repairs a late stale task projection");
+const { AgentLoopService } = await import("../apps/api/dist/agentLoop.js");
+retractionKernel.updateTask(repair.taskId, {status: "doing", blockers: []});
+retractionKernel.updateProject({executionStatus: "running"});
+const auditLoop = new AgentLoopService({getKernel: () => retractionKernel, checkpoint: () => {}, modelRuntime: {
+  async respondToTask(current) {
+    reconcileClaimRepairs(current); // Simulate evidence resolving while the worker returns.
+    return {...retract, messageId: "late_audit_worker", relatedTaskIds: [repair.taskId],
+      metadata: {loopControl: {status: "blocked", reason: "No output file", handoffAgentIds: []}}};
+  }
+}});
+auditLoop.start(retractionKernel.project.projectId, {reason: "audit race regression"});
+const auditDeadline = Date.now() + 2000;
+while (retractionKernel.getAgentLoopState().status === "running" && Date.now() < auditDeadline) await new Promise(resolve => setTimeout(resolve, 10));
+assert.equal(retractionKernel.findTask(repair.taskId).status, "done", "a late loop-control result cannot reopen a resolved evidence repair");
+auditLoop.pause(retractionKernel.project.projectId);
+const { reconcileProductionAudit } = await import("../apps/api/dist/productionAudit.js");
+const repairedAudit = reconcileProductionAudit(retractionKernel, { trigger: "checkpoint" });
+assert.ok(!repairedAudit.run.findings.some((finding) => finding.signature === `task-output:${repair.taskId}`),
+  "a grounded retraction completes a correction task without inventing an output file");
+assert.ok(!repairedAudit.run.findings.some((finding) => finding.signature === "task-output:task_group_claim_repair"),
+  "a task group is not an unmaterialized file");
+const savedRetraction = retract.content;
+retract.content = "仅仅修改文字，未撤回。";
+const forgedAudit = reconcileProductionAudit(retractionKernel, { trigger: "checkpoint", triggerRef: "invalid-retraction" });
+assert.ok(forgedAudit.run.findings.some((finding) => finding.signature === `task-output:${repair.taskId}`),
+  "resolved status alone cannot replace the actual owner-bound retraction evidence");
+retract.content = savedRetraction;
+retractionKernel.recordMessage({ ...source, messageId: "new_false_completion", createdAt: "2099-01-01T00:00:00.000Z" });
+verifyProjectClaims(retractionKernel);
+reconcileClaimRepairs(retractionKernel);
+assert.equal(retractionKernel.listClaimRepairs()[0].status, "open", "a later false claim cannot hide behind an earlier retraction");
+
+console.log("Claim repair smoke passed: no recursion, semantic dedupe, clean migration, owner-bound explicit retraction without artifact approval");
 
 function agentMessage(id, content) {
   return {

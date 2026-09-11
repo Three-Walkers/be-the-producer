@@ -388,6 +388,16 @@ function applyTaskOutcome(
   noProgressCounts: Map<TaskId, number>,
   failureCounts: Map<TaskId, number>
 ): void {
+  if (kernel.findTask(task.taskId)?.status === "done" && kernel.listClaimRepairs().some((repair) =>
+    repair.taskId === task.taskId && repair.status === "resolved")) {
+    // Claim verification may resolve this task while its worker is returning.
+    // Its empty output list is intentional; a late loop-control reply must not
+    // reopen already-verified audit work or consume retries forever.
+    noProgressCounts.delete(task.taskId);
+    failureCounts.delete(task.taskId);
+    kernel.updateAgentLoopAgent(task.ownerAgentId, {status: "waiting", taskId: task.taskId, lastError: undefined, updatedAt: new Date().toISOString()});
+    return;
+  }
   const control = readLoopControl(message);
   const toolResults = readToolResults(message);
   const successfulTools = toolResults.filter((result) => result.status === "completed");
