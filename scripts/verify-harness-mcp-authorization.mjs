@@ -501,6 +501,11 @@ globalThis.fetch = async (_input, init = {}) => {
   const sceneTool = failure.get(19).result.tools.find((tool) => tool.name === "cocos_apply_blueprint");
   assert.equal(sceneTool.inputSchema.properties.scenePath.default, "assets/scenes/MainGame.scene");
   assert.match(sceneTool.inputSchema.properties.scenePath.description, /Authorized write paths: none/);
+  const wrongScene = runMcp({ ...cocosAuthorization,
+    serviceWritePaths: [...cocosAuthorization.serviceWritePaths, "assets/scenes/MainGame.scene", "assets/scenes/MainGame.scene.meta"]
+  }, "cocos_automation", [rpc(21, "tools/call", { name: "cocos_apply_blueprint", arguments: { scenePath: "assets/scenes/Main.scene" } })]);
+  assert.equal(wrongScene.get(21).result.isError, true);
+  assert.match(wrongScene.get(21).result.content[0].text, /当前任务的场景写入授权为：assets\/scenes\/MainGame.scene/);
   const operations = readFileSync(operationLog, "utf8").trim().split(/\r?\n/).map((line) => JSON.parse(line));
   assert.ok(operations.length > 0);
   assert.ok(operations.every((operation) => operation.status === "failed" && operation.bridgeOk === false));

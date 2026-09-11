@@ -1344,6 +1344,12 @@ function assertCocosRequestAuthorized(name: string, args: Record<string, unknown
   if (name === "cocos_apply_blueprint") {
     const blueprintPath = typeof args.blueprintPath === "string" ? args.blueprintPath : "agents/engineering/cocos-scene-blueprints/main.scene-blueprint.json";
     const scenePath = typeof args.scenePath === "string" ? args.scenePath : defaultCocosScenePath;
+    try {
+      assertPathAuthorized(scenePath, "service_write");
+    } catch (error) {
+      const allowed = authorization.serviceWritePaths.filter((path) => path.startsWith("assets/scenes") && !path.endsWith(".meta"));
+      throw new Error(`${error instanceof Error ? error.message : String(error)}。当前任务的场景写入授权为：${allowed.join("、") || "无"}；默认路径为 ${defaultCocosScenePath}，省略 scenePath 可使用默认值。不要把文件名不匹配误判为整个目录无权限。`);
+    }
     assertPathAuthorized(blueprintPath, "read");
     assertPathAuthorized("assets/scripts", "read");
     for (const path of [scenePath, `${scenePath}.meta`, "assets/resources/btp", "assets/scripts/btp", "agents/cocos-automation/scene-ops"]) {
