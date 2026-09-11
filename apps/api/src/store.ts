@@ -16,6 +16,9 @@ import { verifyProjectClaims } from "./claimVerifier.js";
 import { reconcileClaimRepairs } from "./claimRepair.js";
 import { migrateLegacyClaimRepairStorm } from "./claimRepairMigration.js";
 import { AgentLoopService } from "./agentLoop.js";
+import { extractMentionedAgents } from "./agentMentions.js";
+export { extractMentionedAgents } from "./agentMentions.js";
+import { applyProducerChangeRequest, producerChangeTargets } from "./producerChangeRequest.js";
 import { finalizeMessageActivity, recordServerToolActivity } from "./agentActivity.js";
 import { ModelAgentRuntime } from "./modelAgentRuntime.js";
 import { ProjectPersistenceStore, type ProjectStateRepository, type ProjectSummary } from "./projectPersistence.js";
@@ -201,9 +204,9 @@ export class StudioProjectStore {
       },
       {
         scriptedReplies: false,
-        modelReplies: false,
+        modelReplies: true,
         bootstrapProjectState: true,
-        protocolFlows: true
+        protocolFlows: false
       }
     );
     const kernel = this.getKernel(projectId);
@@ -361,6 +364,23 @@ export class StudioProjectStore {
       ...(options.bootstrapProjectState === undefined ? {} : { bootstrapProjectState: options.bootstrapProjectState })
     };
     const result = this.runtime.handleProducerMessage(kernel, message, runtimeOptions);
+    if (producerChangeTargets(kernel, message).length > 0) {
+      // Abort the old generation before changing its inputs. In-flight model
+      // results must not overwrite the producer's new requirement after return.
+      this.agentLoop.pause(projectId, "制作人变更请求：取消旧执行并重新排程。");
+      const changedTaskIds = applyProducerChangeRequest(kernel, message);
+      const acknowledgement: StudioMessage = {
+        messageId: `msg_producer_change_${randomUUID()}`, projectId, roomId: room.roomId,
+        senderType: "agent", senderId: "studio_orchestrator", messageType: "progress_update",
+        content: `已接收制作人变更请求，将重新执行 ${changedTaskIds.length} 项相关任务；旧文件保留，相关产物需重新提交和评审，无关工作不变。`,
+        mentions: [], relatedTaskIds: changedTaskIds, relatedArtifactIds: [],
+        metadata: { generatedBy: "producer_change_request", sourceMessageId: message.messageId },
+        createdAt: new Date().toISOString()
+      };
+      kernel.recordMessage(acknowledgement);
+      result.agentMessages.push(acknowledgement);
+      this.checkpointKernel(kernel);
+    }
     let modelMessagesHandled = false;
     if (options.modelReplies && result.agentMessages.length === 0) {
       const modelResult = await this.modelRuntime.respond(kernel, message, result.routePlan, {
@@ -599,32 +619,6 @@ export function migrateLegacyMediaGenerationReceipts(kernel: StudioKernel): bool
     changed = true;
   }
   return changed;
-}
-
-const mentionAliases: Record<string, string[]> = {
-  studio_orchestrator: ["studio_orchestrator", "studio orchestrator", "orchestrator", "总控", "调度", "主持人"],
-  producer: ["producer", "producer agent", "制作人协调", "制作"],
-  game_designer: ["game_designer", "game designer", "策划", "游戏策划"],
-  art_director: ["art_director", "art director", "美术", "美术导演"],
-  asset_production: ["asset_production", "asset production", "资产", "资产生产"],
-  cocos_tech_lead: ["cocos_tech_lead", "cocos tech lead", "cocos", "技术负责人", "架构"],
-  gameplay_programmer: ["gameplay_programmer", "gameplay programmer", "程序", "玩法程序", "开发"],
-  cocos_automation: ["cocos_automation", "cocos automation", "自动化", "编辑器"],
-  qa_evaluator: ["qa_evaluator", "game evaluator", "qa", "测试", "评估"],
-  wechat_platform: ["wechat_platform", "wechat platform", "微信", "平台"],
-  devops: ["devops", "运维", "部署"],
-  liveops_analytics: ["liveops_analytics", "liveops", "analytics", "运营", "数据"]
-};
-
-function extractMentionedAgents(content: string): string[] {
-  const normalized = content.toLowerCase();
-  const mentioned = defaultAgentContracts
-    .filter((agent) => {
-      const aliases = [agent.agentId, agent.displayName, ...(mentionAliases[agent.agentId] ?? [])];
-      return aliases.some((alias) => normalized.includes(`@${alias.toLowerCase()}`));
-    })
-    .map((agent) => agent.agentId);
-  return uniqueStrings(mentioned);
 }
 
 function uniqueStrings(values: string[]): string[] {

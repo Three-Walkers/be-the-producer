@@ -336,7 +336,8 @@ export class LocalAgentRuntime {
       bootstrapConceptDiscussion(kernel, message, now);
     }
 
-    const gate = resolveGateAction(kernel, message.content);
+    // An initial brief is data, never a workflow command (even when it describes approvals).
+    const gate = options.bootstrapProjectState ? undefined : resolveGateAction(kernel, message.content);
     const shouldRunLocalDecisionFlow = gate ? protocolFlows : false;
     const transitionApplied = gate && shouldRunLocalDecisionFlow
       ? applyProducerDecisionFlow(kernel, message, gate, now, options.gateEvidencePolicy ?? this.gateEvidencePolicy)
@@ -1040,14 +1041,13 @@ function gateSummaryLine(kernel: StudioKernel, gate: GateAction, stageApplicable
 }
 
 function detectGateAction(content: string): GateAction | undefined {
-  const normalized = content.toLowerCase();
-  if (isReleaseMessage(normalized) || normalized.includes(gateActions.release.confirmToken.toLowerCase())) {
+  if (isReleaseMessage(content) || isGateExecutionConfirmation(content, gateActions.release)) {
     return gateActions.release;
   }
-  if (isPlayableApprovalMessage(normalized) || normalized.includes(gateActions.playable.confirmToken.toLowerCase())) {
+  if (isPlayableApprovalMessage(content) || isGateExecutionConfirmation(content, gateActions.playable)) {
     return gateActions.playable;
   }
-  if (isApprovalMessage(normalized) || normalized.includes(gateActions.stage1.confirmToken.toLowerCase())) {
+  if (isApprovalMessage(content) || isGateExecutionConfirmation(content, gateActions.stage1)) {
     return gateActions.stage1;
   }
   return undefined;
@@ -1073,28 +1073,24 @@ function resolveGateAction(kernel: StudioKernel, content: string): GateAction | 
 }
 
 function isGateExecutionConfirmation(content: string, gate: GateAction): boolean {
-  const normalized = content.toLowerCase();
-  return normalized.includes(gate.confirmToken.toLowerCase()) || (normalized.includes("执行确认") && normalized.includes(gate.label.toLowerCase()));
+  return gateCommandHead(content) === gateCommandHead(gate.confirmToken);
+}
+
+// Match a standalone leading command, not arbitrary keywords across a design brief.
+// Keep the UI's "command。explanation" format, but fail closed for quotes/negation/questions.
+function gateCommandHead(content: string): string {
+  return content.trim().split(/[。.!！;；\n]/, 1)[0]!.toLowerCase().replace(/\s/g, "").replace(/:/g, "：");
 }
 
 function isNaturalLanguageGateConfirmation(content: string): boolean {
-  const normalized = content.toLowerCase().replace(/[，。！？!?\s]/g, "");
-  if (["确认", "同意", "继续", "通过", "审批通过", "确认通过"].includes(normalized)) {
-    return true;
-  }
-  return (
-    (normalized.includes("确认") || normalized.includes("同意") || normalized.includes("继续") || normalized.includes("通过")) &&
-    (normalized.includes("结束") || normalized.includes("下一阶段") || normalized.includes("推进") || normalized.includes("进入开发") || normalized.includes("进入发布"))
-  );
+  const normalized = gateCommandHead(content);
+  return /^(?:确认|同意|继续|通过|审批通过|确认通过)$/.test(normalized) ||
+    /^(?:我)?(?:确认|同意)(?:结束本阶段|进入下一阶段|推进到下一阶段|进入开发|进入发布)$/.test(normalized);
 }
 
 function isGenericGateIntent(content: string): boolean {
-  const normalized = content.toLowerCase();
-  return (
-    isNaturalLanguageGateConfirmation(content) ||
-    ((normalized.includes("门禁") || normalized.includes("评审")) &&
-      (normalized.includes("发起") || normalized.includes("开始") || normalized.includes("请求") || normalized.includes("进入")))
-  );
+  return isNaturalLanguageGateConfirmation(content) ||
+    /^(?:请)?(?:发起|开始|请求|进入)(?:本阶段|当前阶段)?(?:的)?门禁评审$/.test(gateCommandHead(content));
 }
 
 function isGateStageApplicable(kernel: StudioKernel, gate: GateAction): boolean {
@@ -1180,28 +1176,24 @@ function approveStageOne(
 }
 
 function isApprovalMessage(content: string): boolean {
-  return (
-    ((content.includes("确认") || content.includes("同意") || content.includes("审批") || content.includes("通过")) &&
-      (content.includes("玩法") || content.includes("美术") || content.includes("范围") || content.includes("stage 1") || content.includes("立项"))) ||
-    ((content.includes("门禁") || content.includes("评审")) &&
-      (content.includes("立项") || content.includes("本阶段") || content.includes("当前阶段") || content.includes("讨论"))) ||
-    ((content.includes("结束") || content.includes("下一阶段") || content.includes("开发落地")) &&
-      (content.includes("确认") || content.includes("同意") || content.includes("开始") || content.includes("进入") || content.includes("推进")))
-  );
+  const head = gateCommandHead(content);
+  return /^(?:请)?(?:确认|同意|批准|审批通过)(?:立项|stage1)$/.test(head) ||
+    /^(?:请)?(?:发起|开始|请求)(?:立项|立项阶段|stage1)(?:的)?门禁评审$/.test(head) ||
+    head === "请求门禁评审：确认立项";
 }
 
 function isPlayableApprovalMessage(content: string): boolean {
-  return (
-    (content.includes("首个可玩") || content.includes("可玩版本") || content.includes("first playable")) &&
-    (content.includes("确认") || content.includes("同意") || content.includes("通过") || content.includes("接受"))
-  );
+  const head = gateCommandHead(content);
+  return /^(?:(?:确认|同意|接受)(?:首个可玩|可玩版本|firstplayable)(?:通过)?|首个可玩通过)$/.test(head) ||
+    /^(?:请)?(?:发起|开始|请求)(?:首个可玩|可玩版本)(?:的)?门禁评审$/.test(head) ||
+    head === "请求门禁评审：首个可玩通过";
 }
 
 function isReleaseMessage(content: string): boolean {
-  return (
-    (content.includes("发布") || content.includes("上线") || content.includes("release")) &&
-    (content.includes("确认") || content.includes("同意") || content.includes("批准") || content.includes("通过"))
-  );
+  const head = gateCommandHead(content);
+  return /^(?:确认|同意|批准)(?:发布|上线|release)$/.test(head) ||
+    /^(?:请)?(?:发起|开始|请求)(?:发布|上线|release)(?:的)?门禁评审$/.test(head) ||
+    head === "请求门禁评审：批准发布";
 }
 
 function readinessText(isReady: boolean): string {
@@ -2305,6 +2297,8 @@ function ensureStageTwoTasksAndArtifacts(
     updatedAt: now
   });
 
+  // This repair also runs on checkpoints; only real transitions emit notices.
+  if (message.messageId === "runtime_quality_reconciliation") return;
   writeAgentMessage(kernel, {
     agentId: "asset_production",
     roomKind: "art-room",
