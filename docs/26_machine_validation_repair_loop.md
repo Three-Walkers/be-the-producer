@@ -220,3 +220,12 @@ and evidence. Those bytes and their input provenance describe the historical
 run. Recapturing inputs after QA invalidates a build for repair previously threw
 and terminated the API; it could also rebind old evidence to a different build.
 Only a fresh trusted QA execution/receipt may publish new execution evidence.
+
+An authoritative staged diff also preserves explicit idempotent text/source
+submissions: a completed write operation with matching SHA-256/size for the
+current task's owned registered file counts even if its bytes did not change.
+File existence, read operations, failed writes and mismatching hashes do not.
+This permits a justified unchanged-source resubmission after a platform-only
+repair, without requiring pointless gameplay edits or skipping fresh independent
+checks. Directory builds and protected QA/media outputs retain their own service
+receipt requirements. Regression: `verify-claude-harness.mjs`.

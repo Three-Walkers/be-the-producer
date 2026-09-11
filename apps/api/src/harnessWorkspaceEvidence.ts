@@ -537,6 +537,18 @@ export function analyzeHarnessWorkspaceChanges(
   const explicitResubmissions = (invocationToolOperations ?? [])
     .filter((operation) => operation.toolName === "resubmit_existing_asset" && toolOperationSucceeded(operation))
     .map((operation) => operation.path).filter((path) => after.has(path));
+  const declaredOutputPaths = new Set(kernel.listArtifacts().filter((artifact) =>
+    task.outputArtifacts.includes(artifact.artifactId) && artifact.ownerAgentId === agent.agentId &&
+    artifact.sourceTaskId === task.taskId && artifact.type !== "build")
+    .map((artifact) => artifactFilePath(artifact).replaceAll("\\", "/")));
+  for (const operation of invocationToolOperations ?? []) {
+    const file = after.get(operation.path);
+    if (["write_artifact", "write_code", "edit_code"].includes(operation.toolName) && operation.status === "completed" &&
+        operationWritesWorkspace(operation) && declaredOutputPaths.has(operation.path) && file &&
+        operation.hash === file.hash && operation.sizeBytes === file.sizeBytes) {
+      explicitResubmissions.push(operation.path);
+    }
+  }
   const candidateChangedPaths = options.authoritativeWorkspace || !invocationChangedPaths
     ? [...new Set([...workspaceChangedPaths, ...explicitResubmissions])].sort()
     : [...new Set([...invocationChangedPaths, ...failedMutationPaths])].filter((path) => after.has(path)).sort();

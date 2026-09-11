@@ -307,6 +307,16 @@ const repeatedWriteEvidence = recordHarnessWorkspaceChanges(
   ["docs/design/harness-proof.md"]
 );
 assert.deepEqual(repeatedWriteEvidence.changedPaths, ["docs/design/harness-proof.md"]);
+const sameFile = unchangedAfter.get("docs/design/harness-proof.md");
+const repeatOperation = { toolName: "write_artifact", path: sameFile.path, hash: sameFile.hash,
+  sizeBytes: sameFile.sizeBytes, access: "write", status: "completed" };
+const authoritativeRepeat = (operation) => recordHarnessWorkspaceChanges(kernel, task, agent, unchangedBefore,
+  unchangedAfter, "inv_authoritative_repeat", undefined, operation ? [operation] : [], { authoritativeWorkspace: true });
+assert.deepEqual(authoritativeRepeat().changedPaths, [], "existing bytes alone cannot resubmit an output");
+assert.deepEqual(authoritativeRepeat({ ...repeatOperation, access: "read" }).changedPaths, []);
+assert.deepEqual(authoritativeRepeat({ ...repeatOperation, status: "failed" }).changedPaths, []);
+assert.deepEqual(authoritativeRepeat({ ...repeatOperation, hash: "0".repeat(64) }).changedPaths, []);
+assert.deepEqual(authoritativeRepeat(repeatOperation).changedPaths, [sameFile.path], "byte-matching authorized idempotent writes must survive staging diff analysis");
 
 await harness.run({
   projectId: kernel.project.projectId,
