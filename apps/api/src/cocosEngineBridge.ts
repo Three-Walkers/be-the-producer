@@ -27,6 +27,8 @@ import type {
 import type { CocosEngineConfig } from "./cocosEngineSettings.js";
 import { adaptLegacySceneBlueprint } from "./legacySceneBlueprintAdapter.js";
 import { normalizeRelativePathWithinRoot, resolvePathWithinRoot } from "./pathSafety.js";
+import { playtestRuntimeBindingPath, readPlaytestRuntimeBinding } from "./playtestRuntimeBinding.js";
+import { discoverScriptComponents, type ScriptComponent } from "./cocosScriptComponents.js";
 
 export interface CocosBridgeEvidence {
   path: string;
@@ -114,11 +116,6 @@ class AssetImportValidationError extends Error {
     super(message);
     this.name = "AssetImportValidationError";
   }
-}
-
-interface ScriptComponent {
-  className: string;
-  importPath: string;
 }
 
 const defaultManifestPath = "agents/art/asset-manifest.json";
@@ -404,13 +401,19 @@ export class CocosEngineBridge {
       // Fail closed before Creator starts: the build may consume only bytes
       // proven by the latest successful import of the canonical manifest.
       const importReceipt = requireCurrentCocosImportReceipt(this.projectRoot, defaultManifestPath);
+      // Embed the identity of the actual QA contract at build time. Gameplay
+      // and QA authors run independently; neither should guess or hard-code a
+      // hash of another role's future output.
+      const playtestBinding = readPlaytestRuntimeBinding(this.projectRoot);
       const scene = findBuildScene(this.projectRoot);
       if (!scene) {
         throw new Error("工程没有可构建的 .scene 及 .scene.meta。请先调用 cocos_apply_blueprint。");
       }
       const outputAbsolute = resolveInsideProject(this.projectRoot, outputDir);
       const logAbsolute = resolveInsideProject(this.projectRoot, logPath);
-      assertWritableProjectTargets(this.projectRoot, [logPath, reportPath, operationReportPath]);
+      assertWritableProjectTargets(this.projectRoot, [logPath, reportPath, operationReportPath,
+        ...(playtestBinding ? [playtestRuntimeBindingPath] : [])]);
+      if (playtestBinding) evidence.push(this.writeJson(playtestRuntimeBindingPath, playtestBinding));
       ensureDirectoryInsideProject(this.projectRoot, outputDir);
       ensureDirectoryInsideProject(this.projectRoot, relative(this.projectRoot, dirname(logAbsolute)));
       resolvePathWithinRoot(this.projectRoot, relative(this.projectRoot, outputAbsolute), {
@@ -461,6 +464,7 @@ export class CocosEngineBridge {
         debug,
         executablePath: this.config.executablePath,
         creatorVersion: this.config.version,
+        ...(playtestBinding ? { playtestBinding } : {}),
         projectPath: this.projectRoot,
         scenePath: scene.path,
         sceneUuid: scene.uuid,
@@ -1112,30 +1116,11 @@ function validateBridgeComponents(blueprint: SceneBlueprint, discovered: ScriptC
   }
 }
 
-function discoverScriptComponents(projectRoot: string): ScriptComponent[] {
-  const scriptsRoot = resolveInsideProject(projectRoot, "assets/scripts");
-  if (!existsSync(scriptsRoot)) {
-    return [];
-  }
-  const bootstrapDirectory = resolveInsideProject(projectRoot, "assets/scripts/btp");
-  const scripts = listAbsoluteFiles(scriptsRoot).filter((path) => path.endsWith(".ts") && !path.includes(`${sep}btp${sep}`));
-  const components: ScriptComponent[] = [];
-  for (const path of scripts) {
-    const source = readFileSync(path, "utf8");
-    const className = source.match(/@ccclass\(\s*["']([^"']+)["']\s*\)/)?.[1]
-      ?? source.match(/export\s+class\s+(\w+)\s+extends\s+Component/)?.[1];
-    if (!className || !new RegExp(`export\\s+class\\s+${escapeRegExp(className)}\\b`).test(source)) {
-      continue;
-    }
-    const importPath = relative(bootstrapDirectory, path).split(sep).join("/").replace(/\.ts$/, "");
-    components.push({ className, importPath: importPath.startsWith(".") ? importPath : `./${importPath}` });
-  }
-  return [...new Map(components.map((component) => [component.className, component])).values()].sort((left, right) => left.className.localeCompare(right.className));
-}
-
 function renderRuntimeBootstrap(components: ScriptComponent[]): string {
-  const imports = components.map((component) => `import { ${component.className} } from '${component.importPath}';`).join("\n");
-  const registry = components.map((component) => `  ${JSON.stringify(component.className)}: ${component.className},`).join("\n");
+  const imports = components.map((component, index) => component.defaultExport
+    ? `import BtpComponent${index} from ${JSON.stringify(component.importPath)};`
+    : `import { ${component.exportName} as BtpComponent${index} } from ${JSON.stringify(component.importPath)};`).join("\n");
+  const registry = components.map((component, index) => `  ${JSON.stringify(component.className)}: BtpComponent${index},`).join("\n");
   return `import {
   _decorator,
   AudioSource,
@@ -1262,6 +1247,16 @@ export class BtpRuntimeBootstrap extends Component {
           return;
         }
       }
+      // Dependency traversal order must not become draw order. In Cocos UI,
+      // later siblings render above earlier ones; reverse traversal previously
+      // placed the background on top of every interactive panel.
+      const nextSiblingIndex = new Map<string, number>();
+      for (const spec of scene.nodes) {
+        const parentKey = spec.parentNodeId ?? '__scene_root';
+        const siblingIndex = nextSiblingIndex.get(parentKey) ?? 0;
+        this.nodes.get(this.nodeKey(scene.sceneId, spec.nodeId))?.setSiblingIndex(siblingIndex);
+        nextSiblingIndex.set(parentKey, siblingIndex + 1);
+      }
       this.applyRuntimeProperties();
       console.info('[BTP Bridge] scene blueprint materialized', {
         rootChildren: this.node.children.length,
@@ -1374,6 +1369,13 @@ export class BtpRuntimeBootstrap extends Component {
   }
 
   private applyComponentProperty(target: Component & Record<string, unknown>, property: string, value: JsonValue): void {
+    if (target instanceof Sprite && property === 'sizeMode' && typeof value === 'string') {
+      const modes: Record<string, number> = { custom: Sprite.SizeMode.CUSTOM, trimmed: Sprite.SizeMode.TRIMMED, raw: Sprite.SizeMode.RAW };
+      const mode = modes[value.toLowerCase()];
+      if (mode === undefined) throw new Error('[BTP Bridge] invalid Sprite.sizeMode: ' + value);
+      target.sizeMode = mode;
+      return;
+    }
     if (property === 'color' && typeof value === 'string') {
       target[property] = this.parseColor(value, new Color(255, 255, 255, 255));
       return;

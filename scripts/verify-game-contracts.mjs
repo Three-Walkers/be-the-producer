@@ -180,6 +180,21 @@ restartingContract.stateModel.transitions.push({
   emits: [],
 });
 assert.equal(validateGameContract(restartingContract).ok, true, "terminal states may explicitly restart");
+const resultActionsContract = structuredClone(restartingContract);
+resultActionsContract.inputModel.actions.push({ actionId: "retry_level", label: "Retry", description: "Reset and retry this level.",
+  bindings: [{ device: "touch", control: "retry_button", gesture: "tap" }], enabledInStates: ["won", "lost"] });
+resultActionsContract.stateModel.transitions.push({ transitionId: "retry_after_loss", from: "lost", to: "playing",
+  trigger: { type: "input", ref: "retry_level" }, guards: [], emits: ["round_started"] });
+assert.equal(validateGameContract(resultActionsContract).ok, true, "result panels can retry a level without visiting the global main menu");
+const autoTerminalExit = structuredClone(resultActionsContract);
+autoTerminalExit.stateModel.transitions.at(-1).trigger = { type: "signal", ref: "round_started" };
+assert.equal(validateGameContract(autoTerminalExit).ok, false, "background signals must not silently leave result panels");
+const disabledTerminalExit = structuredClone(resultActionsContract);
+disabledTerminalExit.inputModel.actions.at(-1).enabledInStates = ["playing"];
+assert.equal(validateGameContract(disabledTerminalExit).ok, false, "a result-panel exit must be enabled there");
+const terminalToTerminal = structuredClone(resultActionsContract);
+terminalToTerminal.stateModel.transitions.at(-1).to = "won";
+assert.equal(validateGameContract(terminalToTerminal).ok, false, "retry cannot change defeat into victory");
 
 const withTypo = structuredClone(fixtures[0].gameContract);
 withTypo.identity.revison = 2;
