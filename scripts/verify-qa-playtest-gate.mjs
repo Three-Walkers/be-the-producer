@@ -9,7 +9,8 @@ process.env.STUDIO_WORKSPACE_ROOT = join(tempRoot, "studio");
 process.env.GAME_PIPELINE_DATA_ROOT = join(tempRoot, "data");
 
 const { createStudioKernel } = await import("../packages/agent-runtime/dist/index.js");
-const { resumeQaTasksAfterVerifiedRepairs } = await import("../apps/api/dist/qaRepairFlow.js");
+const { resumeQaTasksAfterVerifiedRepairs, materializeQaFailureRepairs } = await import("../apps/api/dist/qaRepairFlow.js");
+const { executeAgentToolRequests } = await import("../apps/api/dist/toolExecutor.js");
 const { writeQaPlaytestReceipt } = await import("../apps/api/dist/qaPlaytestReceipt.js");
 const { reconcileQaPlaytestResults } = await import("../apps/api/dist/qaResultIngestion.js");
 const { assertQaEvidenceWriteAllowed } = await import("../apps/api/dist/qaEvidenceProtection.js");
@@ -243,6 +244,41 @@ for (const [index, repairTask] of repairTasks.entries()) {
 resumeQaTasksAfterVerifiedRepairs(kernel);
 assert.equal(kernel.findTask(taskId).status, "doing", "所有修复证据通过后 QA 应重新排队执行真实试玩");
 assert.equal(kernel.findTask(taskId).blockers.length, 0);
+
+// Real production has canonical artifact-owning tasks. QA must reopen those
+// tasks, not create a ticket lacking permission to edit their existing source.
+const originalTasks = [
+  ["task_stage_2_cocos_implementation", "gameplay_programmer", "assets/scripts/original-owner.ts"],
+  ["task_stage_2_cocos_architecture", "cocos_tech_lead", "agents/engineering/original-owner.md"]
+];
+for (const [originalId, owner, path] of originalTasks) {
+  kernel.addTask({...kernel.findTask(taskId), taskId: originalId, ownerAgentId: owner, description: "Original production", status: "review",
+    inputArtifacts: [], outputArtifacts: [`output_${owner}`], blockers: []});
+  materializeArtifact({artifactId: `output_${owner}`, path, ownerAgentId: owner, sourceTaskId: originalId,
+    type: "source_code", content: "// original source\n", metadata: {toolName: "write_artifact", toolExecutedAt: now}});
+}
+const routed = materializeQaFailureRepairs(kernel, kernel.findTask(taskId));
+assert.deepEqual(new Set(routed.repairTaskIds), new Set(originalTasks.map(([id]) => id)));
+assert.equal(kernel.listTasks().filter(t => t.taskId.startsWith("task_qa_repair_")).length, 2, "no new cross-task repair tickets when original owners exist");
+kernel.updateTask(taskId, {status: "blocked", blockers: [routed.reason]});
+for (const [originalId, owner, path] of originalTasks) {
+  const original = kernel.findTask(originalId);
+  assert.equal(original.status, "doing");
+  assert.deepEqual(original.inputArtifacts, [], "failed QA report is feedback, never a blocking cyclic input");
+  assert.equal(taskOutputsVerified(kernel, original), false, "old submitted bytes cannot close a new repair");
+  const [writeResult] = await executeAgentToolRequests(kernel, [{messageId: `real_repair_${owner}`, projectId,
+    roomId: kernel.getRoom("engineering-room").roomId, senderType: "agent", senderId: owner, messageType: "progress_update", mentions: [],
+    relatedTaskIds: [originalId], relatedArtifactIds: [], metadata: {}, createdAt: now,
+    content: "```json\n" + JSON.stringify({toolRequests: [{tool: owner === "gameplay_programmer" ? "write_code" : "write_artifact", taskId: originalId, artifactId: `output_${owner}`,
+      artifactType: "source_code", path, content: "// changed actual source\n"}]}) + "\n```"}]);
+  assert.equal(writeResult.status, "completed", writeResult.error);
+  kernel.updateTask(originalId, {status: "review"});
+}
+const beforeRepeatedFeedback = originalTasks.map(([id]) => kernel.findTask(id).description);
+materializeQaFailureRepairs(kernel, kernel.findTask(taskId));
+assert.deepEqual(originalTasks.map(([id]) => kernel.findTask(id).description), beforeRepeatedFeedback, "same QA operation feedback is idempotent");
+resumeQaTasksAfterVerifiedRepairs(kernel);
+assert.equal(kernel.findTask(taskId).status, "doing", "real original-owner writes release QA for a new actual run");
 
 rmSync(tempRoot, { recursive: true, force: true });
 process.stdout.write("QA playtest gate smoke passed: forged report rejected, failures routed, verified repairs requeued\n");
