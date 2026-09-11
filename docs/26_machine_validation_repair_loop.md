@@ -31,6 +31,11 @@ bytes, collecting all schema, missing-file, decoding and alpha-policy failures.
 
 ## Generation-time guard and validation cost
 
+Review-task completion and downstream readiness are separate predicates. A
+grounded `change_requested` review completes reviewer work and survives
+checkpoint reconciliation, but cannot satisfy a builder's input. Only a current,
+valid `pass` review is consumable downstream; actual producer gates remain strict.
+
 `remove_white` now checks the final PNG for usable transparency before returning
 it to the generation tool for publication. No removed background, near-opaque
 noise, or a wholly invisible image returns an actionable error, not success.

@@ -18,6 +18,8 @@ const {
   taskOutputsVerified
 } = await import("../apps/api/dist/taskOutputEvidence.js");
 const { apiGateEvidencePolicy } = await import("../apps/api/dist/gateEvidencePolicy.js");
+const { captureCurrentStageReviewOutputEvidence, reconcileCurrentStageReviewOutputEvidence } =
+  await import("../apps/api/dist/evidenceReconciliation.js");
 const {
   buildCurrentVisionReviewAuthoritativeContext,
   qualityReviewReadyForGate
@@ -89,6 +91,8 @@ function verifyPassingQualityReview() {
 function verifyChangeRequestCompletesTaskButFailsGate() {
   const fixture = createVisualReviewFixture("quality_review_change", "change_requested");
   assert.equal(taskOutputsVerified(fixture.kernel, fixture.reviewTask), true, "grounded change request is completed reviewer work");
+  assert.equal(artifactReadyForConsumption(fixture.kernel, fixture.reviewArtifactId), false,
+    "a completed rejection is not permission for downstream build consumption");
   assert.throws(
     () => apiGateEvidencePolicy.assertGateEvidence(fixture.kernel, gateRequirement(fixture.reviewArtifactId)),
     /verdict=pass|verdict=change_requested/
@@ -112,6 +116,13 @@ function verifyChangeRequestCompletesTaskButFailsGate() {
     true,
     "feedback status applied by this exact review must not make the reviewer task incomplete"
   );
+  assert.equal(artifactReadyForConsumption(fixture.kernel, fixture.reviewArtifactId), false,
+    "applied feedback cannot turn a rejected review into a downstream approval");
+  fixture.kernel.updateTask(fixture.reviewTask.taskId, { status: "review" });
+  const baseline = captureCurrentStageReviewOutputEvidence(fixture.kernel);
+  const reconciled = reconcileCurrentStageReviewOutputEvidence(fixture.kernel, baseline);
+  assert.equal(reconciled.taskIds.includes(fixture.reviewTask.taskId), false,
+    "checkpoint reconciliation must preserve completed reviewer work while authors repair");
   assert.throws(() => apiGateEvidencePolicy.assertGateEvidence(fixture.kernel, gateRequirement(fixture.reviewArtifactId)));
 }
 

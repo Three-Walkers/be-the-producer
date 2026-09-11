@@ -9,7 +9,7 @@ import type {
   ArtifactInputProvenance,
   Task
 } from "@game-pipeline/shared-schemas";
-import { artifactReadyForConsumption, artifactInputProvenanceIsCurrent } from "./taskOutputEvidence.js";
+import { artifactReadyForConsumption, artifactReadyForTaskCompletion, artifactInputProvenanceIsCurrent } from "./taskOutputEvidence.js";
 import { currentImplementationReport, implementationReportNeedsRefresh, implementationReviewPath } from "./implementationReview.js";
 import { applyQualityReviewChangeRequest, qualityReviewReadyForGate } from "./qualityReviewArtifacts.js";
 
@@ -211,7 +211,7 @@ function artifactIsReadyForConsumption(kernel: StudioKernel, artifactId: string)
       // build gate still uses artifactReadyForConsumption and demands pass.
       return artifactInputProvenanceIsCurrent(kernel, artifactId) && !!currentImplementationReport(kernel, artifact);
     }
-    return artifactReadyForConsumption(kernel, artifactId);
+    return artifactReadyForTaskCompletion(kernel, artifactId);
   } catch {
     // Unsafe paths and filesystem races are stale evidence, not reasons to make
     // the entire checkpoint fail before the task can be reopened for repair.
