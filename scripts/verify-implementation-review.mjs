@@ -175,6 +175,15 @@ try {
   const apiResults = await executeAgentToolRequests(real, [apiMessage]);
   assert.equal(apiResults[0]?.status, "completed", JSON.stringify(apiResults));
   assert.equal(artifactReadyForConsumption(real, "artifact_implementation_self_check"), true, "API and MCP share the same immutable self-check gate");
+  const recheckSnapshot = captureWorkspaceSnapshot(project);
+  const recheckFile = recheckSnapshot.get(selfCheckPath);
+  const previousSelfCheck = real.listArtifacts().find((a) => a.artifactId === "artifact_implementation_self_check");
+  real.upsertArtifact({ ...previousSelfCheck, status: "change_requested" });
+  const rechecked = recordHarnessWorkspaceChanges(real, real.findTask(programmerId), defaultAgentContracts.find((a) => a.agentId === "gameplay_programmer"),
+    recheckSnapshot, recheckSnapshot, "unchanged_recheck", undefined, [{ toolName: "run_implementation_checks", path: selfCheckPath,
+      hash: recheckFile.hash, sizeBytes: recheckFile.sizeBytes, status: "completed", access: "write" }], { authoritativeWorkspace: true });
+  assert.deepEqual(rechecked.changedPaths, [selfCheckPath], "rerun deterministic self-check remains evidence even when identical bytes are produced");
+  assert.equal(artifactReadyForConsumption(real, "artifact_implementation_self_check"), true);
   syncProjectWorkspace(real);
   assert.equal(artifactReadyForConsumption(real, "artifact_implementation_self_check"), true, "checkpoint must not replace service evidence with a placeholder");
   assert.equal(taskOutputsVerified(real, real.findTask(programmerId)), true);

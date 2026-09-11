@@ -236,3 +236,8 @@ the task's owned registered TypeScript source, never generated bridge code or
 self-check/QA reports. The server verifies the current full-file hash and records
 the explicit reason without editing bytes; fresh self-check and independent QA
 requirements remain. Regression: `verify-implementation-review.mjs`.
+
+The same idempotency rule includes the programmer's exact server-owned self-check
+path when `run_implementation_checks` actually reruns and records matching bytes.
+Deterministic reports need not invent timestamps or change content to count as a
+new verified execution. Direct writes to that report remain forbidden.

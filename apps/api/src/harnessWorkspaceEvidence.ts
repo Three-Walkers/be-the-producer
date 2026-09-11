@@ -545,7 +545,8 @@ export function analyzeHarnessWorkspaceChanges(
     if (operation.toolName === "resubmit_source" && (agent.agentId !== "gameplay_programmer" ||
         !kernel.listArtifacts().some((artifact) => artifact.type === "source_code" && artifact.path === operation.path && task.outputArtifacts.includes(artifact.artifactId)))) continue;
     const file = after.get(operation.path);
-    if (["write_artifact", "write_code", "edit_code", "resubmit_source"].includes(operation.toolName) && operation.status === "completed" &&
+    const selfCheckResubmission = operation.toolName === "run_implementation_checks" && agent.agentId === "gameplay_programmer" && operation.path === selfCheckPath;
+    if ((selfCheckResubmission || ["write_artifact", "write_code", "edit_code", "resubmit_source"].includes(operation.toolName)) && operation.status === "completed" &&
         operationWritesWorkspace(operation) && declaredOutputPaths.has(operation.path) && file &&
         operation.hash === file.hash && operation.sizeBytes === file.sizeBytes) {
       explicitResubmissions.push(operation.path);
