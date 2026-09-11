@@ -34,7 +34,7 @@ mkdirSync(dirname(counterPath), { recursive: true });
 const count = existsSync(counterPath) ? Number(readFileSync(counterPath, "utf8")) + 1 : 1;
 writeFileSync(counterPath, String(count));
 if (args.includes("--resume")) {
-  process.stderr.write("Session does not exist or cannot be resumed.\\n");
+  process.stderr.write("No conversation found with session ID: " + args[args.indexOf("--resume") + 1] + "\\n");
   process.exit(1);
 }
 const sessionId = count === 1
