@@ -223,6 +223,10 @@ async function verifyRejectedContractDraftEditing() {
     assert.equal(firstHash, hash(body(document)));
     assert.equal(readFileSync(join(projectRoot, path), "utf8"), original, "invalid draft leaves published bytes untouched");
     const patch = { path, source: "last_rejected", expectedHash: firstHash, edits: [{ oldText: ',\n  "typo": true', newText: "" }] };
+    const ambiguous = await mcp.call("edit_artifact", { ...patch, edits: [{ oldText: '"type"', newText: '"bad_type"' }] });
+    assert.match(ambiguous.content[0].text, /edits\[0\].oldText matches multiple/);
+    const missing = await mcp.call("edit_artifact", { ...patch, edits: [{ oldText: "nonexistent_span", newText: "replacement" }] });
+    assert.match(missing.content[0].text, /edits\[0\].oldText matches zero/);
     assert.equal((await mcp.call("edit_artifact", { ...patch, expectedHash: "0".repeat(64) })).isError, true, "draft hash is mandatory");
     assert.equal((await mcp.call("edit_artifact", { ...patch, path: gamePath })).isError, true, "draft cannot cross task ownership");
     write(path, original + "\n");

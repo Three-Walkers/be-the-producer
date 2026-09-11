@@ -475,11 +475,13 @@ async function callTool(params: Record<string, unknown> | undefined): Promise<Re
     if (createHash("sha256").update(bytes).digest("hex") !== requiredString(args.expectedHash, "expectedHash")) throw new Error("Artifact changed since read_file; reread before editing.");
     if (!Array.isArray(args.edits) || args.edits.length < 1 || args.edits.length > 40) throw new Error("Provide 1–40 exact edits.");
     let content = bytes.toString("utf8");
-    for (const edit of args.edits) {
+    for (const [editIndex, edit] of args.edits.entries()) {
       if (!isRecord(edit)) throw new Error("Invalid artifact edit.");
       const oldText = requiredString(edit.oldText, "oldText"), newText = requiredString(edit.newText, "newText", true);
       const index = content.indexOf(oldText);
-      if (index < 0 || content.indexOf(oldText, index + 1) >= 0 || oldText === newText) throw new Error("Each oldText must match exactly one span and change it; no edits were saved.");
+      if (oldText === newText) throw new Error(`edits[${editIndex}] would not change content; remove this no-op. No edits were saved.`);
+      if (index < 0 || content.indexOf(oldText, index + 1) >= 0) throw new Error(
+        `edits[${editIndex}].oldText matches ${index < 0 ? "zero" : "multiple"} spans in the selected base after preceding edits. ${index < 0 ? "Use an exact current excerpt (including whitespace), accounting for earlier edits in this batch." : "Include the surrounding scenarioId/stepId or other unique context."} No edits were saved.`);
       content = content.slice(0, index) + newText + content.slice(index + oldText.length);
     }
     return callTool({name: "write_artifact", arguments: {path: target.relativePath, content}});
