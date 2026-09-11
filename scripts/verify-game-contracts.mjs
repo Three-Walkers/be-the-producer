@@ -228,3 +228,43 @@ unsafeComponentProperty.sceneBlueprint.scenes[0].nodes[0].components[0].referenc
 assert.throws(() => parseProductionContractBundle(unsafeComponentProperty), ContractValidationError);
 
 console.log("Game contract fixtures passed: tap-defense, puzzle, runner");
+
+// Contract-authoring and execution are separate QA tasks. A test contract must
+// be consumable before any build or run_playtest receipt exists.
+const fs = await import("node:fs");
+const { join, dirname } = await import("node:path");
+const { tmpdir } = await import("node:os");
+const { createHash } = await import("node:crypto");
+const taskRoot = fs.mkdtempSync(join(tmpdir(), "btp-qa-contract-task-"));
+process.env.STUDIO_WORKSPACE_ROOT = join(taskRoot, "studio");
+try {
+  const { createStudioKernel } = await import("../packages/agent-runtime/dist/index.js");
+  const { taskOutputsVerified } = await import("../apps/api/dist/taskOutputEvidence.js");
+  const { resolveProjectWorkspaceRoot } = await import("../apps/api/dist/workspaceWriter.js");
+  const k = createStudioKernel("qa_contract_fixture", "QA contract", "producer", "fixture");
+  const now = new Date().toISOString();
+  k.addTask({ taskId: "qa_authoring", projectId: k.project.projectId, stageId: k.project.currentStage,
+    ownerAgentId: "qa_evaluator", roomId: k.getRoom("qa-room").roomId, taskLevel: "task",
+    title: "Author contract", description: "fixture", status: "doing", priority: 1, sortOrder: 1,
+    inputArtifacts: ["fixture_game", "fixture_scene"], outputArtifacts: ["fixture_playtest"],
+    blockers: [], acceptanceCriteria: [], createdAt: now, updatedAt: now });
+  for (const [artifactId, type, path, document] of [
+    ["fixture_game", "game_contract", "agents/design/contracts/game-contract.json", fixtures[0].gameContract],
+    ["fixture_scene", "scene_blueprint", "agents/engineering/cocos-scene-blueprints/main.scene-blueprint.json", fixtures[0].sceneBlueprint],
+    ["fixture_playtest", "playtest_contract", "agents/qa/contracts/core-loop.playtest-contract.json", fixtures[0].playtestContract]
+  ]) {
+    const body = JSON.stringify(document);
+    k.addArtifact({ artifactId, projectId: k.project.projectId, type, path, ownerAgentId: "qa_evaluator",
+      ...(artifactId === "fixture_playtest" ? { sourceTaskId: "qa_authoring" } : {}),
+      stageId: k.project.currentStage, status: "submitted", version: 1, sourceDecisionIds: [],
+      metadata: { toolExecutedAt: now }, createdAt: now, updatedAt: now });
+    const absolute = join(resolveProjectWorkspaceRoot(k.project.projectId), path);
+    fs.mkdirSync(dirname(absolute), { recursive: true }); fs.writeFileSync(absolute, body);
+    k.recordArtifactMaterialization(artifactId, { path, hash: createHash("sha256").update(body).digest("hex"),
+      sizeBytes: Buffer.byteLength(body), materializedAt: now });
+  }
+  assert.equal(taskOutputsVerified(k, k.findTask("qa_authoring")), true, "QA contract must not require a future playtest run");
+  k.listArtifacts().find((a) => a.artifactId === "fixture_playtest").status = "change_requested";
+  assert.equal(taskOutputsVerified(k, k.findTask("qa_authoring")), false, "rejected contract cannot bypass readiness");
+  console.log("QA contract authoring passed without a runnable build; execution evidence policy remains separate.");
+} finally { fs.rmSync(taskRoot, { recursive: true, force: true }); }

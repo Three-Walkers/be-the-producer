@@ -4,6 +4,7 @@ import type { CocosBridgeEvidence } from "./cocosEngineBridge.js";
 import type { ArtifactInputProvenance } from "@game-pipeline/shared-schemas";
 import { parsePlaytestMarker, type PlaytestReportEvidence } from "./playtestEvidence.js";
 import { resolvePathWithinRoot } from "./pathSafety.js";
+import type { AgentHarnessToolOperation } from "./agentHarness.js";
 
 export interface QaPlaytestReceipt {
   schemaVersion: 1 | 2;
@@ -18,6 +19,27 @@ export interface QaPlaytestReceipt {
 }
 
 const receiptDirectory = ".be-the-producer/qa-playtest-receipts";
+
+/** Only service receipts tied to this invocation's byte-bound operations may
+ * leave staging. Never copy the whole private harness directory. */
+export function verifiedQaReceiptCommitPaths(
+  stagingRoot: string,
+  expectedReportPaths: readonly string[],
+  operations: readonly AgentHarnessToolOperation[]
+): string[] {
+  return readVerifiedQaPlaytestReceipts(stagingRoot).flatMap((receipt) => {
+    if (!expectedReportPaths.includes(receipt.reportPath)) return [];
+    const matches = receipt.evidence.every((file) => operations.some((operation) =>
+      operation.toolName === "run_playtest" && operation.operationType === "playtest" &&
+      operation.operationId === receipt.operationId && operation.status === "completed" &&
+      operation.path === file.path && operation.hash === file.hash && operation.sizeBytes === file.sizeBytes
+    ));
+    if (!matches) return [];
+    const path = `${receiptDirectory}/${receipt.operationId}.json`;
+    resolvePathWithinRoot(stagingRoot, path, { allowMissing: false, expectedKind: "file", label: "QA service receipt" });
+    return [path];
+  });
+}
 
 export function writeQaPlaytestReceipt(
   projectRoot: string,

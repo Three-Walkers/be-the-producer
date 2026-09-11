@@ -426,11 +426,16 @@ export function reconcileLocalRuntimeProjectState(
 
   const stageTwoTaskIds = [
     "task_group_stage_2",
+    "task_stage_2_cocos_implementation",
+    "task_stage_2_qa_implementation_review",
+    "task_stage_2_playtest_contract",
     "task_stage_2_asset_pipeline",
     "task_stage_2_visual_quality_review",
     "task_stage_2_cocos_build"
   ];
   const stageTwoArtifactIds = [
+    "artifact_implementation_self_check",
+    "artifact_implementation_review",
     "artifact_asset_manifest_draft",
     "artifact_asset_contact_sheet",
     "artifact_stage_2_visual_quality_review"
@@ -2008,8 +2013,8 @@ function ensureStageTwoTasksAndArtifacts(
     progressPercent: 50,
     childrenSummary: emptyChildrenSummary(),
     inputArtifacts: ["artifact_gdd_baseline_draft", "artifact_game_contract_draft", "artifact_scene_blueprint_draft"],
-    outputArtifacts: ["artifact_gameplay_source"],
-    acceptanceCriteria: ["玩法 TypeScript 源码已写入 Cocos assets/scripts", "核心循环状态机和 UI 逻辑明确"],
+    outputArtifacts: ["artifact_gameplay_source", "artifact_implementation_self_check"],
+    acceptanceCriteria: ["玩法 TypeScript 源码已写入 Cocos assets/scripts", "核心循环状态机和 UI 逻辑明确", "最后一次代码修改后 run_implementation_checks 的真实 Cocos 类型检查与蓝图集成检查通过，回执绑定当前源码树"],
     blockers: [],
     createdAt: now,
     updatedAt: now
@@ -2029,12 +2034,23 @@ function ensureStageTwoTasksAndArtifacts(
     sortOrder: 118,
     progressPercent: 0,
     childrenSummary: emptyChildrenSummary(),
-    inputArtifacts: ["artifact_game_contract_draft", "artifact_scene_blueprint_draft"],
+    inputArtifacts: ["artifact_gdd_baseline_draft", "artifact_game_contract_draft", "artifact_scene_blueprint_draft"],
     outputArtifacts: ["artifact_playtest_contract_draft"],
     acceptanceCriteria: ["PlaytestContract 通过严格结构校验", "所有循环和超时均有上限", "required 场景覆盖核心循环"],
     blockers: [],
     createdAt: now,
     updatedAt: now
+  });
+  ensureTask(kernel, {
+    taskId: "task_stage_2_qa_implementation_review",
+    projectId, stageId, parentTaskId: groupId, roomId: kernel.getRoom("qa-room").roomId,
+    taskLevel: "task", ownerAgentId: "qa_evaluator", title: "独立审查实现与制作基线的一致性",
+    description: "构建前独立读取 GDD、GameContract、Art Bible、SceneBlueprint 和真实源码，调用 run_implementation_checks；逐项审查核心循环、数值与成长、交互、视觉接入、存档和异常路径。提交有原文证据的 implementation_review JSON，发现偏差时自动回派原作者。不得修改游戏实现或以静态审查代替真实试玩。",
+    status: "todo", priority: 94, sortOrder: 122, progressPercent: 0, childrenSummary: emptyChildrenSummary(),
+    inputArtifacts: ["artifact_gdd_baseline_draft", "artifact_game_contract_draft", "artifact_art_bible_baseline_draft", "artifact_scene_blueprint_draft", "artifact_gameplay_source"],
+    outputArtifacts: ["artifact_implementation_review"],
+    acceptanceCriteria: ["六个审查维度都有基线和实现原文证据", "失败项包含预期与实际和可回派的源码位置", "通过结论必须绑定当前源码树且所有静态错误已清零", "本任务不声称真实游戏验收通过"],
+    blockers: [], createdAt: now, updatedAt: now
   });
   ensureTask(kernel, {
     taskId: "task_stage_2_cocos_build",
@@ -2056,7 +2072,9 @@ function ensureStageTwoTasksAndArtifacts(
       "artifact_stage_2_visual_quality_review",
       "artifact_scene_blueprint_draft",
       "artifact_playtest_contract_draft",
-      "artifact_gameplay_source"
+      "artifact_gameplay_source",
+      "artifact_implementation_self_check",
+      "artifact_implementation_review"
     ],
     outputArtifacts: ["artifact_wechat_dev_build"],
     acceptanceCriteria: [
@@ -2082,7 +2100,7 @@ function ensureStageTwoTasksAndArtifacts(
     priority: 85,
     sortOrder: 130,
     childrenSummary: emptyChildrenSummary(),
-    inputArtifacts: ["artifact_wechat_dev_build", "artifact_playtest_contract_draft"],
+    inputArtifacts: ["artifact_wechat_dev_build", "artifact_playtest_contract_draft", "artifact_gdd_baseline_draft", "artifact_game_contract_draft", "artifact_scene_blueprint_draft", "artifact_gameplay_source"],
     outputArtifacts: ["artifact_qa_playtest_report"],
     acceptanceCriteria: [
       "真实 Cocos Web 构建已在 Chrome 中启动",
@@ -2142,9 +2160,19 @@ function ensureStageTwoTasksAndArtifacts(
     kernel,
     "task_stage_2_cocos_build",
     "inputArtifacts",
-    ["artifact_asset_manifest_draft", "artifact_stage_2_visual_quality_review"],
+    ["artifact_asset_manifest_draft", "artifact_stage_2_visual_quality_review", "artifact_implementation_self_check", "artifact_implementation_review"],
     now
   );
+  ensureTaskArtifactReferences(kernel, "task_stage_2_cocos_implementation", "outputArtifacts", ["artifact_implementation_self_check"], now);
+  ensureTaskArtifactReferences(kernel, "task_stage_2_playtest_contract", "inputArtifacts", ["artifact_gdd_baseline_draft"], now);
+  ensureTaskArtifactReferences(kernel, "task_stage_2_qa_playtest", "inputArtifacts", ["artifact_gdd_baseline_draft", "artifact_game_contract_draft", "artifact_scene_blueprint_draft", "artifact_gameplay_source"], now);
+  ensureTaskArtifactReferences(kernel, groupId, "outputArtifacts", ["artifact_implementation_self_check", "artifact_implementation_review"], now);
+  for (const output of [
+    { artifactId: "artifact_implementation_self_check", path: "docs/engineering/implementation-self-check.json", ownerAgentId: "gameplay_programmer" as const, sourceTaskId: "task_stage_2_cocos_implementation" },
+    { artifactId: "artifact_implementation_review", path: "agents/qa/reviews/implementation-review.json", ownerAgentId: "qa_evaluator" as const, sourceTaskId: "task_stage_2_qa_implementation_review" }
+  ]) ensureArtifact(kernel, { ...output, projectId, type: "bug_report", stageId, status: "draft", version: 1,
+    sourceDecisionIds: [], metadata: { generatedBy: "local_agent_runtime" }, createdAt: now, updatedAt: now });
+  reopenStageOneTaskForMissingEvidence(kernel, "task_stage_2_cocos_implementation", ["artifact_gameplay_source", "artifact_implementation_self_check"], now);
 
   ensureArtifact(kernel, {
     artifactId: "artifact_asset_manifest_draft",
