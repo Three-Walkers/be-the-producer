@@ -315,7 +315,7 @@ export class CocosEngineBridge {
       ]);
 
       evidence.push(this.writeJson(descriptorPath, normalized));
-      evidence.push(this.writeText(scriptPath, renderRuntimeBootstrap(scriptComponents)));
+      evidence.push(this.writeText(scriptPath, renderRuntimeBootstrap(scriptComponents, scriptUuid)));
       evidence.push(this.writeJson(scriptMetaPath, typescriptMeta(scriptUuid)));
       evidence.push(this.writeJson(scenePath, createBootstrapScene({ sceneName: entryScene.name, resolution }, scriptUuid, sceneUuid)));
       evidence.push(this.writeJson(sceneMetaPath, sceneMeta(sceneUuid)));
@@ -1117,7 +1117,7 @@ function validateBridgeComponents(blueprint: SceneBlueprint, discovered: ScriptC
   }
 }
 
-function renderRuntimeBootstrap(components: ScriptComponent[]): string {
+function renderRuntimeBootstrap(components: ScriptComponent[], scriptUuid: string): string {
   const imports = components.map((component, index) => component.defaultExport
     ? `import BtpComponent${index} from ${JSON.stringify(component.importPath)};`
     : `import { ${component.exportName} as BtpComponent${index} } from ${JSON.stringify(component.importPath)};`).join("\n");
@@ -1131,6 +1131,7 @@ function renderRuntimeBootstrap(components: ScriptComponent[]): string {
   Component,
   Graphics,
   JsonAsset,
+  js,
   Label,
   Node,
   resources,
@@ -1432,6 +1433,11 @@ export class BtpRuntimeBootstrap extends Component {
     return new Color((rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255, alpha);
   }
 }
+
+// Headless Creator compilation does not always inject an _RF UUID frame.
+// Bind the exact serialized scene type in either compiler mode, using the
+// engine's public alias API without replacing the class's primary identity.
+js.setClassAlias(BtpRuntimeBootstrap, ${JSON.stringify(compressUuid(scriptUuid))});
 `;
 }
 

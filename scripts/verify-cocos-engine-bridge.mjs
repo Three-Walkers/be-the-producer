@@ -4,6 +4,8 @@ import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { runInNewContext } from "node:vm";
+import ts from "typescript";
 import {
   CocosEngineBridge,
   minimalCreatorEnvironment,
@@ -260,6 +262,22 @@ assert.equal(existsSync(join(projectRoot, "assets", "scenes", "MainGame.scene"))
 assert.equal(existsSync(join(projectRoot, "assets", "scenes", "MainGame.scene.meta")), true);
 assert.equal(existsSync(join(projectRoot, "assets", "scripts", "btp", "BtpRuntimeBootstrap.ts")), true);
 const bootstrapSource = readFileSync(join(projectRoot, "assets", "scripts", "btp", "BtpRuntimeBootstrap.ts"), "utf8");
+const bootstrapScene = JSON.parse(readFileSync(join(projectRoot, "assets/scenes/MainGame.scene"), "utf8"));
+const bootstrapType = bootstrapScene[5].__type__;
+// Execute the generated module with both name-only and UUID-instrumented
+// compiler identities. Its serialized scene component must resolve in both.
+for (const primaryId of ["BtpRuntimeBootstrap", bootstrapType]) {
+  const registry = new Map();
+  const fixtureExports = {};
+  const Component = class {};
+  const cc = { Component, _decorator: { ccclass: () => (ctor) => { registry.set(primaryId, ctor); return ctor; } },
+    js: { setClassAlias: (ctor, alias) => { assert.ok(!registry.has(alias) || registry.get(alias) === ctor); registry.set(alias, ctor); } } };
+  const compiled = ts.transpileModule(bootstrapSource, { compilerOptions: {
+    module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, experimentalDecorators: true
+  } }).outputText;
+  runInNewContext(compiled, { exports: fixtureExports, require: (id) => id === "cc" ? cc : { GameController: Component } });
+  assert.equal(registry.get(bootstrapType), fixtureExports.BtpRuntimeBootstrap, "scene UUID must resolve without depending on compiler _RF injection");
+}
 assert.match(bootstrapSource, /GameController/);
 assert.match(bootstrapSource, /node\.layer = parent\.layer/);
 assert.match(bootstrapSource, /spec\.testId/);
