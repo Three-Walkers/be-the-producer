@@ -115,6 +115,15 @@ export class AgentActivityReporter {
         this.toolSequence += 1;
         this.transition(`tool_${this.toolSequence}_done`, `工具执行完成：${event.toolName ?? "unknown"}`, event.progressPercent ?? 72, "tool_call", event.path);
         break;
+      case "tool_failed": {
+        this.toolSequence += 1;
+        this.transition(`tool_${this.toolSequence}_failed`, `工具执行失败：${event.toolName ?? "unknown"}`,
+          this.activity.progressPercent, "tool_call", [event.path, event.detail].filter(Boolean).join(" · "));
+        const step = this.activity.steps.at(-1);
+        if (step) step.status = "failed";
+        this.persist();
+        break;
+      }
       case "completed":
         this.transition("harness_complete", "工作会话已返回，正在核对产物证据", 88, "finalizing");
         break;

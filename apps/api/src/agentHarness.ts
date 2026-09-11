@@ -3,7 +3,7 @@ import type { ModelProviderConfig } from "./modelSettings.js";
 import type { ArtVisionAuthoritativeContextEvidence, ArtVisionSemanticResult } from "./multimodalArtProvider.js";
 import type { VisionSemanticInspectionReceipt } from "./qualityReviewArtifacts.js";
 
-export type AgentHarnessProgressType = "started" | "model_output" | "tool_started" | "tool_completed" | "completed" | "failed";
+export type AgentHarnessProgressType = "started" | "model_output" | "tool_started" | "tool_completed" | "tool_failed" | "completed" | "failed";
 
 export interface AgentHarnessProgressEvent {
   type: AgentHarnessProgressType;

@@ -58,6 +58,7 @@ export interface ArtifactPreviewResult {
   previewable: boolean;
   content?: string;
   language?: "markdown" | "json" | "text";
+  image?: { dataUrl: string; width: number; height: number; sizeBytes: number };
   reason?: string;
 }
 
@@ -442,11 +443,28 @@ export function readArtifactPreview(projectId: string, artifact: Artifact): Arti
   }
 
   if (!isPreviewableDocument(target.relativePath)) {
+    if (extname(target.relativePath).toLowerCase() === ".png" && (target.sizeBytes ?? 0) <= 12 * 1024 * 1024) {
+      const bytes = readFileSync(target.absolutePath);
+      if (bytes.length >= 24 && bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])) &&
+          bytes.toString("ascii", 12, 16) === "IHDR") {
+        const width = bytes.readUInt32BE(16);
+        const height = bytes.readUInt32BE(20);
+        if (width > 0 && height > 0 && width * height <= 32_000_000) {
+          return {
+            artifact, target: publicTarget, previewable: true,
+            image: { dataUrl: `data:image/png;base64,${bytes.toString("base64")}`, width, height, sizeBytes: bytes.length }
+          };
+        }
+      }
+      return { artifact, target: publicTarget, previewable: false, reason: "PNG 文件无效或像素尺寸超过预览限制。" };
+    }
     return {
       artifact,
       target: publicTarget,
       previewable: false,
-      reason: "该文件类型暂不支持内嵌预览，请在 Finder 中查看。"
+      reason: extname(target.relativePath).toLowerCase() === ".png"
+        ? "图片超过 12MB，请在 Finder 中查看原文件。"
+        : "该文件类型暂不支持内嵌预览，请在 Finder 中查看。"
     };
   }
 

@@ -2927,6 +2927,7 @@ async function previewArtifact(artifactId) {
   }
 
   const preview = await request(`/projects/${state.projectId}/artifacts/${encodeURIComponent(artifactId)}/preview`);
+  if (!artifactPreviewDialog.open || activePreviewArtifactId !== artifactId) return;
   renderArtifactPreview(preview);
 }
 
@@ -2941,6 +2942,22 @@ function renderArtifactPreview(preview) {
       <strong>暂不支持内嵌预览</strong>
       <span>${escapeHtml(preview.reason ?? "该交付物需要在本地应用中查看。")}</span>
     </div>`;
+    return;
+  }
+
+  if (preview.image && /^data:image\/png;base64,[A-Za-z0-9+/=]+$/.test(preview.image.dataUrl)) {
+    $("#artifact-preview-body").innerHTML = `<div class="artifact-image-toolbar">
+      <span>${preview.image.width} × ${preview.image.height} · ${(preview.image.sizeBytes / 1024 / 1024).toFixed(2)} MB · PNG</span>
+      <button type="button" id="artifact-image-size" aria-pressed="false">原始尺寸</button>
+    </div><figure class="artifact-image-canvas">
+      <img src="${preview.image.dataUrl}" width="${preview.image.width}" height="${preview.image.height}" alt="${escapeHtml(deliverableName(artifact))} · ${escapeHtml(preview.target?.relativePath ?? artifact.path)}" decoding="async">
+    </figure>`;
+    $("#artifact-image-size").addEventListener("click", (event) => {
+      const original = event.currentTarget.getAttribute("aria-pressed") !== "true";
+      event.currentTarget.setAttribute("aria-pressed", String(original));
+      event.currentTarget.textContent = original ? "适应窗口" : "原始尺寸";
+      $("#artifact-preview-body .artifact-image-canvas").classList.toggle("original-size", original);
+    });
     return;
   }
 
