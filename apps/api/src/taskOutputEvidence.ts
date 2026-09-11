@@ -94,7 +94,8 @@ export function taskOutputsVerified(kernel: StudioKernel, task: Task): boolean {
   // A grounded rejection completes reviewer work and triggers author repairs.
   if (task.taskId === implementationReviewTaskId) {
     const report = artifacts.find((artifact) => task.outputArtifacts.includes(artifact.artifactId) && artifact.path === implementationReviewPath);
-    return !!report && artifactInputProvenanceIsCurrent(kernel, report.artifactId) && !!currentImplementationReport(kernel, report);
+    return !!report && !["change_requested", "rejected", "superseded"].includes(report.status) &&
+      artifactInputProvenanceIsCurrent(kernel, report.artifactId) && !!currentImplementationReport(kernel, report);
   }
   const registeredOutputsVerified = task.outputArtifacts.every((artifactId) => artifactReadyForTaskCompletion(kernel, artifactId));
   if (!registeredOutputsVerified) {

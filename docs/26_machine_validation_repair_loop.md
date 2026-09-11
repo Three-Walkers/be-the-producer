@@ -194,3 +194,12 @@ so a QA build does not silently edit the canonical authored scene.
 
 Tests: `verify-qa-launch-diagnostics.mjs`, `verify-staged-qa-receipts.mjs`,
 `verify-cocos-build-isolation.mjs`, `verify-qa-playtest-gate.mjs`.
+
+Producer change requests can target `[task:task_stage_2_qa_playtest]` (or an
+explicit related-task binding). Exact task selections take precedence over role
+mentions; unknown IDs do not fall back to reopening all of a role's work. Normal
+downstream invalidation still applies. Use this for a specific QA retry instead
+of reopening its contract authoring and independent review tasks as well.
+An implementation review explicitly marked `change_requested` cannot complete
+from an unchanged previous receipt; a newly submitted grounded negative verdict
+still completes independent reviewer work without approving the implementation.

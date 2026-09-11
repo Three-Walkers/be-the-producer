@@ -7,9 +7,15 @@ import type { StudioMessage, Task } from "@game-pipeline/shared-schemas";
 export function producerChangeTargets(kernel: StudioKernel, message: StudioMessage): Task[] {
   if (message.senderType !== "producer" || message.messageType !== "change_request") return [];
   const stages = new Set(workflowTaskStages(kernel.project.currentStage));
+  // An explicit task selector narrows a role mention. A typo must select no
+  // work, never silently widen a QA retry into contract/implementation edits.
+  const selected = new Set([
+    ...message.relatedTaskIds,
+    ...[...message.content.matchAll(/\[task:([A-Za-z0-9_-]+)\]/g)].map((match) => match[1])
+  ]);
   return kernel.listTasks().filter((task) => stages.has(task.stageId) &&
     task.taskLevel !== "task_group" && task.status !== "cancelled" && task.outputArtifacts.length > 0 &&
-    (message.relatedTaskIds.includes(task.taskId) || message.mentions.includes(task.ownerAgentId)));
+    (selected.size > 0 ? selected.has(task.taskId) : message.mentions.includes(task.ownerAgentId)));
 }
 
 export function applyProducerChangeRequest(kernel: StudioKernel, message: StudioMessage): string[] {

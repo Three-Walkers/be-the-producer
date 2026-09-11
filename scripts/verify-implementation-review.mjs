@@ -204,6 +204,9 @@ try {
     "checkpoint must not destroy a legitimate QA rejection merely because the build cannot consume it");
   const historical = createStudioKernelFromSnapshot(structuredClone(real.toSnapshot()));
   const historicalReport = historical.listArtifacts().find(a => a.artifactId === "artifact_implementation_review");
+  historical.upsertArtifact({ ...historicalReport, status: "change_requested" });
+  assert.equal(taskOutputsVerified(historical, historical.findTask(reviewerId)), false,
+    "explicitly reopened review cannot auto-complete by reusing unchanged old receipt bytes");
   historical.upsertArtifact({...historicalReport, version: historicalReport.version + 1, status: "change_requested",
     metadata: {...historicalReport.metadata, toolExecutedAt: undefined, filesystemEvidenceInvalidationReason: "review_output_not_current_after_workspace_sync"}});
   historical.updateTask(reviewerId, {status: "blocked", blockers: ["Agent Loop：Agent 请求评审，但任务输出尚未全部通过 Artifact Ledger 验证。"]});
