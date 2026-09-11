@@ -51,6 +51,15 @@ survive a new invocation. QA machine reports remain protected. Failed patches
 are recorded as failed artifact writes, and only a valid subsequent publication
 can supersede that failure. Regression: `verify-contract-artifact-gates.mjs`.
 
+The QA agent then correctly diagnosed a second issue: a valid replacement still
+reported the old file's errors. Revision comparison was reparsing the historical
+body under the new validator. It now strictly validates the candidate but reads
+only the previous positive integer revision to enforce monotonic advancement.
+An invalid old body can therefore be repaired by a valid higher revision; equal
+or lower revisions still fail. Malformed JSON or an unrecoverable old revision
+requires explicit recovery, never guessing/resetting the version. Regression
+includes replacing an invalid historical contract through the actual QA MCP.
+
 ## Failure observed in Tidewatch
 
 The visual reviewer reported a passing score while a runtime PNG declared

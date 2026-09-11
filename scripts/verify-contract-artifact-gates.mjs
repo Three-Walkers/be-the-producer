@@ -14,8 +14,20 @@ const { createStudioKernel } = await import("@game-pipeline/agent-runtime");
 const { executeAgentToolRequests } = await import("../apps/api/dist/toolExecutor.js");
 const { artifactReadyForConsumption } = await import("../apps/api/dist/taskOutputEvidence.js");
 const { resolveWorkspacePathTarget, syncProjectWorkspace } = await import("../apps/api/dist/workspaceWriter.js");
+const { assertContractRevisionAdvance } = await import("../apps/api/dist/contractArtifacts.js");
 
 try {
+  for (const [type, fixture] of [["game_contract", gameContractFixture()], ["scene_blueprint", sceneBlueprintFixture()], ["playtest_contract", playtestContractFixture()]]) {
+    const historical = { ...structuredClone(fixture), no_longer_valid: true };
+    const next = structuredClone(fixture);
+    if (type === "game_contract") next.identity.revision++;
+    else next.revision++;
+    assert.doesNotThrow(() => assertContractRevisionAdvance(type, JSON.stringify(historical), JSON.stringify(next)), "valid repairs must not be rejected by validating the historical body again");
+    assert.throws(() => assertContractRevisionAdvance(type, JSON.stringify(historical), JSON.stringify(fixture)), /revision.*递增/, "an invalid old body still enforces the revision floor");
+    assert.throws(() => assertContractRevisionAdvance(type, JSON.stringify(historical), JSON.stringify({ ...next, invalid_candidate: true })), /校验/, "new candidate remains strictly validated");
+    assert.throws(() => assertContractRevisionAdvance(type, "{broken", JSON.stringify(next)), /revision.*无法读取/);
+    assert.throws(() => assertContractRevisionAdvance(type, '{"revision":0,"identity":{"revision":0}}', JSON.stringify(next)), /revision.*正整数/);
+  }
   const projectId = "contract_artifact_gates";
   const kernel = createStudioKernel(projectId, "Contract Artifact Gates", "producer_test", "验证契约写入与消费门禁");
   const now = new Date().toISOString();
@@ -189,7 +201,7 @@ async function verifyRejectedContractDraftEditing() {
   const write = (file, text) => { mkdirSync(dirname(join(projectRoot, file)), { recursive: true }); writeFileSync(join(projectRoot, file), text); };
   const body = (document) => `${JSON.stringify(document, null, 2)}\n`;
   const hash = (text) => createHash("sha256").update(text).digest("hex");
-  const original = body(playtestContractFixture());
+  const original = body({ ...playtestContractFixture(), legacy_invalid_field: true });
   write(path, original); write(gamePath, body(gameContractFixture())); write(scenePath, body(sceneBlueprintFixture()));
   write(reportPath, "# Server QA report\n");
   const authorization = { mode: "task", taskId: "qa_draft_task", inputArtifactIds: ["game", "scene"], outputArtifactIds: ["test", "report"],
