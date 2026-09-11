@@ -58,3 +58,28 @@ Run `npm run build`, then:
 
 These changes repair the production mechanism. They do not establish that
 Tidewatch has a runnable build or that its gameplay has passed QA.
+
+## Follow-up failures observed during the same run
+
+- QA receipt ingestion used to classify tasks only by owner. A closed claim
+  repair has no `qa_report`, so it was reopened for missing playtest evidence,
+  closed again by claim reconciliation, and repeatedly queued through microtasks.
+  This could saturate the API thread without running a worker. Ingestion now
+  targets only actual, task-owned `qa_report` execution work, not contract
+  authoring, implementation reviews, task groups or closed claim repairs.
+- A reviewer could submit a contact sheet plus an incomplete set of runtime
+  images. Submission now checks every runtime hash in the server-owned manifest
+  context and names missing images before writing the report. The same invocation
+  can inspect those images and resubmit without losing its prior observations.
+- Invalidated review evidence combined with a late handoff could leave a reviewer
+  blocked after the author had repaired its inputs. A fingerprinted recovery
+  requeues that reviewer once per verified input revision, preserves manual
+  blockers, and does not manufacture a valid review receipt.
+- Positive `note` findings inside a failed aggregate criterion stay in the
+  evidence but are not converted into required author changes. Invalid manual
+  review JSON immediately points the reviewer to `submit_visual_review` instead
+  of encouraging repeated score/field transcription.
+
+Additional regression commands: `verify-qa-playtest-gate.mjs`,
+`verify-harness-mcp-authorization.mjs`, and `verify-vision-semantic-binding.mjs`
+under `scripts/` (after `npm run build`).

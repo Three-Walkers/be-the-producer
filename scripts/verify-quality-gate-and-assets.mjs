@@ -18,7 +18,7 @@ const {
   taskOutputsVerified
 } = await import("../apps/api/dist/taskOutputEvidence.js");
 const { apiGateEvidencePolicy } = await import("../apps/api/dist/gateEvidencePolicy.js");
-const { captureCurrentStageReviewOutputEvidence, reconcileCurrentStageReviewOutputEvidence } =
+const { captureCurrentStageReviewOutputEvidence, reconcileCurrentStageReviewOutputEvidence, reconcileInvalidQualityReviewEvidence } =
   await import("../apps/api/dist/evidenceReconciliation.js");
 const {
   buildCurrentVisionReviewAuthoritativeContext,
@@ -62,6 +62,7 @@ const RGBA_INVISIBLE_PNG = makePng(2, 2, 6, [
 try {
   verifyPassingQualityReview();
   verifyChangeRequestCompletesTaskButFailsGate();
+  verifyInvalidatedHandoffResumesOnce();
   verifyStaleTargetAndIdentityFailClosed();
   verifyPngAlphaInspection();
   verifyAssetProductionRequiresRealGeneratedPng();
@@ -124,6 +125,27 @@ function verifyChangeRequestCompletesTaskButFailsGate() {
   assert.equal(reconciled.taskIds.includes(fixture.reviewTask.taskId), false,
     "checkpoint reconciliation must preserve completed reviewer work while authors repair");
   assert.throws(() => apiGateEvidencePolicy.assertGateEvidence(fixture.kernel, gateRequirement(fixture.reviewArtifactId)));
+}
+
+function verifyInvalidatedHandoffResumesOnce() {
+  const fixture = createVisualReviewFixture("quality_handoff_resume", "pass");
+  const { kernel, reviewTask, reviewArtifactId } = fixture;
+  const review = kernel.listArtifacts().find((a) => a.artifactId === reviewArtifactId);
+  review.metadata.toolExecutedAt = undefined;
+  review.metadata.qualityReviewEvidenceInvalidationReason = "missing image coverage";
+  const handoff = "Agent Loop：已交接给 asset_production：repair incomplete assets";
+  kernel.updateTask(reviewTask.taskId, { status: "blocked", blockers: [handoff] });
+  assert.ok(reconcileInvalidQualityReviewEvidence(kernel).taskIds.includes(reviewTask.taskId));
+  assert.equal(kernel.findTask(reviewTask.taskId).status, "doing");
+  assert.equal(review.metadata.toolExecutedAt, undefined, "requeue must not bless an invalid receipt");
+  kernel.updateTask(reviewTask.taskId, { status: "blocked", blockers: [handoff] });
+  assert.equal(reconcileInvalidQualityReviewEvidence(kernel).taskIds.length, 0, "same inputs must not reset handoff retries forever");
+  materialize(kernel, { artifactId: "artifact_art_bible_baseline_draft", taskId: "task_stage_1_art_direction",
+    type: "art_bible", path: "agents/art/art-bible.md", ownerAgentId: "art_director", content: Buffer.from("# Updated art baseline\n"),
+    version: 2, metadata: { toolName: "write_artifact", toolExecutedAt: new Date().toISOString() } });
+  assert.ok(reconcileInvalidQualityReviewEvidence(kernel).taskIds.includes(reviewTask.taskId), "new verified inputs re-arm review");
+  kernel.updateTask(reviewTask.taskId, { status: "blocked", blockers: ["人工：等待基线确认"] });
+  assert.equal(reconcileInvalidQualityReviewEvidence(kernel).taskIds.length, 0);
 }
 
 function verifyStaleTargetAndIdentityFailClosed() {

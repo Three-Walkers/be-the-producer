@@ -3,6 +3,7 @@ import {
   workflowTaskStages,
   type StudioKernel
 } from "@game-pipeline/agent-runtime";
+import { createHash } from "node:crypto";
 import type {
   ArtifactDirectoryManifest,
   ArtifactEvidenceStatus,
@@ -62,9 +63,16 @@ export function reconcileInvalidQualityReviewEvidence(
       // Once the author has resubmitted valid inputs, remove only that owned
       // blocker; keep real/manual dependency failures and the invalid receipt.
       if (artifact.metadata.qualityReviewEvidenceInvalidationReason && task &&
-          executableStages.has(task.stageId) && task.status !== "cancelled" &&
-          task.blockers.some((blocker) => blocker.startsWith("质量审查证据失效：")) &&
+          executableStages.has(task.stageId) && task.status === "blocked" &&
+          task.blockers.every((blocker) => blocker.startsWith("质量审查证据失效：") || blocker.startsWith("Agent Loop：已交接给")) &&
           task.inputArtifacts.every((id) => artifactReadyForConsumption(kernel, id))) {
+        const fingerprint = createHash("sha256").update(JSON.stringify(task.inputArtifacts.map((id) => {
+          const input = kernel.listArtifacts().find((entry) => entry.artifactId === id);
+          const ledger = kernel.listArtifactLedger().find((entry) => entry.artifactId === id);
+          return [id, input?.version, ledger?.path, ledger?.hash, ledger?.sizeBytes];
+        }))).digest("hex");
+        if (artifact.metadata.qualityReviewRepairInputFingerprint === fingerprint) continue;
+        kernel.upsertArtifact({ ...artifact, metadata: { ...artifact.metadata, qualityReviewRepairInputFingerprint: fingerprint }, updatedAt: now });
         reopenTaskForEvidenceRepair(kernel, task, now);
         reopenedTaskIds.push(task.taskId);
       }
