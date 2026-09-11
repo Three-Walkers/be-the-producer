@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
-import type { StudioKernel } from "@game-pipeline/agent-runtime";
+import { workflowTaskStages, type StudioKernel } from "@game-pipeline/agent-runtime";
 import type { AgentId, Task } from "@game-pipeline/shared-schemas";
-import { readTaskPlaytestEvidence, taskOutputsVerified } from "./taskOutputEvidence.js";
+import { artifactReadyForConsumption, readTaskPlaytestEvidence, taskOutputsVerified } from "./taskOutputEvidence.js";
 
 const blockerPrefix = "QA_PLAYTEST_FAILED:";
 
@@ -129,10 +129,17 @@ export function materializeQaFailureRepairs(kernel: StudioKernel, qaTask: Task):
 
 export function resumeQaTasksAfterVerifiedRepairs(kernel: StudioKernel): void {
   const now = new Date().toISOString();
-  for (const qaTask of kernel.listTasks().filter((task) => task.ownerAgentId === "qa_evaluator" && task.status === "blocked")) {
+  const stages = new Set(workflowTaskStages(kernel.project.currentStage));
+  for (const qaTask of kernel.listTasks().filter((task) => task.ownerAgentId === "qa_evaluator" &&
+    stages.has(task.stageId) && ["blocked", "doing"].includes(task.status))) {
     const blocker = qaTask.blockers.find((item) => item.startsWith(blockerPrefix));
     const operationId = blocker?.slice(blockerPrefix.length).split(":")[0]?.trim();
     if (!operationId) continue;
+    // A producer change can set the task to doing while retaining the failure
+    // marker. Recover by the evidence/marker, not only the displayed status.
+    // Never clear a manual blocker or run against a still-stale build input.
+    if (qaTask.blockers.some((item) => !item.startsWith(blockerPrefix)) ||
+        !qaTask.inputArtifacts.every((id) => artifactReadyForConsumption(kernel, id))) continue;
     const repairTasks = kernel.listTasks().filter((task) => task.description.includes(`[playtest:${operationId}]`));
     if (repairTasks.length === 0 || !repairTasks.every((task) => ["review", "done"].includes(task.status) && taskOutputsVerified(kernel, task))) {
       continue;

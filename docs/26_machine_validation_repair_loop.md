@@ -1,5 +1,25 @@
 # Machine validation must produce actionable author work
 
+## Reopened QA recovery and test-authoring preflight
+
+A producer change can put a previously failed QA task back in `doing` while
+retaining its historical failure marker. Recovery previously inspected only
+`blocked`, stranding QA even after the programmer and builder submitted verified
+repairs. Recovery now accepts both states, requires all repair outputs and QA
+inputs to be consumable, preserves manual blockers, and leaves cancelled/old-stage
+work untouched. This queues a real rerun; it never changes the failed verdict.
+
+The v1 contract runner reloads the same entry point for each scenario. Different
+`startState` values do not establish fixtures, and run-wide gates are not scoped
+by their names. Contract preflight now rejects mixed reset states and provably
+contradictory equality/threshold gates on the same aggregate. The QA author gets
+explicit guidance to add real setup actions and keep branch-specific assertions
+inside their scenarios, without deleting coverage or changing gameplay to match
+an impossible test. Existing files are not silently rewritten.
+
+Regression: `verify-qa-playtest-gate.mjs`, `verify-game-contracts.mjs`,
+`verify-playtest-contract-runner.mjs` after `npm run build`.
+
 ## Failure observed in Tidewatch
 
 The visual reviewer reported a passing score while a runtime PNG declared

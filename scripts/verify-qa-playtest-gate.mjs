@@ -298,6 +298,27 @@ assert.deepEqual(originalTasks.map(([id]) => kernel.findTask(id).description), b
 resumeQaTasksAfterVerifiedRepairs(kernel);
 assert.equal(kernel.findTask(taskId).status, "doing", "real original-owner writes release QA for a new actual run");
 
+// Producer change requests reopen dependants without erasing historical QA
+// failure markers. The visible doing status must not strand a verified repair.
+kernel.updateTask(taskId, { status: "doing", blockers: [routed.reason] });
+resumeQaTasksAfterVerifiedRepairs(kernel);
+assert.equal(kernel.findTask(taskId).blockers.length, 0, "verified repairs also recover reopened doing tasks");
+assert.equal(kernel.getAgentLoopState().agents.qa_evaluator.status, "queued");
+const resumeTime = kernel.findTask(taskId).updatedAt;
+resumeQaTasksAfterVerifiedRepairs(kernel);
+assert.equal(kernel.findTask(taskId).updatedAt, resumeTime, "without a failure marker, recovery is idempotent");
+const originalInputs = [...kernel.findTask(taskId).inputArtifacts];
+kernel.updateTask(taskId, { status: "doing", blockers: [routed.reason], inputArtifacts: ["still_missing_build"] });
+resumeQaTasksAfterVerifiedRepairs(kernel);
+assert.deepEqual(kernel.findTask(taskId).blockers, [routed.reason], "source repair alone cannot release QA while its build is unavailable");
+kernel.updateTask(taskId, { status: "blocked", inputArtifacts: originalInputs, blockers: [routed.reason, "manual: producer hold"] });
+resumeQaTasksAfterVerifiedRepairs(kernel);
+assert.equal(kernel.findTask(taskId).status, "blocked", "manual hold is preserved");
+assert.equal(kernel.findTask(taskId).blockers.length, 2);
+kernel.updateTask(taskId, { status: "cancelled", blockers: [routed.reason] });
+resumeQaTasksAfterVerifiedRepairs(kernel);
+assert.equal(kernel.findTask(taskId).status, "cancelled", "cancelled work is never resumed");
+
 rmSync(tempRoot, { recursive: true, force: true });
 process.stdout.write("QA playtest gate smoke passed: forged report rejected, failures routed, verified repairs requeued\n");
 
