@@ -4,6 +4,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync 
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
+import { crc32, deflateSync } from "node:zlib";
 import { getQualityReviewArtifactContracts } from "../packages/agent-runtime/dist/index.js";
 import { mergeArtVisionSemanticResults } from "../apps/api/dist/multimodalArtProvider.js";
 
@@ -62,9 +63,48 @@ try {
     rpc(10, "tools/list"),
     rpc(11, "tools/call", { name: "write_artifact", arguments: { path: ownPath, content: "conversation overwrite" } })
   ]);
-  assert.deepEqual(toolNames(conversationResponses, 10).sort(), ["list_files", "read_file"]);
+  assert.deepEqual(toolNames(conversationResponses, 10).sort(), ["list_files", "read_file", "read_image"]);
   assert.equal(conversationResponses.get(11)?.result?.isError, true);
   assert.match(readFileSync(join(projectRoot, ownPath), "utf8"), /own = 2/);
+
+  const screenshotPath = "agents/qa/playtest-runs/fixture/menu.png";
+  const pngChunk = (type, data) => {
+    const payload = Buffer.concat([Buffer.from(type), data]);
+    const length = Buffer.alloc(4), crc = Buffer.alloc(4);
+    length.writeUInt32BE(data.length); crc.writeUInt32BE(crc32(payload));
+    return Buffer.concat([length, payload, crc]);
+  };
+  const header = Buffer.alloc(13); header.writeUInt32BE(1, 0); header.writeUInt32BE(1, 4); header[8] = 8; header[9] = 6;
+  const screenshot = Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), pngChunk("IHDR", header),
+    pngChunk("IDAT", deflateSync(Buffer.from([0, 255, 0, 0, 255]))), pngChunk("IEND", Buffer.alloc(0))]);
+  mkdirSync(dirname(join(projectRoot, screenshotPath)), { recursive: true });
+  writeFileSync(join(projectRoot, screenshotPath), screenshot);
+  writeFileSync(join(projectRoot, "agents/qa/playtest-runs/fixture/corrupt.png"), "not pixels");
+  writeFileSync(join(projectRoot, "agents/qa/playtest-runs/fixture/large.png"), Buffer.alloc(8 * 1024 * 1024 + 1));
+  const pixelLog = join(root, "pixel-operations.jsonl");
+  writeFileSync(pixelLog, "");
+  const pixelAuthorization = { ...gameplayAuthorization, outputArtifactIds: [], artifacts: [], readRoots: [], serviceReadPaths: ["agents/qa/playtest-runs/fixture"] };
+  for (const role of ["qa_evaluator", "gameplay_programmer"]) {
+    const pixels = runMcp(pixelAuthorization, role, [
+      rpc(900, "tools/call", { name: "read_image", arguments: { path: screenshotPath } }),
+      rpc(901, "tools/call", { name: "read_image", arguments: { path: "agents/qa/playtest-runs/fixture/corrupt.png" } }),
+      rpc(902, "tools/call", { name: "read_image", arguments: { path: "agents/qa/playtest-runs/fixture/large.png" } }),
+      rpc(903, "tools/call", { name: "read_image", arguments: { path: "agents/private/secret.png" } }),
+      rpc(904, "tools/call", { name: "read_file", arguments: { path: screenshotPath } }),
+      rpc(905, "tools/call", { name: "read_image", arguments: { path: "../outside.png" } })
+    ], { BTP_OPERATION_LOG_PATH: pixelLog });
+    const viewed = pixels.get(900)?.result;
+    assert.equal(viewed?.isError, undefined, JSON.stringify(viewed));
+    assert.equal(viewed?.content?.[1]?.type, "image");
+    assert.equal(viewed?.content?.[1]?.mimeType, "image/png");
+    assert.deepEqual(Buffer.from(viewed.content[1].data, "base64"), screenshot);
+    assert.equal(viewed.structuredContent.hash, createHash("sha256").update(screenshot).digest("hex"));
+    assert.equal(viewed.structuredContent.width, 1);
+    for (const id of [901, 902, 903, 904, 905]) assert.equal(pixels.get(id)?.result?.isError, true, `reject ${role} image request ${id}`);
+    assert.match(pixels.get(904).result.content[0].text, /read_image/);
+  }
+  assert.deepEqual(readFileSync(join(projectRoot, screenshotPath)), screenshot, "viewing cannot rewrite screenshot evidence");
+  assert.equal(readFileSync(pixelLog, "utf8").trim(), "", "image viewing must not create write or review-verdict evidence");
 
   const contractPath = "agents/design/contracts/game-contract.json";
   const contractOperationLog = join(root, "contract-operations.jsonl");

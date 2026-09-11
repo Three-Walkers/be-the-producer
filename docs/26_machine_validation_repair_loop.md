@@ -30,6 +30,19 @@ still pass an expired step. A timeout or malformed pre-action read becomes an
 explicit failed step using the last observed snapshot, not an invented state or
 a mislabeled handshake failure. Late promise results cannot append evidence.
 
+## Let agents inspect actual screenshots
+
+QA could produce PNG screenshots but its MCP exposed only UTF-8 reads; it had no
+way to consume their pixels. All roles now have read-only `read_image` under the
+same task-bound input/read authorization. It returns the original PNG as image
+content plus its SHA-256, dimensions and size. PNG decoding/CRC validation and an
+8 MB file cap reject corrupt or oversized payloads. `read_file` points PNG callers
+to this tool instead of sending binary gibberish. No file, ledger entry, visual
+review receipt or QA verdict is created by viewing. A non-vision provider must
+report its limitation, not infer pixels from names/logs. Formal visual review
+still requires its existing independent vision-inspection receipts. Regression:
+`verify-harness-mcp-authorization.mjs`, `verify-claude-harness.mjs`.
+
 ## Reopened QA recovery and test-authoring preflight
 
 A producer change can put a previously failed QA task back in `doing` while

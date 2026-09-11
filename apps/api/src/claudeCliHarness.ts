@@ -329,10 +329,11 @@ function assertClaudeCompatibleProvider(input: AgentHarnessRunInput): void {
 
 function claudeToolsForAgent(agent: AgentContract, mode: "conversation" | "task"): string[] {
   if (mode === "conversation") {
-    return ["mcp__btp_workspace__read_file", "mcp__btp_workspace__list_files"];
+    return ["mcp__btp_workspace__read_file", "mcp__btp_workspace__read_image", "mcp__btp_workspace__list_files"];
   }
   const tools = [
     "mcp__btp_workspace__read_file",
+    "mcp__btp_workspace__read_image",
     "mcp__btp_workspace__write_artifact",
     "mcp__btp_workspace__append_document",
     "mcp__btp_workspace__list_files",

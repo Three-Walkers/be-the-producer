@@ -338,6 +338,7 @@ for (const unsafeBuiltin of ["Read", "Glob", "Grep", "Bash"]) {
   assert.equal(toolsArg.includes(unsafeBuiltin), false, `Claude task tools must not expose ${unsafeBuiltin}`);
 }
 assert.ok(toolsArg.includes("mcp__btp_workspace__read_file"));
+assert.ok(toolsArg.includes("mcp__btp_workspace__read_image"));
 const mcpConfigArg = JSON.parse(args[args.indexOf("--mcp-config") + 1]);
 assert.equal(mcpConfigArg.mcpServers.btp_workspace.env.BTP_TOOL_MODE, "task");
 assert.equal(JSON.parse(mcpConfigArg.mcpServers.btp_workspace.env.BTP_VISION_PRODUCER_DECISIONS)[0].messageId, "producer_scope");
