@@ -229,3 +229,10 @@ This permits a justified unchanged-source resubmission after a platform-only
 repair, without requiring pointless gameplay edits or skipping fresh independent
 checks. Directory builds and protected QA/media outputs retain their own service
 receipt requirements. Regression: `verify-claude-harness.mjs`.
+
+For programmer tasks, `resubmit_source(path, expectedHash, reason)` avoids sending
+an unchanged multi-thousand-line module back through the model. It accepts only
+the task's owned registered TypeScript source, never generated bridge code or
+self-check/QA reports. The server verifies the current full-file hash and records
+the explicit reason without editing bytes; fresh self-check and independent QA
+requirements remain. Regression: `verify-implementation-review.mjs`.

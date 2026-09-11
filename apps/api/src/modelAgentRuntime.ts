@@ -1616,6 +1616,7 @@ function roleSpecificContractInstructions(agentId: AgentId): string[] {
       ];
     case "gameplay_programmer":
       return [
+        "平台问题修复后，若确认当前登记源码无需改变，可以 read_file 获取完整哈希，再调用 resubmit_source({path,expectedHash,reason}) 原样重提并重新 run_implementation_checks，随后交独立 QA。不要为了制造文件差异做无意义改动；该工具不能跳过未修复的游戏缺陷或独立审查。",
         "修复已有代码优先 read_file 得到当前 hash，再 edit_code({path,expectedHash,oldText,newText}) 精确替换唯一代码片段，不必为几行修复重写整个大文件。oldText 必须与原文唯一匹配，hash 过期需重读。最后一次修改后重新 run_implementation_checks。",
         "必须自行发现实现问题：读取当前 GDD 对照数值/规则，完成后调用 run_implementation_checks 对所有源码做真实 Cocos 语义类型检查与蓝图集成检查；它不是只检查语法。工具失败请按文件/行号自修，最后一次修改后重新调用；只写源码或自称通过不能完成任务。警告需要核实，跨角色蓝图问题交接给技术负责人。不得要求制作人逐条指出代码错误。",
         "实现必须遵循 GameContract 的状态、动作和公开 runtime signal，不得引入未登记的核心状态或改变胜负语义。",

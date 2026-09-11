@@ -104,6 +104,20 @@ try {
   assert.equal(edits[2].isError, true, "ambiguous code replacement rejected");
   assert.equal(edits[3].isError, undefined);
   assert.equal(readFileSync(join(project, sourcePath), "utf8"), source.replace("= 10", "= 12"), "precise edit preserves the rest of the module");
+  const resubmittedBytes = readFileSync(join(project, sourcePath));
+  const resubmittedHash = createHash("sha256").update(resubmittedBytes).digest("hex");
+  const submissions = requests("gameplay_programmer", [{ artifactId: "code", type: "source_code", path: sourcePath }], [
+    { name: "resubmit_source", arguments: { path: sourcePath, expectedHash: sourceHash, reason: "Platform-only change; source independently checked." } },
+    { name: "resubmit_source", arguments: { path: "assets/scripts/btp/BtpRuntimeBootstrap.ts", expectedHash: resubmittedHash, reason: "Must not access generated bridge source." } },
+    { name: "resubmit_source", arguments: { path: selfCheckPath, expectedHash: resubmittedHash, reason: "Must not forge server reports." } },
+    { name: "resubmit_source", arguments: { path: sourcePath, expectedHash: resubmittedHash, reason: "Platform-only change; source independently checked." } }
+  ]);
+  assert.equal(submissions[0].isError, true, "stale hash cannot resubmit source");
+  assert.equal(submissions[1].isError, true);
+  assert.equal(submissions[2].isError, true);
+  assert.equal(submissions[3].isError, undefined, JSON.stringify(submissions[3]));
+  assert.deepEqual(readFileSync(join(project, sourcePath)), resubmittedBytes);
+  assert.equal(parseToolOperations(join(root, "operations.jsonl")).at(-1).resubmissionReason, "Platform-only change; source independently checked.");
   write(join(project, sourcePath), source);
   process.env.STUDIO_WORKSPACE_ROOT = root;
   const longSource = source + "// fixture padding\n".repeat(400);

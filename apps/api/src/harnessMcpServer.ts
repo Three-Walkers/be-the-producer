@@ -315,6 +315,10 @@ function toolDefinitions(): Array<Record<string, unknown>> {
       inputSchema: { type: "object", properties: {}, additionalProperties: false } });
   }
   if (agentId === "gameplay_programmer") {
+    tools.push({ name: "resubmit_source", title: "Resubmit unchanged owned source",
+      description: "Explicitly resubmit a registered source output after confirming it needs no edit (for example a platform-only repair). Read first, supply its current full SHA-256 and a reason. Does not approve gameplay; rerun implementation checks and independent QA. Never use to hide an unfixed defect.",
+      inputSchema: { type: "object", properties: { path: { type: "string" }, expectedHash: { type: "string", pattern: "^[a-f0-9]{64}$" }, reason: { type: "string", minLength: 8, maxLength: 1200 } },
+        required: ["path", "expectedHash", "reason"], additionalProperties: false } });
     tools.push({ name: "edit_code", title: "Precisely edit existing TypeScript",
       description: "Replace one exact unique source span in an authorized TypeScript file. Read the file first and use its returned hash as expectedHash. Preserves the rest of the module; rerun implementation checks after your final edit. Does not grant new write paths.",
       inputSchema: { type: "object", properties: { path: { type: "string" }, expectedHash: { type: "string", pattern: "^[a-f0-9]{64}$" },
@@ -429,6 +433,21 @@ async function callTool(params: Record<string, unknown> | undefined): Promise<Re
     });
     const document = qualityReviewFromVisionResult(contract, merged.result, targets, `review.${merged.semanticHash.slice(0, 24)}`);
     return callTool({ name: "write_artifact", arguments: { path: output.path, document } });
+  }
+  if (name === "resubmit_source") {
+    if (agentId !== "gameplay_programmer" || authorization.mode !== "task") throw new Error("Only a programmer task may resubmit its owned source.");
+    const path = requiredString(args.path, "path");
+    const output = taskOutputArtifacts().find((artifact) => artifact.path === path && artifact.type === "source_code" && artifact.ownerAgentId === agentId);
+    if (!output || !path.startsWith("assets/scripts/") || path.startsWith("assets/scripts/btp/") || !/\.tsx?$/.test(path)) throw new Error("resubmit_source requires a registered owned implementation source output.");
+    const target = resolveAuthorizedTarget(path, false, "artifact_write");
+    const bytes = readFileSync(target.absolutePath);
+    if (bytes.byteLength > 5 * 1024 * 1024) throw new Error("Source exceeds 5 MB.");
+    const hash = createHash("sha256").update(bytes).digest("hex");
+    if (hash !== requiredString(args.expectedHash, "expectedHash")) throw new Error("Source changed since read_file; reread before resubmitting.");
+    const reason = requiredString(args.reason, "reason");
+    if (reason.length < 8 || reason.length > 1200) throw new Error("Provide an 8–1200 character resubmission reason.");
+    recordOperation({ toolName: name, path, hash, sizeBytes: bytes.byteLength, access: "write", status: "completed", resubmissionReason: reason });
+    return { content: [{ type: "text", text: `Unchanged source resubmitted: ${path}. Run implementation checks; independent QA is still required.` }], structuredContent: { path, hash, sizeBytes: bytes.byteLength, reason } };
   }
   if (name === "edit_code") {
     const target = resolveAuthorizedTarget(requiredString(args.path, "path"), false, "artifact_write");
