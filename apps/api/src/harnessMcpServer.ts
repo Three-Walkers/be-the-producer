@@ -17,7 +17,7 @@ import {
 } from "./contractArtifacts.js";
 import type { ArtifactInputProvenance, ArtifactQualityReview } from "@game-pipeline/shared-schemas";
 import { parseGameContract, parseSceneBlueprint, parsePlaytestContract, validateSceneBlueprintCompatibility,
-  validatePlaytestContractCompatibility, ContractValidationError } from "@game-pipeline/shared-schemas";
+  validatePlaytestContractCompatibility, ContractValidationError, QualityReviewValidationError } from "@game-pipeline/shared-schemas";
 import { getQualityReviewArtifactContracts, type QualityReviewArtifactContract } from "@game-pipeline/agent-runtime";
 import type { AgentHarnessAuthorization, AgentHarnessAuthorizationArtifact } from "./agentHarness.js";
 import { normalizeRelativePathWithinRoot, resolvePathWithinRoot } from "./pathSafety.js";
@@ -97,6 +97,10 @@ async function handleRequest(request: JsonRpcRequest): Promise<void> {
         respondError(request.id, -32601, `Method not found: ${request.method ?? "unknown"}`);
     }
   } catch (error) {
+    if (agentId === "visual_quality_reviewer" && request.params?.name === "write_artifact" &&
+        error instanceof QualityReviewValidationError) {
+      error = new Error(`${error.message}\n视觉审查不要手工重写 JSON 或重算评分。完成全部必需图片的 inspect_visual_assets 后，直接调用 submit_visual_review({}) 提交本轮已绑定的结果；无需再次抄写，禁止修改视觉模型结论。`);
+    }
     recordFailedWorkspaceWrite(request, error);
     respond(request.id, {
       content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
@@ -1127,6 +1131,11 @@ function mergeVisionInspectionReceipts(
     throw new Error("视觉 quality_review 的 Art Bible、Asset Manifest 或 runtime 技术上下文已在 inspection 后变化。 ");
   }
   const requiredImageTargets = review.targets.filter((target) => /\.(?:png|jpe?g|webp)$/i.test(target.path));
+  const missingRuntimeImages = currentContext.evidence.filter((entry) => entry.kind === "runtime_asset_technical" &&
+    !merged.evidence.some((image) => image.path === entry.path && image.hash === entry.hash && image.sizeBytes === entry.sizeBytes));
+  if (missingRuntimeImages.length) {
+    throw new Error(`视觉审查尚未覆盖 ${missingRuntimeImages.length} 张当前 runtime PNG：${missingRuntimeImages.map((entry) => entry.path).join("、")}。请在本轮调用 inspect_visual_assets 补查这些图片，然后再次 submit_visual_review；不得用联系表代替独立图片检查。`);
+  }
   if (requiredImageTargets.length === 0) {
     throw new Error("视觉 quality_review 的 canonical targets 中没有可检查的图片产物。");
   }
