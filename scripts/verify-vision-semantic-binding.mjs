@@ -18,6 +18,7 @@ const {
   buildCurrentVisionReviewAuthoritativeContext,
   applyQualityReviewChangeRequest,
   currentGeneratedRuntimeAssetPathsForReview,
+  qualityReviewFromVisionResult,
   qualityReviewReadyForGate
 } = await import("../apps/api/dist/qualityReviewArtifacts.js");
 const { reconcileInvalidQualityReviewEvidence, restoreHistoricalReviewReferences } = await import("../apps/api/dist/evidenceReconciliation.js");
@@ -84,6 +85,15 @@ try {
     severity: "major",
     verdict: "change_requested"
   });
+  const mixedSemantic = structuredClone(majorSemantic);
+  mixedSemantic.criteria[0].findings.push({ issueCode: "palette.already_correct", severity: "note",
+    summary: "The sand palette already matches the baseline.", evidenceRefs: [`${board.path}#pixel:sand`] });
+  const projected = qualityReviewFromVisionResult(contract, mixedSemantic,
+    qualityReview(kernel, contract, artBible, board, mixedSemantic).targets, "review.mixed");
+  assert.deepEqual(projected.criteria, mixedSemantic.criteria, "all observations and scores remain immutable");
+  assert.equal(projected.requiredChanges.some((change) => change.issueCode === "palette.already_correct"), false,
+    "positive notes in a failed aggregate criterion must not become author rework");
+  assert.ok(projected.requiredChanges.length > 0, "real major findings still require rework");
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (_input, init = {}) => {
     const body = JSON.parse(String(init.body ?? "{}"));
