@@ -141,3 +141,9 @@ Unexpected source/asset changes remain visible to the outer workspace guard and
 are still rejected. Symlinks are refused. This deliberately favors reproducible,
 isolated builds over caching generated editor metadata in the authored workspace.
 Regression: `node scripts/verify-cocos-build-isolation.mjs`.
+
+Project-list polling also reloaded complete on-disk audit histories (one observed
+request took 18 seconds). The single-process store now keeps a small summary
+projection from successful durable saves, including real `savedAt` timestamps.
+Creation, lazy loading and deletion maintain that projection; callers receive
+copies. This is not a cross-process cache-coherence or database replacement.

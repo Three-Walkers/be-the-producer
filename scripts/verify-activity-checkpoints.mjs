@@ -42,7 +42,8 @@ try {
   roomKernel.updateProject({ executionStatus: "paused" });
   let saved;
   const store = new StudioProjectStore({ persistence: {
-    loadAll: () => [roomKernel], load: () => roomKernel, listSummaries: () => [], delete: () => {},
+    loadAll: () => [roomKernel], load: () => roomKernel,
+    listSummaries: () => assert.fail("sidebar polling must not reload full disk histories"), delete: () => {},
     save: (current) => { saved = structuredClone(current.toSnapshot()); return saved; }
   }, modelRuntime: { async respond(current, message, route, options) {
     assert.ok(saved.messages.some(m => m.messageId === message.messageId), "producer intent must be durable BEFORE the model request");
@@ -53,5 +54,18 @@ try {
   roomKernel.updateProject({ executionStatus: "running" });
   await store.handleProducerInput(roomKernel.project.projectId, { content: "@策划 说明当前玩法风险", messageType: "plan_submission" },
     { modelReplies: true, scriptedReplies: false, bootstrapProjectState: false, protocolFlows: false });
+  const savedAt = saved.savedAt;
+  for (let i = 0; i < 100; i++) {
+    const summary = store.listProjects()[0];
+    assert.equal(summary.projectId, roomKernel.project.projectId);
+    assert.equal(summary.executionStatus, "paused");
+    assert.equal(summary.savedAt, savedAt);
+    summary.name = "caller mutation must not alter cached summary";
+  }
+  assert.equal(store.listProjects()[0].name, "Room");
+  const created = store.createProject({ name: "Second project" });
+  assert.equal(store.listProjects().length, 2);
+  store.deleteProject(created.project.projectId);
+  assert.equal(store.listProjects().length, 1, "deleted projects leave the summary projection too");
   console.log("Activity checkpoints passed: 200 model deltas, live UI state, durable producer input and lifecycle boundaries.");
 } finally { rmSync(root, { recursive: true, force: true }); }
