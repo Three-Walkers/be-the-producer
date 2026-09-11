@@ -43,6 +43,18 @@ report its limitation, not infer pixels from names/logs. Formal visual review
 still requires its existing independent vision-inspection receipts. Regression:
 `verify-harness-mcp-authorization.mjs`, `verify-claude-harness.mjs`.
 
+## Account failures are not transient harness failures
+
+During the independent review, the provider returned HTTP 400 `Arrearage`.
+Generic process-exit classification retried the same account repeatedly. Billing
+codes (including quota failures delivered as HTTP 429) now produce a sanitized,
+non-retryable diagnostic. The scheduler honors `harnessRetryable=false` for both
+billing and authentication failures, blocks after one attempt and retains the
+producer-action blocker across restarts. Recovery requires restoring the provider
+and explicitly reopening the affected task; no provider switch, charge or gate
+approval is automatic. Ordinary rate limiting remains transient. Regression:
+`verify-claude-harness.mjs`, `verify-agent-loop.mjs`.
+
 ## Reopened QA recovery and test-authoring preflight
 
 A producer change can put a previously failed QA task back in `doing` while

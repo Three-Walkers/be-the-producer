@@ -50,6 +50,7 @@ export type ClaudeCliProcessFailureKind =
   | "provider_rate_limited"
   | "provider_overloaded"
   | "provider_timeout"
+  | "provider_billing"
   | "authentication"
   | "session"
   | "process_exit";
@@ -1005,6 +1006,15 @@ function extractPlainFailureCandidate(source: string): string | undefined {
 
 function classifyClaudeCliFailure(rawDetail: string | undefined): ClaudeCliFailureDiagnosis {
   const detail = sanitizeClaudeCliFailureDetail(rawDetail ?? "");
+  // Some providers return billing failures as HTTP 400 or 429. A retry cannot
+  // repair an account balance; classify these before transient status codes.
+  if (/\bArrearage\b|insufficient[_ -]quota|billing[_ -]hard[_ -]limit|credit balance.{0,30}(?:low|insufficient)|insufficient.{0,20}(?:credit|balance)|欠费|余额不足/i.test(detail)) {
+    return {
+      kind: "provider_billing",
+      retryable: false,
+      detail: "模型服务因账户欠费、余额不足或计费额度限制拒绝请求。请恢复该 Provider 的计费状态后明确重试任务；未更换模型或跳过审查，已有任务和产物证据保留。"
+    };
+  }
   if (/API Error:\s*terminated|\bterminated\b/i.test(detail)) {
     return {
       kind: "provider_terminated",

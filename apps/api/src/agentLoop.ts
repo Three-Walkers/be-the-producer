@@ -501,6 +501,11 @@ function applyTaskOutcome(
   const now = new Date().toISOString();
 
   if (message.metadata.failure === true) {
+    if (message.metadata.harnessRetryable === false) {
+      retryTransientFailure(kernel, task, message, failureCounts,
+        `${message.content}；等待制作人恢复模型服务配置或计费后明确重试任务`, 1);
+      return;
+    }
     const retryLimit = message.metadata.failureKind === "harness_timeout_no_progress" ? 2 : maxTransientFailures;
     retryTransientFailure(kernel, task, message, failureCounts, message.content, retryLimit);
     return;

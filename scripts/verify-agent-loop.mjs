@@ -489,6 +489,7 @@ const fakeModelRuntime = {
         metadata: {
           failure: true,
           failureKind: forcedFailureKind,
+          ...(forcedFailureKind === "provider_billing" ? { harnessRetryable: false } : {}),
           loopIteration: input.iteration
         },
         createdAt: new Date().toISOString()
@@ -662,6 +663,18 @@ await waitFor(() => kernel.getAgentLoopState().status !== "running", 4_000);
 assert.equal(modelCallCount - callsBeforeNoProgressFailure, 2, "无工具进展的 Harness 超时最多自动尝试两次");
 assert.equal(kernel.findTask("task_harness_no_progress")?.status, "blocked");
 assert.match(kernel.findTask("task_harness_no_progress")?.blockers.join("；") ?? "", /连续失败 2 次/);
+forcedFailureKind = undefined;
+
+kernel.updateTask("task_harness_no_progress", { status: "doing", blockers: [] });
+forcedFailureKind = "provider_billing";
+const callsBeforeBillingFailure = modelCallCount;
+service.start(projectId, { reason: "non-retryable provider failure smoke" });
+await waitFor(() => kernel.getAgentLoopState().status !== "running", 4_000);
+assert.equal(modelCallCount - callsBeforeBillingFailure, 1, "billing/auth failures must not consume a transient retry loop");
+assert.match(kernel.findTask("task_harness_no_progress").blockers.join("；"), /等待制作人/);
+service.start(projectId, { reason: "restart must preserve permanent provider blocker" });
+await waitFor(() => kernel.getAgentLoopState().status !== "running", 4_000);
+assert.equal(modelCallCount - callsBeforeBillingFailure, 1, "restart must not implicitly retry a non-retryable account failure");
 forcedFailureKind = undefined;
 
 addDirectToolFixture({

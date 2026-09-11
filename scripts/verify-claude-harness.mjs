@@ -97,7 +97,18 @@ chmodSync(fakeClaude, 0o755);
 process.env.CLAUDE_CLI_PATH = fakeClaude;
 process.env.TEST_SECRET_SHOULD_NOT_LEAK = "super-secret";
 
-const { ClaudeCliHarness, ClaudeCliProcessError, ClaudeSessionResumeError } = await import("../apps/api/dist/claudeCliHarness.js");
+const { ClaudeCliHarness, ClaudeCliProcessError, ClaudeSessionResumeError, diagnoseClaudeCliFailure } = await import("../apps/api/dist/claudeCliHarness.js");
+for (const detail of [
+  'API Error: 400 {"code":"Arrearage","message":"Access denied"}',
+  'API Error: 429 {"code":"insufficient_quota"}',
+  "API Error: credit balance is too low"
+]) {
+  const diagnosed = diagnoseClaudeCliFailure({ stdout: "", stderr: detail });
+  assert.equal(diagnosed.kind, "provider_billing");
+  assert.equal(diagnosed.retryable, false);
+  assert.match(diagnosed.detail, /计费/);
+}
+assert.equal(diagnoseClaudeCliFailure({ stdout: "", stderr: "API Error: 429 too many requests" }).retryable, true);
 const { captureWorkspaceSnapshot, recordHarnessWorkspaceChanges } = await import("../apps/api/dist/harnessWorkspaceEvidence.js");
 const { createStudioKernel, defaultAgentContracts, getQualityReviewArtifactContracts } = await import("@game-pipeline/agent-runtime");
 const { createTaskHarnessAuthorization } = await import("../apps/api/dist/toolAuthorization.js");
