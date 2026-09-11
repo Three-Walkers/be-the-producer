@@ -8,11 +8,13 @@ const put = (path, bytes) => { mkdirSync(dirname(join(root, path)), { recursive:
 try {
   put("package.json", '{"name":"authored-project"}\n');
   put("assets/scenes/MainGame.scene.meta", '{"uuid":"authored-uuid"}\n');
+  put("assets/scenes/MainGame.scene", '[{"name":"AuthoredScene"}]\n');
   put("assets/scripts/gameplay/Game.ts", "original source\n");
   put("settings/v2/packages/project.json", '{"orientation":"portrait"}\n');
   const mutate = () => {
     put("package.json", '{"name":"native-mutation"}');
     put("assets/scenes/MainGame.scene.meta", '{"uuid":"changed-uuid"}');
+    put("assets/scenes/MainGame.scene", '[{"name":"NativeReserializedScene"}]');
     put("assets/scripts/gameplay/Game.ts.meta", '{"uuid":"new-meta"}');
     put("assets/scripts.meta", '{"uuid":"directory-meta"}');
     put("profiles/v2/editor/packages.json", '{"editor":"local-only"}');
@@ -25,6 +27,7 @@ try {
     if (fails) assert.throws(execute, /Creator failed/); else assert.equal(execute(), 36);
     assert.equal(readFileSync(join(root, "package.json"), "utf8"), '{"name":"authored-project"}\n');
     assert.equal(readFileSync(join(root, "assets/scenes/MainGame.scene.meta"), "utf8"), '{"uuid":"authored-uuid"}\n');
+    assert.equal(readFileSync(join(root, "assets/scenes/MainGame.scene"), "utf8"), '[{"name":"AuthoredScene"}]\n');
     assert.equal(readFileSync(join(root, "settings/v2/packages/project.json"), "utf8"), '{"orientation":"portrait"}\n');
     for (const path of ["assets/scripts.meta", "assets/scripts/gameplay/Game.ts.meta", "profiles/v2/editor/packages.json", "settings/v2/packages/builder.json"]) {
       assert.equal(existsSync(join(root, path)), false, `native auxiliary file must remain isolated: ${path}`);

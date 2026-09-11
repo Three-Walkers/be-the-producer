@@ -37,7 +37,9 @@ function snapshotMetadata(root: string): Map<string, Buffer> {
       const child = `${path}/${entry.name}`;
       if (entry.isSymbolicLink()) throw new Error(`Creator 元数据拒绝符号链接：${child}`);
       if (entry.isDirectory()) visit(child, onlyMeta);
-      else if (entry.isFile() && (!onlyMeta || child.endsWith(".meta"))) {
+      // Creator also upgrades/reserializes scenes when importing them for a
+      // build. That is build-local preprocessing, not an authored scene edit.
+      else if (entry.isFile() && (!onlyMeta || child.endsWith(".meta") || child.endsWith(".scene"))) {
         const file = resolvePathWithinRoot(root, child, { allowMissing: false, expectedKind: "file", label: "Creator 元数据文件" });
         files.set(child, readFileSync(file.absolutePath));
       }
