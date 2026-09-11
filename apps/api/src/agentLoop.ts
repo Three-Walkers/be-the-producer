@@ -12,6 +12,7 @@ import { executeAgentToolRequests, type ToolExecutionResult } from "./toolExecut
 import { artifactReadyForConsumption, taskOutputsVerified } from "./taskOutputEvidence.js";
 import { resumeQaTasksAfterVerifiedRepairs } from "./qaRepairFlow.js";
 import { finalizeMessageActivity, recordServerToolActivity } from "./agentActivity.js";
+import { implementationReportNeedsRefresh } from "./implementationReview.js";
 
 export interface AgentLoopWakeOptions {
   reason: string;
@@ -124,6 +125,22 @@ export class AgentLoopService {
     let options = initialOptions;
     const noProgressCounts = new Map<TaskId, number>();
     const failureCounts = new Map<TaskId, number>();
+    const inFlight = new Map<TaskId, {
+      task: Task;
+      controller: AbortController;
+      inputs: string;
+      superseded: boolean;
+      completion: Promise<{ taskId: TaskId; error?: unknown }>;
+    }>();
+    const cancelSupersededInputs = (kernel: StudioKernel) => {
+      for (const entry of inFlight.values()) {
+        const currentTask = kernel.findTask(entry.task.taskId);
+        if (!entry.superseded && (!currentTask || taskInputRevision(kernel, currentTask) !== entry.inputs)) {
+          entry.superseded = true;
+          entry.controller.abort(new Error("上游输入已更新，取消旧快照任务并重新排队。"));
+        }
+      }
+    };
     let rounds = 0;
     try {
       while (true) {
@@ -142,23 +159,30 @@ export class AgentLoopService {
           options = { ...options, unlockRetryableFailures: false };
         }
         resumeQaTasksAfterVerifiedRepairs(kernel);
+        resumeSupersededImplementationTasks(kernel);
         advanceVerifiedTasksToReview(kernel);
+        cancelSupersededInputs(kernel);
 
-        const candidates = selectRunnableTasks(kernel, options.preferredAgentIds).slice(0, maxParallelAgents);
-        if (candidates.length === 0) {
+        const occupiedAgents = new Set([...inFlight.values()].map((entry) => entry.task.ownerAgentId));
+        const candidates = selectRunnableTasks(kernel, options.preferredAgentIds).filter((task) => {
+          if (inFlight.has(task.taskId) || occupiedAgents.has(task.ownerAgentId)) return false;
+          occupiedAgents.add(task.ownerAgentId);
+          return true;
+        }).slice(0, Math.max(0, maxParallelAgents - inFlight.size));
+        if (candidates.length === 0 && inFlight.size === 0) {
           settleWithoutRunnableTasks(kernel);
           this.dependencies.checkpoint(kernel);
           return;
         }
 
         rounds += 1;
-        const iteration = kernel.getAgentLoopState().iteration + 1;
+        const iteration = kernel.getAgentLoopState().iteration + (candidates.length > 0 ? 1 : 0);
         const now = new Date().toISOString();
         kernel.updateAgentLoop({
           status: "running",
           iteration,
-          activeAgentIds: candidates.map((task) => task.ownerAgentId),
-          pendingTaskIds: candidates.map((task) => task.taskId),
+          activeAgentIds: [...inFlight.values()].map((entry) => entry.task.ownerAgentId).concat(candidates.map((task) => task.ownerAgentId)),
+          pendingTaskIds: [...inFlight.keys(), ...candidates.map((task) => task.taskId)],
           waitingReason: undefined,
           updatedAt: now
         });
@@ -178,49 +202,86 @@ export class AgentLoopService {
         }
         this.dependencies.checkpoint(kernel);
 
-        const messages = new Array<StudioMessage>(candidates.length);
-        await Promise.all(
-          candidates.map(async (task, index) => {
+        for (const task of candidates) {
+          const controller = new AbortController();
+          const inputs = taskInputRevision(kernel, task);
+          const relayAbort = () => controller.abort(active.abortController.signal.reason);
+          active.abortController.signal.addEventListener("abort", relayAbort, { once: true });
+          if (active.abortController.signal.aborted) relayAbort();
+          const inputsAreCurrent = () => {
+            const currentTask = kernel.findTask(task.taskId);
+            return Boolean(currentTask && taskInputRevision(kernel, currentTask) === inputs);
+          };
+          const execution = (async () => {
             const message = await this.dependencies.modelRuntime.respondToTask(kernel, task, {
               iteration,
-              abortSignal: active.abortController.signal,
-              onAgentActivity: () => this.dependencies.checkpoint(kernel),
+              abortSignal: controller.signal,
+              inputsAreCurrent,
+              onAgentActivity: () => {
+                cancelSupersededInputs(kernel);
+                this.dependencies.checkpoint(kernel);
+              },
               ...(options.triggerMessageId ? { triggerMessageId: options.triggerMessageId } : {})
             });
-            messages[index] = message;
+            cancelSupersededInputs(kernel);
+            if (controller.signal.aborted || !inputsAreCurrent() || this.activeRuns.get(projectId)?.generation !== generation || kernel.project.executionStatus !== "running") return;
             kernel.recordMessage(message);
+            await executeAgentToolRequests(kernel, [message], {
+              onActivity: (toolMessage, event) => {
+                recordServerToolActivity(kernel, toolMessage, event);
+                this.dependencies.checkpoint(kernel);
+              }
+            });
+            if (this.activeRuns.get(projectId)?.generation !== generation || kernel.project.executionStatus !== "running") return;
+            finalizeMessageActivity(kernel, message);
+            applyTaskOutcome(kernel, task, message, noProgressCounts, failureCounts);
+            finalizeTaskSessionProtocol(kernel, kernel.findTask(task.taskId) ?? task, message);
+            // Publish each completed task immediately, not after the slowest sibling.
+            const pendingTaskIds = kernel.getAgentLoopState().pendingTaskIds.filter((id) => id !== task.taskId);
+            kernel.updateAgentLoop({
+              pendingTaskIds,
+              activeAgentIds: [...new Set(pendingTaskIds.map((id) => kernel.findTask(id)?.ownerAgentId).filter((id): id is AgentId => Boolean(id)))],
+              updatedAt: new Date().toISOString()
+            });
             this.dependencies.checkpoint(kernel);
-          })
-        );
+          })();
+          // Observe all rejections immediately while waiting only for the first
+          // free slot, so a fast branch can launch its downstream work without
+          // waiting for an unrelated slow specialist.
+          inFlight.set(task.taskId, { task, controller, inputs, superseded: false, completion: execution.finally(() => {
+            active.abortController.signal.removeEventListener("abort", relayAbort);
+          }).then(
+            () => ({ taskId: task.taskId }),
+            (error: unknown) => ({ taskId: task.taskId, error })
+          ) });
+        }
+        const finished = await Promise.race([...inFlight.values()].map((entry) => entry.completion));
+        const completedEntry = inFlight.get(finished.taskId);
+        inFlight.delete(finished.taskId);
+        if (finished.error !== undefined && !completedEntry?.superseded) throw finished.error;
 
         const current = this.activeRuns.get(projectId);
         if (!current || current.generation !== generation || kernel.project.executionStatus !== "running") {
           return;
         }
 
-        await executeAgentToolRequests(kernel, messages, {
-          onActivity: (message, event) => {
-            recordServerToolActivity(kernel, message, event);
-            this.dependencies.checkpoint(kernel);
+        if (completedEntry?.superseded) {
+          // Cancellation is not a model failure or a product verdict. Keep the
+          // role slot until the worker settles, then retry against fresh inputs.
+          noProgressCounts.delete(finished.taskId);
+          failureCounts.delete(finished.taskId);
+          for (const activity of kernel.listAgentActivities()) {
+            if (activity.taskId === finished.taskId) kernel.removeAgentActivity(activity.activityId);
           }
-        });
-        for (const message of messages) {
-          finalizeMessageActivity(kernel, message);
+          kernel.updateAgentLoopAgent(completedEntry.task.ownerAgentId, {
+            status: "queued", lastError: undefined, updatedAt: new Date().toISOString()
+          });
         }
-        this.dependencies.checkpoint(kernel);
 
-        for (let index = 0; index < candidates.length; index += 1) {
-          const task = candidates[index];
-          const message = messages[index];
-          if (task && message) {
-            applyTaskOutcome(kernel, task, message, noProgressCounts, failureCounts);
-            finalizeTaskSessionProtocol(kernel, kernel.findTask(task.taskId) ?? task, message);
-          }
-        }
         advanceVerifiedTasksToReview(kernel);
         kernel.updateAgentLoop({
-          activeAgentIds: [],
-          pendingTaskIds: [],
+          activeAgentIds: [...inFlight.values()].map((entry) => entry.task.ownerAgentId),
+          pendingTaskIds: [...inFlight.keys()],
           updatedAt: new Date().toISOString()
         });
         this.dependencies.checkpoint(kernel);
@@ -239,6 +300,9 @@ export class AgentLoopService {
         }
       }
     } catch (error) {
+      const active = this.activeRuns.get(projectId);
+      if (!active || active.generation !== generation) return;
+      active.abortController.abort();
       const kernel = this.dependencies.getKernel(projectId);
       const errorMessage = error instanceof Error ? error.message : String(error);
       const now = new Date().toISOString();
@@ -269,6 +333,32 @@ export class AgentLoopService {
         this.start(projectId, pending);
       }
     }
+  }
+}
+
+/** Ignore status-only feedback: a negative review legitimately marks its own
+ * inputs change_requested. Only an actual input identity/revision change makes
+ * an isolated workspace obsolete. Never track a task's own in-place outputs. */
+function taskInputRevision(kernel: StudioKernel, task: Task): string {
+  return JSON.stringify([...new Set(task.inputArtifacts)].filter((id) => !task.outputArtifacts.includes(id)).sort().map((id) => {
+    const artifact = kernel.listArtifacts().find((entry) => entry.artifactId === id);
+    const ledger = kernel.listArtifactLedger().find((entry) => entry.artifactId === id);
+    return [id, artifact?.version, artifact?.path, ledger?.path, ledger?.hash, ledger?.sizeBytes, ledger?.directoryManifest?.digest];
+  }));
+}
+
+export function resumeSupersededImplementationTasks(kernel: StudioKernel): void {
+  for (const taskId of ["task_stage_2_cocos_implementation", "task_stage_2_qa_implementation_review"]) {
+    const task = kernel.findTask(taskId);
+    if (!task || task.stageId !== kernel.project.currentStage || !["review", "blocked"].includes(task.status)) continue;
+    // Product waits and real failures need their own resolution. This path only
+    // recovers an obsolete verifier receipt, never an arbitrary blocked task.
+    if (task.blockers.some((blocker) => blocker !== `${loopBlockerPrefix}Agent 请求评审，但任务输出尚未全部通过 Artifact Ledger 验证。`)) continue;
+    if (!inputArtifactsVerified(kernel, task)) continue;
+    const reports = kernel.listArtifacts().filter((artifact) => task.outputArtifacts.includes(artifact.artifactId));
+    if (!reports.some((artifact) => implementationReportNeedsRefresh(kernel, artifact))) continue;
+    kernel.updateTask(task.taskId, { status: "doing", progressPercent: 65, blockers: [], updatedAt: new Date().toISOString() });
+    kernel.updateAgentLoopAgent(task.ownerAgentId, { status: "queued", taskId: task.taskId, lastError: undefined, updatedAt: new Date().toISOString() });
   }
 }
 
