@@ -384,15 +384,15 @@ export class StudioProjectStore {
     }
     let modelMessagesHandled = false;
     if (options.modelReplies && result.agentMessages.length === 0) {
+      // Persist producer intent before starting an external model request.
+      // UI activity is ephemeral; final messages, tool outcomes and lifecycle
+      // boundaries still take full durable/evidence checkpoints.
+      this.checkpointKernel(kernel);
       const modelResult = await this.modelRuntime.respond(kernel, message, result.routePlan, {
-        onAgentActivity: () => {
-          this.checkpointKernel(kernel);
-        },
         onAgentMessage: async (agentMessage) => {
           await executeAgentToolRequests(kernel, [agentMessage], {
             onActivity: (toolMessage, event) => {
               recordServerToolActivity(kernel, toolMessage, event);
-              this.checkpointKernel(kernel);
             }
           });
           finalizeMessageActivity(kernel, agentMessage);

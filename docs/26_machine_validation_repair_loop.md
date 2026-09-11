@@ -114,3 +114,16 @@ with failed tool records, without adding them to required outputs or the artifac
 ledger. Failed builds remain unconsumable. Any failed source/scene/asset mutation,
 wrong operation identity, altered report bytes or unauthorized path still rejects
 publication. Regression: `node scripts/verify-cocos-failure-diagnostics.mjs`.
+
+## Telemetry is not a durable transaction
+
+Each streamed model delta previously triggered three full workspace syncs, evidence
+reconciliation and a complete snapshot save. A long project history amplified this
+into sustained API CPU saturation during otherwise ordinary asset import progress.
+Activity reporters now update in-memory UI state without that transaction. The
+existing task-start, result-publication, pause and settlement checkpoints remain;
+producer intent is explicitly persisted before requesting a room model response.
+Active progress may be lost after a crash (and is cleared at restart already), but
+committed artifacts, decisions and final activity timelines retain their durable
+boundaries. Regression: `node scripts/verify-activity-checkpoints.mjs` verifies 200
+progress events without intermediate durable saves, plus producer-input durability.

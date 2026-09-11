@@ -220,7 +220,9 @@ export class AgentLoopService {
               inputsAreCurrent,
               onAgentActivity: () => {
                 cancelSupersededInputs(kernel);
-                this.dependencies.checkpoint(kernel);
+                // Live activity already lives in the kernel for UI reads.
+                // Persist only lifecycle boundaries, not every model delta or
+                // per-file tool receipt (which can number in the hundreds).
               },
               ...(options.triggerMessageId ? { triggerMessageId: options.triggerMessageId } : {})
             });
@@ -230,7 +232,6 @@ export class AgentLoopService {
             await executeAgentToolRequests(kernel, [message], {
               onActivity: (toolMessage, event) => {
                 recordServerToolActivity(kernel, toolMessage, event);
-                this.dependencies.checkpoint(kernel);
               }
             });
             if (this.activeRuns.get(projectId)?.generation !== generation || kernel.project.executionStatus !== "running") return;
