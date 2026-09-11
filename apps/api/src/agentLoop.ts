@@ -9,7 +9,7 @@ import type {
 import { workflowTaskStages, type StudioKernel } from "@game-pipeline/agent-runtime";
 import { finalizeTaskSessionProtocol, ModelAgentRuntime } from "./modelAgentRuntime.js";
 import { executeAgentToolRequests, type ToolExecutionResult } from "./toolExecutor.js";
-import { artifactReadyForConsumption, taskOutputsVerified } from "./taskOutputEvidence.js";
+import { artifactReadyForConsumption, artifactReadyForTaskCompletion, taskOutputsVerified } from "./taskOutputEvidence.js";
 import { resumeQaTasksAfterVerifiedRepairs } from "./qaRepairFlow.js";
 import { finalizeMessageActivity, recordServerToolActivity } from "./agentActivity.js";
 import { implementationReportNeedsRefresh } from "./implementationReview.js";
@@ -37,6 +37,7 @@ const loopBlockerPrefix = "Agent Loop：";
 const maxParallelAgents = 3;
 const maxRoundsPerBatch = 24;
 const maxTransientFailures = 3;
+const handoffFeedbackPattern = /\n?\[HANDOFF_EVIDENCE_REPAIR\][\s\S]*?\[\/HANDOFF_EVIDENCE_REPAIR\]/g;
 
 export class AgentLoopService {
   private readonly activeRuns = new Map<string, ActiveRun>();
@@ -395,6 +396,8 @@ function advanceVerifiedTasksToReview(kernel: StudioKernel): void {
     if (!executionStages.has(task.stageId) || task.taskLevel === "task_group" || !taskOutputsVerified(kernel, task)) {
       continue;
     }
+    const description = task.description.replace(handoffFeedbackPattern, "");
+    if (description !== task.description) kernel.updateTask(task.taskId, { description });
     const now = new Date().toISOString();
     const advancedToReview = ["todo", "doing"].includes(task.status);
     if (advancedToReview) {
@@ -533,6 +536,24 @@ function applyTaskOutcome(
 
   if (!control) {
     retryTransientFailure(kernel, task, message, failureCounts, "Agent 未返回结构化 loopControl，调度器无法安全决定下一步。");
+    return;
+  }
+  // A downstream recipient cannot repair the evidence it is waiting to consume.
+  // Reject this control transition before resetting the retry budget; otherwise
+  // a repeated handoff can either deadlock both sides or retry without a limit.
+  if (control.status === "handoff" && inputArtifactsVerified(kernel, currentTask) &&
+      !taskOutputsVerified(kernel, currentTask) && handoffTargetsDownstream(kernel, currentTask, control.handoffAgentIds)) {
+    const artifacts = kernel.listArtifacts();
+    const missing = currentTask.outputArtifacts.filter((id) => !artifactReadyForTaskCompletion(kernel, id));
+    const labels = (missing.length ? missing : currentTask.outputArtifacts).map((id) => {
+      const artifact = artifacts.find((entry) => entry.artifactId === id);
+      return `${id} (${artifact?.path ?? "未登记路径"}; ${artifact?.status ?? "missing"})`;
+    });
+    const feedback = `交接未成立：下游仍依赖本任务的未验证输出 ${labels.join("、")}。请用工具补齐或重新提交这些输出；聊天结论、清单 status 和交接声明不能替代实际证据。`;
+    // lastError is cleared when a worker starts. Persist bounded feedback in the
+    // task context so the next invocation actually sees what it must repair.
+    kernel.updateTask(task.taskId, { description: `${currentTask.description.replace(handoffFeedbackPattern, "")}\n[HANDOFF_EVIDENCE_REPAIR]\n${feedback}\n[/HANDOFF_EVIDENCE_REPAIR]` });
+    retryTransientFailure(kernel, currentTask, message, failureCounts, feedback);
     return;
   }
   failureCounts.delete(task.taskId);
@@ -701,6 +722,29 @@ function retryTransientFailure(
   });
 }
 
+function handoffTargetsDownstream(kernel: StudioKernel, task: Task, recipients: AgentId[]): boolean {
+  const stages = taskExecutionStages(kernel);
+  const tasks = kernel.listTasks().filter((candidate) => candidate.taskId !== task.taskId &&
+    stages.has(candidate.stageId) && candidate.taskLevel !== "task_group" && candidate.status !== "cancelled");
+  // Preserve legitimate requests to upstream authors (including mixed handoffs).
+  if (tasks.some((candidate) => recipients.includes(candidate.ownerAgentId) &&
+      candidate.outputArtifacts.some((id) => task.inputArtifacts.includes(id)))) return false;
+  const outputs = new Set(task.outputArtifacts);
+  const visited = new Set<TaskId>();
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const candidate of tasks) {
+      if (visited.has(candidate.taskId) || !candidate.inputArtifacts.some((id) => outputs.has(id))) continue;
+      if (recipients.includes(candidate.ownerAgentId)) return true;
+      visited.add(candidate.taskId);
+      candidate.outputArtifacts.forEach((id) => outputs.add(id));
+      changed = true;
+    }
+  }
+  return false;
+}
+
 function settleWithoutRunnableTasks(kernel: StudioKernel): void {
   const executionStages = taskExecutionStages(kernel);
   const stageTasks = kernel
@@ -709,18 +753,21 @@ function settleWithoutRunnableTasks(kernel: StudioKernel): void {
   const blocked = stageTasks.filter((task) => task.status === "blocked");
   const review = stageTasks.filter((task) => task.status === "review");
   const pendingDependencies = stageTasks.filter((task) => ["todo", "doing"].includes(task.status));
-  const waitingForProducer = blocked.some((task) => task.blockers.some((blocker) => blocker.includes("等待制作人"))) || review.length > 0;
+  const workBlocked = blocked.filter((task) => !task.blockers.length || task.blockers.some((blocker) =>
+    !blocker.startsWith(`${loopBlockerPrefix}等待制作人`) && !/^等待制作人/.test(blocker)));
+  const waitingForProducer = workBlocked.length === 0 &&
+    (blocked.length > 0 || (review.length > 0 && pendingDependencies.length === 0));
   const reason = waitingForProducer
     ? review.length > 0
       ? `${review.length} 个任务已进入评审，阶段保持开放，等待制作人继续讨论或发起门禁评审。`
       : blocked.flatMap((task) => task.blockers).join("；")
     : blocked.length > 0
-      ? blocked.flatMap((task) => task.blockers).join("；")
+      ? workBlocked.flatMap((task) => task.blockers).join("；") || "存在尚未解决的任务阻塞。"
       : pendingDependencies.length > 0
         ? "剩余任务正在等待已验证的上游产物。"
         : "当前阶段没有可自动执行的角色任务，等待制作人下一步指令。";
   kernel.updateAgentLoop({
-    status: waitingForProducer || blocked.length === 0 ? "waiting_for_producer" : "blocked",
+    status: waitingForProducer || (blocked.length === 0 && pendingDependencies.length === 0) ? "waiting_for_producer" : "blocked",
     activeAgentIds: [],
     pendingTaskIds: pendingDependencies.map((task) => task.taskId),
     waitingReason: reason,

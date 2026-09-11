@@ -83,3 +83,19 @@ Tidewatch has a runnable build or that its gameplay has passed QA.
 Additional regression commands: `verify-qa-playtest-gate.mjs`,
 `verify-harness-mcp-authorization.mjs`, and `verify-vision-semantic-binding.mjs`
 under `scripts/` (after `npm run build`).
+
+## Evidence-aware handoff
+
+An author could declare a downstream handoff with a contact sheet still marked
+`change_requested`. The author stopped, while the recipient could not consume its
+input. The loop now walks the active artifact dependency graph (including indirect
+consumers), rejects incomplete downstream handoffs, and returns exact output IDs,
+paths and statuses to the original task. Feedback replaces a bounded task-context
+section, because transient agent `lastError` is cleared when the next worker starts.
+Three failed attempts stop; successful submission removes the repair section.
+Upstream/producer requests, explicit blockers and invalid upstream inputs retain
+their existing handling. No files or review verdicts are fabricated by recovery.
+
+When work is blocked, unrelated completed reviews no longer turn the whole loop
+into “waiting for producer”. The UI receives the actual unresolved work reason.
+Regression: `node scripts/verify-handoff-evidence.mjs` after `npm run build`.
