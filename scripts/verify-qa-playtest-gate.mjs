@@ -47,6 +47,18 @@ kernel.addTask({
   updatedAt: now
 });
 
+// A closed claim repair has no production outputs. Treating every QA-owned
+// task as a playtest reopens it on every checkpoint and creates a wakeup storm.
+for (const id of ["task_claim_repair_closed", "task_contract_authoring", "task_implementation_review"]) {
+  kernel.addTask({ ...kernel.findTask(taskId), taskId: id, title: id, status: "done", outputArtifacts: [] });
+}
+for (let attempt = 0; attempt < 4; attempt++) {
+  assert.deepEqual(reconcileQaPlaytestResults(kernel).queuedAgentIds, [], "non-playtest QA work must not wake the loop");
+  assert.equal(kernel.findTask("task_claim_repair_closed").status, "done");
+  assert.equal(kernel.findTask("task_contract_authoring").status, "done");
+  assert.equal(kernel.findTask("task_implementation_review").status, "done");
+}
+
 const evidencePaths = [
   "agents/qa/playtest-runs/smoke/01-initial.png",
   "agents/qa/playtest-runs/smoke/02-playing.png",

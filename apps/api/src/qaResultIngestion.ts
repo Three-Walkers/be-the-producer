@@ -12,12 +12,25 @@ export interface QaResultIngestionOutcome {
   queuedAgentIds: AgentId[];
 }
 
+const stalePlaytestError = "上一轮 QA 评审缺少有效 run_playtest 收据或当前文件 hash 不一致，已强制重新试玩。";
+
+function isPlaytestExecutionTask(kernel: StudioKernel, task: Task): boolean {
+  return task.ownerAgentId === "qa_evaluator" && task.taskLevel !== "task_group" && task.outputArtifacts.some((id) =>
+    kernel.listArtifacts().some((artifact) => artifact.artifactId === id && artifact.type === "qa_report" &&
+      artifact.ownerAgentId === task.ownerAgentId && artifact.sourceTaskId === task.taskId));
+}
+
 export function reconcileQaPlaytestResults(kernel: StudioKernel): QaResultIngestionOutcome {
   const projectRoot = resolveProjectWorkspaceRoot(kernel.project.projectId);
   const processedOperationIds: string[] = [];
   const failedOperationIds: string[] = [];
   const queuedAgentIds = new Set<AgentId>();
   const executionStages = new Set(workflowTaskStages(kernel.project.currentStage));
+  const oldState = kernel.getAgentLoopState().agents.qa_evaluator;
+  const oldTask = oldState?.taskId ? kernel.findTask(oldState.taskId) : undefined;
+  if (oldState?.lastError === stalePlaytestError && oldTask && !isPlaytestExecutionTask(kernel, oldTask) && oldTask.status === "done") {
+    kernel.updateAgentLoopAgent("qa_evaluator", { status: "waiting", lastError: undefined, updatedAt: new Date().toISOString() });
+  }
 
   for (const receipt of readVerifiedQaPlaytestReceipts(projectRoot)) {
     if (wasReceiptProcessed(kernel, receipt.operationId)) {
@@ -66,7 +79,7 @@ export function reconcileQaPlaytestResults(kernel: StudioKernel): QaResultIngest
 
   resumeQaTasksAfterVerifiedRepairs(kernel);
   for (const task of kernel.listTasks().filter((candidate) =>
-    candidate.ownerAgentId === "qa_evaluator" &&
+    isPlaytestExecutionTask(kernel, candidate) &&
     executionStages.has(candidate.stageId) &&
     ["review", "done"].includes(candidate.status)
   )) {
@@ -89,13 +102,13 @@ export function reconcileQaPlaytestResults(kernel: StudioKernel): QaResultIngest
     kernel.updateAgentLoopAgent(task.ownerAgentId, {
       status: "queued",
       taskId: task.taskId,
-      lastError: "上一轮 QA 评审缺少有效 run_playtest 收据或当前文件 hash 不一致，已强制重新试玩。",
+      lastError: stalePlaytestError,
       updatedAt: now
     });
     queuedAgentIds.add(task.ownerAgentId);
   }
   for (const task of kernel.listTasks().filter((candidate) =>
-    candidate.ownerAgentId === "qa_evaluator" &&
+    isPlaytestExecutionTask(kernel, candidate) &&
     executionStages.has(candidate.stageId) &&
     ["todo", "doing"].includes(candidate.status)
   )) {
@@ -127,16 +140,15 @@ function receiptInputsMatchCurrentTask(kernel: StudioKernel, task: Task, receipt
 }
 
 function findQaTask(kernel: StudioKernel, receipt: QaPlaytestReceipt): Task | undefined {
+  const executionStages = new Set(workflowTaskStages(kernel.project.currentStage));
+  const eligible = (task: Task) => isPlaytestExecutionTask(kernel, task) && executionStages.has(task.stageId) && task.status !== "cancelled";
   const reportArtifact = kernel.listArtifacts().find((artifact) => artifact.path === receipt.reportPath && artifact.ownerAgentId === "qa_evaluator");
   if (reportArtifact?.sourceTaskId) {
     const task = kernel.findTask(reportArtifact.sourceTaskId);
-    if (task) return task;
+    if (task && eligible(task)) return task;
   }
-  const executionStages = new Set(workflowTaskStages(kernel.project.currentStage));
   return kernel.listTasks().find((task) =>
-    task.ownerAgentId === "qa_evaluator" &&
-    executionStages.has(task.stageId) &&
-    task.taskLevel !== "task_group" &&
+    eligible(task) &&
     task.outputArtifacts.some((artifactId) => kernel.listArtifacts().some((artifact) => artifact.artifactId === artifactId && artifact.path === receipt.reportPath))
   );
 }
