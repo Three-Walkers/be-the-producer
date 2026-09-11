@@ -37,6 +37,20 @@ the 60-second step, 300-second scenario and 100-iteration limits remain enforced
 including the runner's hard watchdog. QA authors no longer need unrealistically
 short waits to pass an erroneously inflated budget calculation.
 
+## Repair rejected contract drafts without rewriting the whole document
+
+QA repeatedly retyped a large contract to repair one timeout or typo, introducing
+new missing fields in subsequent attempts. Contract authors (design, technical
+lead and QA) can now use `edit_artifact` with `source=last_rejected` and the
+`rejectedDraftHash` returned by a failed submission. At most four 5 MB candidates
+are held in the current invocation's memory, never in project files or the ledger.
+Exact unique patches rerun all ordinary authorization, schema, upstream and
+revision checks before publication. Published-file changes require a rebase;
+successful publication clears the candidate. Drafts cannot cross paths/tasks or
+survive a new invocation. QA machine reports remain protected. Failed patches
+are recorded as failed artifact writes, and only a valid subsequent publication
+can supersede that failure. Regression: `verify-contract-artifact-gates.mjs`.
+
 ## Failure observed in Tidewatch
 
 The visual reviewer reported a passing score while a runtime PNG declared

@@ -53,6 +53,9 @@ const controlPath = process.env.BTP_CONTROL_PATH?.trim();
 const operationLogPath = process.env.BTP_OPERATION_LOG_PATH?.trim();
 const visionInspectionReceipts: VisionSemanticInspectionReceipt[] = [];
 let lastImplementationCheck: ImplementationCheckResult | undefined;
+// Invocation-local editing buffers only. Rejected drafts never touch project
+// files or create successful operations/ledger evidence; keep memory bounded.
+const rejectedContractDrafts = new Map<string, { content: string; hash: string; baseHash: string | null }>();
 const reader = createInterface({ input: process.stdin, terminal: false });
 
 reader.on("line", (line) => {
@@ -114,7 +117,7 @@ function recordFailedWorkspaceWrite(request: JsonRpcRequest, error: unknown): vo
     return;
   }
   const name = typeof request.params?.name === "string" ? request.params.name : "";
-  if (!["write_artifact", "append_document", "generate_raster_asset", "compose_asset_contact_sheet", "resubmit_existing_asset", "inspect_visual_assets"].includes(name)) {
+  if (!["write_artifact", "edit_artifact", "append_document", "generate_raster_asset", "compose_asset_contact_sheet", "resubmit_existing_asset", "inspect_visual_assets"].includes(name)) {
     return;
   }
   const args = isRecord(request.params?.arguments) ? request.params.arguments : {};
@@ -133,11 +136,11 @@ function recordFailedWorkspaceWrite(request: JsonRpcRequest, error: unknown): vo
     return;
   }
   recordOperation({
-    toolName: name,
+    toolName: name === "edit_artifact" ? "write_artifact" : name,
     path,
     access: name === "inspect_visual_assets" ? "read" : "write",
     status: "failed",
-    error: error instanceof Error ? error.message : String(error)
+    error: `${name === "edit_artifact" ? "edit_artifact: " : ""}${error instanceof Error ? error.message : String(error)}`
   });
 }
 
@@ -234,10 +237,10 @@ function toolDefinitions(): Array<Record<string, unknown>> {
       }
     }
   ];
-  if (["cocos_tech_lead", "gameplay_programmer", "asset_production"].includes(agentId)) {
+  if (["game_designer", "qa_evaluator", "cocos_tech_lead", "gameplay_programmer", "asset_production"].includes(agentId)) {
     tools.push({name: "edit_artifact", title: "Patch an authorized text artifact atomically",
-      description: "Use read_file's full-file hash and exact unique excerpts to patch an existing output without rewriting it. Edits are applied together, then all ordinary write_artifact schema/revision/provenance checks run. Include the required contract revision increment in the same edit list. No intermediate invalid content is saved.",
-      inputSchema: {type: "object", properties: {path: {type: "string"}, expectedHash: {type: "string"}, edits: {type: "array", minItems: 1, maxItems: 40,
+      description: "Patch an authorized output using read_file's hash, or source=last_rejected with the rejectedDraftHash returned by a failed contract submission in this invocation. Exact edits are validated through ordinary write_artifact schema/revision/provenance checks. No invalid draft is published. Include the required contract revision increment. Read/modify only your own task output, never QA execution evidence.",
+      inputSchema: {type: "object", properties: {path: {type: "string"}, expectedHash: {type: "string"}, source: {type: "string", enum: ["file", "last_rejected"]}, edits: {type: "array", minItems: 1, maxItems: 40,
         items: {type: "object", properties: {oldText: {type: "string", minLength: 1}, newText: {type: "string"}}, required: ["oldText", "newText"], additionalProperties: false}}},
         required: ["path", "expectedHash", "edits"], additionalProperties: false}});
   }
@@ -464,7 +467,11 @@ async function callTool(params: Record<string, unknown> | undefined): Promise<Re
   if (name === "edit_artifact") {
     const target = resolveAuthorizedTarget(requiredString(args.path, "path"), false, "artifact_write");
     if (!/\.(?:json|md|ts|tsx)$/.test(target.relativePath)) throw new Error("edit_artifact only supports authorized UTF-8 JSON/Markdown/TypeScript outputs.");
-    const bytes = readFileSync(target.absolutePath);
+    if (args.source !== undefined && !["file", "last_rejected"].includes(String(args.source))) throw new Error("source must be file or last_rejected.");
+    const draft = args.source === "last_rejected" ? rejectedContractDrafts.get(target.relativePath) : undefined;
+    if (args.source === "last_rejected" && !draft) throw new Error("No rejected contract draft exists for this path in this invocation. Read the current file or submit a complete candidate.");
+    if (draft && draft.baseHash !== currentFileHash(target.absolutePath)) throw new Error("Published artifact changed after draft rejection; reread and rebase the candidate before editing.");
+    const bytes = draft ? Buffer.from(draft.content, "utf8") : readFileSync(target.absolutePath);
     if (createHash("sha256").update(bytes).digest("hex") !== requiredString(args.expectedHash, "expectedHash")) throw new Error("Artifact changed since read_file; reread before editing.");
     if (!Array.isArray(args.edits) || args.edits.length < 1 || args.edits.length > 40) throw new Error("Provide 1–40 exact edits.");
     let content = bytes.toString("utf8");
@@ -582,26 +589,39 @@ async function callTool(params: Record<string, unknown> | undefined): Promise<Re
       content = stamped.content;
     }
     assertQaEvidenceWriteAllowed(target.relativePath, name);
-    assertContractPathContent(target.relativePath, content, name === "append_document" ? "append" : "write");
     const contractType = contractArtifactTypeForPath(target.relativePath);
-    if (name === "write_artifact" && (contractType === "scene_blueprint" || contractType === "playtest_contract")) {
-      const readInput = (type: string) => {
-        const input = taskInputArtifacts().find((artifact) => artifact.type === type);
-        if (!input) throw new Error(`${contractType} requires task-bound ${type} input`);
-        const source = resolveAuthorizedTarget(input.path, false, "read");
-        return JSON.parse(readFileSync(source.absolutePath, "utf8"));
-      };
-      const game = parseGameContract(readInput("game_contract"));
-      const compatibility = contractType === "scene_blueprint"
-        ? validateSceneBlueprintCompatibility(parseSceneBlueprint(JSON.parse(content)), game)
-        : validatePlaytestContractCompatibility(parsePlaytestContract(JSON.parse(content)), game, parseSceneBlueprint(readInput("scene_blueprint")));
-      if (!compatibility.ok) throw new ContractValidationError(`${contractType} upstream compatibility`, compatibility.issues);
-    }
-    if (contractType && name === "write_artifact") {
-      const previousContent = existsSync(target.absolutePath) && statSync(target.absolutePath).isFile()
-        ? readFileSync(target.absolutePath, "utf8")
-        : undefined;
-      assertContractRevisionAdvance(contractType, previousContent, content);
+    try {
+      assertContractPathContent(target.relativePath, content, name === "append_document" ? "append" : "write");
+      if (name === "write_artifact" && (contractType === "scene_blueprint" || contractType === "playtest_contract")) {
+        const readInput = (type: string) => {
+          const input = taskInputArtifacts().find((artifact) => artifact.type === type);
+          if (!input) throw new Error(`${contractType} requires task-bound ${type} input`);
+          const source = resolveAuthorizedTarget(input.path, false, "read");
+          return JSON.parse(readFileSync(source.absolutePath, "utf8"));
+        };
+        const game = parseGameContract(readInput("game_contract"));
+        const compatibility = contractType === "scene_blueprint"
+          ? validateSceneBlueprintCompatibility(parseSceneBlueprint(JSON.parse(content)), game)
+          : validatePlaytestContractCompatibility(parsePlaytestContract(JSON.parse(content)), game, parseSceneBlueprint(readInput("scene_blueprint")));
+        if (!compatibility.ok) throw new ContractValidationError(`${contractType} upstream compatibility`, compatibility.issues);
+      }
+      if (contractType && name === "write_artifact") {
+        const previousContent = existsSync(target.absolutePath) && statSync(target.absolutePath).isFile()
+          ? readFileSync(target.absolutePath, "utf8")
+          : undefined;
+        assertContractRevisionAdvance(contractType, previousContent, content);
+      }
+    } catch (error) {
+      if (name === "write_artifact" && contractType && outputArtifact &&
+          ["game_contract", "scene_blueprint", "playtest_contract"].includes(contractType) &&
+          ["game_designer", "cocos_tech_lead", "qa_evaluator"].includes(agentId)) {
+        const hash = createHash("sha256").update(content).digest("hex");
+        rejectedContractDrafts.delete(target.relativePath);
+        rejectedContractDrafts.set(target.relativePath, { content, hash, baseHash: currentFileHash(target.absolutePath) });
+        if (rejectedContractDrafts.size > 4) rejectedContractDrafts.delete(rejectedContractDrafts.keys().next().value!);
+        throw new Error(`${error instanceof Error ? error.message : String(error)}\nRejected draft retained in memory only, NOT submitted. rejectedDraftHash=${hash}. Repair just the invalid excerpts with edit_artifact({path,source:"last_rejected",expectedHash:"${hash}",edits:[{oldText,newText}]}). All schema, upstream and revision checks will run again; the current published file is unchanged.`);
+      }
+      throw error;
     }
     mkdirSync(dirname(target.absolutePath), { recursive: true });
     target = resolveAuthorizedTarget(path, false, "artifact_write");
@@ -611,6 +631,7 @@ async function callTool(params: Record<string, unknown> | undefined): Promise<Re
     } else {
       writeFileSync(target.absolutePath, content.endsWith("\n") ? content : `${content}\n`, "utf8");
     }
+    rejectedContractDrafts.delete(target.relativePath);
     const stats = statSync(target.absolutePath);
     const hash = createHash("sha256").update(readFileSync(target.absolutePath)).digest("hex");
     recordOperation({
@@ -1421,6 +1442,10 @@ function recordOperation(operation: import("./agentHarness.js").AgentHarnessTool
     `${JSON.stringify({ ...operation, recordedAt: new Date().toISOString() })}\n`,
     { encoding: "utf8", mode: 0o600 }
   );
+}
+
+function currentFileHash(path: string): string | null {
+  return existsSync(path) ? createHash("sha256").update(readFileSync(path)).digest("hex") : null;
 }
 
 function resolveAuthorizedTarget(

@@ -354,7 +354,7 @@ function claudeToolsForAgent(agent: AgentContract, mode: "conversation" | "task"
     tools.push("mcp__btp_workspace__run_implementation_checks");
   }
   if (agent.agentId === "gameplay_programmer") tools.push("mcp__btp_workspace__edit_code", "mcp__btp_workspace__resubmit_source");
-  if (["cocos_tech_lead", "gameplay_programmer", "asset_production"].includes(agent.agentId)) tools.push("mcp__btp_workspace__edit_artifact");
+  if (["game_designer", "qa_evaluator", "cocos_tech_lead", "gameplay_programmer", "asset_production"].includes(agent.agentId)) tools.push("mcp__btp_workspace__edit_artifact");
   if (agent.agentId === "cocos_automation") {
     tools.push(
       "mcp__btp_workspace__cocos_validate_project",
