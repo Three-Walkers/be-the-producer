@@ -7,6 +7,7 @@ import { artifactFilePath, hashWorkspaceFile, resolveProjectWorkspaceRoot } from
 import { selfCheckPath, implementationReviewPath, validateImplementationReview, applyImplementationReviewFeedback } from "./implementationReview.js";
 import { runImplementationChecks } from "./implementationChecks.js";
 import { cocosEngineSettingsStore } from "./cocosEngineSettings.js";
+import { verifyCocosBuildManifest } from "./cocosEngineBridge.js";
 import { parsePlaytestMarker } from "./playtestEvidence.js";
 import type { AgentHarnessToolOperation } from "./agentHarness.js";
 import { isQaHarnessManagedPath } from "./qaEvidenceProtection.js";
@@ -537,6 +538,7 @@ export function analyzeHarnessWorkspaceChanges(
     .filter((path) => !readOnlyOperationPaths.has(path) || before.get(path)?.hash !== after.get(path)?.hash)
     .filter((path) => !failedOnlyOperationPaths.has(path) || failedMutationPaths.includes(path));
   const deletedPaths = [...before.keys()].filter((path) => !after.has(path)).sort();
+  const replacementRoots = verifiedBuildReplacementRoots(kernel, task, after, invocationToolOperations ?? []);
   const protectedMutationPaths = changedPaths.filter((path) => {
     if (!isQaHarnessManagedPath(path)) return false;
     return invocationToolOperations
@@ -549,9 +551,31 @@ export function analyzeHarnessWorkspaceChanges(
     ...changedPaths.filter((path) => !isAllowedAgentPath(kernel, task, agent, path)).map((path) => `未授权写入：${path}`),
     ...protectedMutationPaths.map((path) => `受保护 QA 机器证据被非 run_playtest 工具修改：${path}`),
     ...failedMutationPaths.map((path) => `失败工具仍修改了工作区，拒绝物化：${path}`),
-    ...deletedPaths.map((path) => `删除：${path}`)
+    ...deletedPaths.filter((path) => !replacementRoots.some((root) => path.startsWith(`${root}/`)))
+      .map((path) => `删除：${path}`)
   ];
   return { changedPaths, deletedPaths, violations };
+}
+
+function verifiedBuildReplacementRoots(kernel: StudioKernel, task: Task, after: WorkspaceSnapshot, operations: AgentHarnessToolOperation[]): string[] {
+  if (task.ownerAgentId !== "cocos_automation") return [];
+  return kernel.listArtifacts().filter((artifact) => artifact.type === "build" &&
+    artifact.ownerAgentId === task.ownerAgentId && artifact.sourceTaskId === task.taskId && task.outputArtifacts.includes(artifact.artifactId))
+    .flatMap((artifact) => {
+      const path = artifactFilePath(artifact).replaceAll("\\", "/");
+      const file = after.get(path);
+      const operation = operations.filter((op) => op.path === path && op.toolName === "cocos_build").at(-1);
+      if (!file || !operation || operation.status !== "completed" || operation.bridgeOk !== true ||
+          operation.operationType !== "build" || operation.hash !== file.hash || operation.sizeBytes !== file.sizeBytes ||
+          !operation.directoryManifest || operation.directoryManifest.rootPath !== artifact.path) return [];
+      try {
+        const report = JSON.parse(readFileSync(file.absolutePath, "utf8"));
+        const root = file.absolutePath.slice(0, -file.path.length);
+        return report.status === "success" && report.operationId === operation.operationId && report.outputPath === artifact.path &&
+          report.outputManifest?.digest === operation.directoryManifest.digest && verifyCocosBuildManifest(root, operation.directoryManifest)
+          ? [artifact.path] : [];
+      } catch { return []; }
+    });
 }
 
 /** A failed build is not a successful output, but its server-written diagnostic

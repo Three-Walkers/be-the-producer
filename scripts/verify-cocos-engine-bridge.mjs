@@ -13,7 +13,7 @@ import {
 import { CocosEngineSettingsStore } from "../apps/api/dist/cocosEngineSettings.js";
 import { artifactReadyForConsumption, taskOutputsVerified } from "../apps/api/dist/taskOutputEvidence.js";
 import { createStudioKernel, defaultAgentContracts } from "../packages/agent-runtime/dist/index.js";
-import { captureWorkspaceSnapshot, recordHarnessWorkspaceChanges } from "../apps/api/dist/harnessWorkspaceEvidence.js";
+import { captureWorkspaceSnapshot, recordHarnessWorkspaceChanges, analyzeHarnessWorkspaceChanges } from "../apps/api/dist/harnessWorkspaceEvidence.js";
 import { reconcileCocosSupportingEvidence } from "../apps/api/dist/cocosSupportingEvidence.js";
 
 const root = mkdtempSync(join(tmpdir(), "btp-cocos-bridge-"));
@@ -573,13 +573,32 @@ assert.equal(artifactReadyForConsumption(provenanceKernel, "artifact_wechat_dev_
 const buildSnapshot = captureWorkspaceSnapshot(projectRoot);
 const buildPaths = [...buildSnapshot.keys()].filter((path) => path.startsWith("shared/build-artifacts/wechat/dev/"));
 const buildTask = provenanceKernel.findTask("task_stage_2_cocos_build");
+const buildOperations = build.evidence.map((item) => ({
+  toolName: "cocos_build", ...item, status: "completed", bridgeOk: true,
+  operationId: build.operationId, operationType: "build",
+  ...(item.path === build.reportPath ? { directoryManifest: report.outputManifest } : {})
+}));
+const previousBuild = new Map(buildSnapshot);
+const oldChunkPath = "shared/build-artifacts/wechat/dev/old-hash-chunk.js";
+previousBuild.set(oldChunkPath, { path: oldChunkPath, hash: "old", sizeBytes: 3 });
+const cocosAgent = defaultAgentContracts.find((agent) => agent.agentId === "cocos_automation");
+const replacement = analyzeHarnessWorkspaceChanges(provenanceKernel, buildTask, cocosAgent,
+  previousBuild, buildSnapshot, buildPaths, buildOperations);
+assert.deepEqual(replacement.deletedPaths, [oldChunkPath]);
+assert.deepEqual(replacement.violations, [], "a successful exact new build manifest authorizes replacing obsolete build files");
+for (const badOperations of [[], buildOperations.map(op => ({ ...op, bridgeOk: false })),
+  buildOperations.map(op => ({ ...op, hash: "0".repeat(64) }))]) {
+  assert.ok(analyzeHarnessWorkspaceChanges(provenanceKernel, buildTask, cocosAgent,
+    previousBuild, buildSnapshot, buildPaths, badOperations).violations.some(v => v.includes(oldChunkPath)));
+}
+const deletedSource = new Map(buildSnapshot);
+deletedSource.delete("assets/scripts/gameplay/GameController.ts");
+assert.ok(analyzeHarnessWorkspaceChanges(provenanceKernel, buildTask, cocosAgent,
+  buildSnapshot, deletedSource, buildPaths, buildOperations).violations.some(v => v.includes("assets/scripts/gameplay/GameController.ts")),
+  "successful build does not authorize source deletion");
 const harnessEvidence = recordHarnessWorkspaceChanges(provenanceKernel, buildTask,
   defaultAgentContracts.find((agent) => agent.agentId === "cocos_automation"), buildSnapshot, buildSnapshot,
-  "inv_build_directory", buildPaths, build.evidence.map((item) => ({
-    toolName: "cocos_build", ...item, status: "completed", bridgeOk: true,
-    operationId: build.operationId, operationType: "build",
-    ...(item.path === build.reportPath ? { directoryManifest: report.outputManifest } : {})
-  })));
+  "inv_build_directory", buildPaths, buildOperations);
 assert.deepEqual(harnessEvidence.violations, []);
 assert.deepEqual(harnessEvidence.artifactIds, ["artifact_wechat_dev_build"]);
 assert.equal(artifactReadyForConsumption(provenanceKernel, "artifact_wechat_dev_build"), true,

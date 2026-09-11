@@ -654,7 +654,7 @@ function commitHarnessWorkspaceTransaction(
         return artifact?.type === "qa_report" ? [artifact.path] : [];
       }), result.toolOperations ?? [])
     : [];
-  const transaction = stageWorkspaceCommit(projectRoot, stagingRoot, [...analysis.changedPaths, ...serviceReceiptPaths]);
+  const transaction = stageWorkspaceCommit(projectRoot, stagingRoot, [...analysis.changedPaths, ...serviceReceiptPaths], analysis.deletedPaths);
   try {
     const evidence = recordHarnessWorkspaceChanges(
       kernel,

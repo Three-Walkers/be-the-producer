@@ -162,3 +162,13 @@ deliverables of the build task. A narrow migration removes these bridge-managed
 paths from its required output list without deleting files/history or approving old
 statuses. Workspace synchronization preserves that distinction. The canonical
 build remains mandatory. Regression coverage is in `verify-cocos-engine-bridge.mjs`.
+
+Normal native rebuilds replace old hashed chunks. The guard now allows deletion
+only inside the current task's registered build directory when a successful,
+byte-bound `cocos_build` report and its full new directory manifest validate.
+Failed/missing/tampered receipts never authorize replacement, nor does a successful
+build authorize any source/asset deletion. The workspace transaction backs up each
+obsolete build file before removing it and restores deletions along with writes if
+publication fails. Original authored assets and code are unaffected. This is build
+replacement, not a general agent delete capability or permanent version archive.
+Tests: `verify-cocos-engine-bridge.mjs` and `verify-workspace-isolation.mjs`.
