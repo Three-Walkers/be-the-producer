@@ -157,6 +157,9 @@ assert.equal(reviewRequest.enable_thinking, false);
 assert.equal(reviewRequest.messages[1].content[1].type, "image_url");
 assert.equal(reviewRequest.messages[1].content[1].image_url.url, PNG_DATA_URL);
 assert.match(reviewRequest.messages[0].content, /server-owned project context and rubric/i);
+assert.match(reviewRequest.messages[0].content, /Do not invent numerical margins/);
+assert.match(reviewRequest.messages[0].content, /identify the applicable baseline section/);
+assert.match(reviewRequest.messages[0].content, /does not waive existing rubric thresholds/);
 assert.ok(
   reviewRequest.messages[0].content.includes(AUTHORITATIVE_CONTEXT.prompt),
   "conflicting caller focus cannot replace the server-owned Art Bible context"

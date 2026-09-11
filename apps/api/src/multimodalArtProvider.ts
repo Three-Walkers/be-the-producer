@@ -866,6 +866,8 @@ function buildVisionSemanticContractPrompt(rubric: ArtVisionRubric, imagePaths: 
     "Every criterion requires at least one finding grounded in a supplied image path using path#pixel:<specific region>.",
     "Images may arrive in multiple batches. For this batch judge the supplied pixels; absence from this batch alone is NOT evidence an asset is missing. Use the authoritative complete manifest to assess coverage. Do not invent unseen UI layouts or claim runtime interaction was tested from standalone sprites.",
     "A pass criterion may contain only minor/note findings. Any critical/major observation forbids a pass verdict.",
+    "Use note for positive observations, normal antialiasing/translucency, and unproven runtime risks. Minor improvement suggestions alone need not fail a criterion. Reserve major/critical for an observed usability, safety or approved-baseline violation; identify the applicable baseline section and concrete visible impact in summary.",
+    "Do not invent numerical margins, padding percentages, hard-edge rules or new aesthetic requirements absent from the authoritative baseline. New preferences are proposals, not acceptance gates. Never claim runtime blending, flicker or interaction failure from a static image without observable evidence; explicitly defer those hypotheses to real runtime QA. This does not waive existing rubric thresholds or genuine defects.",
     "scoreTotal must be the weighted score. verdict must be blocked if any criterion is blocked; otherwise change_requested when any criterion requests changes, any critical/major finding exists, or the threshold is missed; otherwise pass.",
     `Supplied image paths: ${JSON.stringify(imagePaths)}`,
     JSON.stringify(responseShape, null, 2)
