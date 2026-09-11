@@ -1025,16 +1025,13 @@ function writeArtifactFile(
         }
         return;
       }
-      // A native file is evidence only when an authorized Harness operation
-      // stamped the current artifact version. Evidence reconciliation clears
-      // this timestamp after external mutation; workspace sync must not bless
-      // the remaining bytes again without a fresh Agent tool operation.
-      if (!artifact.metadata.toolExecutedAt) {
-        return;
-      }
-      recordArtifactFileEvidence(projectRoot, kernel, artifact, targetPath);
-      return;
     }
+    // Native tools publish bytes AND their input-bound ledger atomically.
+    // A later checkpoint is not another tool execution: never rehash external
+    // edits, recapture historical provenance, resurrect pending receipts, or
+    // regenerate a missing native file from cached toolContent. In particular,
+    // invalidating an upstream contract must not crash sync of old build logs.
+    return;
   }
 
   if (toolContent !== undefined) {

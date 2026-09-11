@@ -20,6 +20,16 @@ an impossible test. Existing files are not silently rewritten.
 Regression: `verify-qa-playtest-gate.mjs`, `verify-game-contracts.mjs`,
 `verify-playtest-contract-runner.mjs` after `npm run build`.
 
+Native artifact publication is now excluded from workspace sync entirely. The
+same historical-provenance crash observed for QA receipts also affected imported
+asset logs and generated build support files when stricter contract validation
+invalidated an upstream input at restart. Only the authorized tool publication
+transaction may materialize native evidence. A checkpoint cannot bless changed
+bytes, revive a pending version, or recreate a missing native file from cached
+content. Historical receipts retain their original inputs; readiness checks and
+reconciliation still reject missing, altered and invalidated outputs.
+Regression: `verify-store-evidence-reconciliation.mjs`.
+
 ## Failure observed in Tidewatch
 
 The visual reviewer reported a passing score while a runtime PNG declared

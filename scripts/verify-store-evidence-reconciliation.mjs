@@ -24,6 +24,7 @@ const { syncProjectWorkspace } = await import("../apps/api/dist/workspaceWriter.
 
 try {
   verifyUntouchedReviewOutputStaysInReview();
+  verifyNativeSyncCannotPublishEvidence();
   verifyTamperedReviewOutputReopens();
   verifyMissingReviewOutputReopens();
   verifyPastStageTaskDoesNotReopen();
@@ -65,8 +66,8 @@ function verifyTamperedReviewOutputReopens() {
   syncProjectWorkspace(kernel);
   assert.equal(
     artifactReadyForConsumption(kernel, artifactId),
-    true,
-    "workspace sync currently re-hashes native files, so the frozen pre-sync receipt is required"
+    false,
+    "workspace sync must not bless externally changed native bytes, even before reconciliation"
   );
 
   const result = reconcileCurrentStageReviewOutputEvidence(kernel, baseline, "2026-08-15T10:00:00.000Z");
@@ -79,6 +80,24 @@ function verifyTamperedReviewOutputReopens() {
     undefined
   );
   assert.equal(artifactReadyForConsumption(kernel, artifactId), false);
+}
+
+function verifyNativeSyncCannotPublishEvidence() {
+  const kernel = createStudioKernel("native_sync_history", "Native receipt history", "producer_test", "immutable evidence");
+  const taskId = "native_history_task", artifactId = "native_history_artifact", path = "agents/design/native-history.md";
+  addReviewTask(kernel, { taskId, artifactId, stageId: kernel.project.currentStage });
+  materializeNativeArtifact(kernel, { taskId, artifactId, path, content: "historical-v1\n" });
+  const before = JSON.stringify(kernel.listArtifactLedger().find((item) => item.artifactId === artifactId));
+  kernel.updateTask(taskId, { inputArtifacts: ["upstream_contract_now_invalid"] });
+  assert.doesNotThrow(() => syncProjectWorkspace(kernel), "historical native receipts never recapture invalid current inputs during a checkpoint");
+  assert.equal(JSON.stringify(kernel.listArtifactLedger().find((item) => item.artifactId === artifactId)), before);
+  const artifact = kernel.listArtifacts().find((item) => item.artifactId === artifactId);
+  kernel.upsertArtifact({ ...artifact, version: artifact.version + 1 });
+  assert.doesNotThrow(() => syncProjectWorkspace(kernel));
+  assert.equal(kernel.listArtifactLedger().find((item) => item.artifactId === artifactId).status, "pending", "timestamp plus old bytes cannot publish a new version");
+  unlinkSync(workspacePath(kernel.project.projectId, path));
+  assert.doesNotThrow(() => syncProjectWorkspace(kernel), "missing native outputs cannot be regenerated as registry placeholders");
+  assert.equal(kernel.listArtifactLedger().find((item) => item.artifactId === artifactId).status, "pending");
 }
 
 function verifyMissingReviewOutputReopens() {
