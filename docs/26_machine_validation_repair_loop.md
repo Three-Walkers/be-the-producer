@@ -24,6 +24,12 @@ terminal transition; both incorrectly passed before the fix. The report's
 interface-discovery check is labeled as scene/API loading, not game playability.
 Regression: `verify-playtest-contract-runner.mjs`, `verify-qa-launch-diagnostics.mjs`.
 
+Snapshot reads now share the same absolute step deadline as actions and assertion
+polling. Previously a slow snapshot could spend the longer scenario budget and
+still pass an expired step. A timeout or malformed pre-action read becomes an
+explicit failed step using the last observed snapshot, not an invented state or
+a mislabeled handshake failure. Late promise results cannot append evidence.
+
 ## Reopened QA recovery and test-authoring preflight
 
 A producer change can put a previously failed QA task back in `doing` while
