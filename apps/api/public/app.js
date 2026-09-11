@@ -360,8 +360,12 @@ $("#refresh-project-dashboard").addEventListener("click", async () => {
 
 document.querySelectorAll("[data-dashboard-target]").forEach((button) => {
   button.addEventListener("click", () => {
-    document.getElementById(button.dataset.dashboardTarget)?.scrollIntoView({ behavior: reducedMotion() ? "auto" : "smooth", block: "start" });
+    focusDashboardSection(button.dataset.dashboardTarget);
   });
+});
+
+document.querySelectorAll("[data-open-dashboard-target]").forEach((button) => {
+  button.addEventListener("click", () => openDashboardSection(button.dataset.openDashboardTarget));
 });
 
 document.querySelectorAll("[data-dashboard-task-filter]").forEach((button) => {
@@ -381,6 +385,25 @@ function openProjectDashboard() {
   }
   history.pushState({ ...(history.state ?? {}), btpView: "project-dashboard" }, "", "#project-dashboard");
   syncProjectDashboardRoute();
+}
+
+function openDashboardSection(targetId) {
+  if (!state.projectId) {
+    showToast("请先创建或打开一个项目。");
+    return;
+  }
+  if (location.hash !== "#project-dashboard") {
+    history.pushState({ ...(history.state ?? {}), btpView: "project-dashboard" }, "", "#project-dashboard");
+    syncProjectDashboardRoute();
+  }
+  requestAnimationFrame(() => requestAnimationFrame(() => focusDashboardSection(targetId)));
+}
+
+function focusDashboardSection(targetId) {
+  const target = document.getElementById(targetId);
+  if (!target) return;
+  target.scrollIntoView({ behavior: reducedMotion() ? "auto" : "smooth", block: "start" });
+  target.focus({ preventScroll: true });
 }
 
 function closeProjectDashboard() {
@@ -1925,6 +1948,9 @@ function renderProjectOverview() {
         : "启动项目后由 Agents 拆解任务"
       : "创建或选择项目后查看推进重点";
   $("#open-project-dashboard").disabled = !state.project;
+  document.querySelectorAll("[data-open-dashboard-target]").forEach((button) => {
+    button.disabled = !state.project;
+  });
 }
 
 function renderProjectDashboardSummary() {
@@ -2901,6 +2927,7 @@ async function previewArtifact(artifactId) {
   }
 
   const preview = await request(`/projects/${state.projectId}/artifacts/${encodeURIComponent(artifactId)}/preview`);
+  if (!artifactPreviewDialog.open || activePreviewArtifactId !== artifactId) return;
   renderArtifactPreview(preview);
 }
 
@@ -2915,6 +2942,22 @@ function renderArtifactPreview(preview) {
       <strong>暂不支持内嵌预览</strong>
       <span>${escapeHtml(preview.reason ?? "该交付物需要在本地应用中查看。")}</span>
     </div>`;
+    return;
+  }
+
+  if (preview.image && /^data:image\/png;base64,[A-Za-z0-9+/=]+$/.test(preview.image.dataUrl)) {
+    $("#artifact-preview-body").innerHTML = `<div class="artifact-image-toolbar">
+      <span>${preview.image.width} × ${preview.image.height} · ${(preview.image.sizeBytes / 1024 / 1024).toFixed(2)} MB · PNG</span>
+      <button type="button" id="artifact-image-size" aria-pressed="false">原始尺寸</button>
+    </div><figure class="artifact-image-canvas">
+      <img src="${preview.image.dataUrl}" width="${preview.image.width}" height="${preview.image.height}" alt="${escapeHtml(deliverableName(artifact))} · ${escapeHtml(preview.target?.relativePath ?? artifact.path)}" decoding="async">
+    </figure>`;
+    $("#artifact-image-size").addEventListener("click", (event) => {
+      const original = event.currentTarget.getAttribute("aria-pressed") !== "true";
+      event.currentTarget.setAttribute("aria-pressed", String(original));
+      event.currentTarget.textContent = original ? "适应窗口" : "原始尺寸";
+      $("#artifact-preview-body .artifact-image-canvas").classList.toggle("original-size", original);
+    });
     return;
   }
 

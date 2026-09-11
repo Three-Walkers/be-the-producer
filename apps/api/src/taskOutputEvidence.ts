@@ -17,7 +17,8 @@ import {
   qualityReviewReadyForGate
 } from "./qualityReviewArtifacts.js";
 import { validateManifestRuntimeAssetAlphaPolicies } from "./imageAssetValidation.js";
-import { hasCurrentGenerateRasterAssetReceipt } from "./mediaArtifactEvidence.js";
+import { hasCurrentGenerateRasterAssetReceipt, hasCurrentComposedContactSheetReceipt } from "./mediaArtifactEvidence.js";
+import { selfCheckPath, implementationReviewPath, implementationReviewTaskId, currentImplementationReport } from "./implementationReview.js";
 
 const requiredLegacyPlaytestChecks = [
   "launch",
@@ -89,12 +90,22 @@ export function taskOutputsVerified(kernel: StudioKernel, task: Task): boolean {
   }
   const artifacts = kernel.listArtifacts();
   const ledger = kernel.listArtifactLedger();
+  // Completing an independent review is not the same as approving its subject.
+  // A grounded rejection completes reviewer work and triggers author repairs.
+  if (task.taskId === implementationReviewTaskId) {
+    const report = artifacts.find((artifact) => task.outputArtifacts.includes(artifact.artifactId) && artifact.path === implementationReviewPath);
+    return !!report && artifactInputProvenanceIsCurrent(kernel, report.artifactId) && !!currentImplementationReport(kernel, report);
+  }
   const registeredOutputsVerified = task.outputArtifacts.every((artifactId) => artifactReadyForConsumption(kernel, artifactId));
   if (!registeredOutputsVerified) {
     return false;
   }
 
-  if (task.ownerAgentId === "qa_evaluator") {
+  // QA authors contracts before a runnable build exists. Only execution tasks
+  // producing a qa_report require run_playtest receipts; role-based gating
+  // here creates a contract -> build -> QA -> contract dependency cycle.
+  if (task.ownerAgentId === "qa_evaluator" && task.outputArtifacts.some((id) =>
+    artifacts.find((artifact) => artifact.artifactId === id)?.type === "qa_report")) {
     return qaPlaytestOutputsVerified(kernel, task);
   }
   if (task.taskId.startsWith("task_qa_repair_")) {
@@ -142,8 +153,8 @@ export function artifactReadyForConsumption(kernel: StudioKernel, artifactId: st
   }
   if (artifact.metadata.bridgeOperationId && artifact.metadata.bridgeOk !== true) {
     const verifiedMediaOperation =
-      artifact.metadata.bridgeOperationType === "image_generation" &&
-      hasCurrentGenerateRasterAssetReceipt(kernel, artifact) &&
+      ((artifact.metadata.bridgeOperationType === "image_generation" && hasCurrentGenerateRasterAssetReceipt(kernel, artifact)) ||
+        hasCurrentComposedContactSheetReceipt(kernel, artifact)) &&
       workspaceArtifactHasPngSignature(kernel, artifact);
     const verifiedReviewOperation =
       artifact.type === "quality_review" &&
@@ -171,6 +182,10 @@ export function artifactReadyForConsumption(kernel: StudioKernel, artifactId: st
   }
   if (artifact.type === "quality_review") {
     return qualityReviewReadyForTaskCompletion(kernel, artifact.artifactId);
+  }
+  if ([selfCheckPath, implementationReviewPath].includes(artifact.path)) {
+    const report = currentImplementationReport(kernel, artifact);
+    return !!report && ("verdict" in report ? report.verdict === "pass" : report.status === "pass");
   }
   if (!isContractArtifactType(artifact.type)) {
     return true;
@@ -279,7 +294,6 @@ export function assetProductionOutputsVerified(kernel: StudioKernel, task: Task)
     contactSheet.path !== "agents/art/processed-assets/first-playable-contact-sheet.png" ||
     contactSheet.ownerAgentId !== "asset_production" ||
     contactSheet.sourceTaskId !== task.taskId ||
-    contactSheet.metadata.mediaRole !== "asset_contact_sheet" ||
     !artifactReadyForConsumption(kernel, manifest.artifactId) ||
     !artifactReadyForConsumption(kernel, contactSheet.artifactId) ||
     !workspaceArtifactHasPngSignature(kernel, contactSheet)
@@ -312,7 +326,6 @@ export function assetProductionOutputsVerified(kernel: StudioKernel, task: Task)
     artifact.ownerAgentId === "asset_production" &&
     artifact.type === "asset" &&
     artifact.artifactId !== contactSheet.artifactId &&
-    artifact.metadata.mediaRole !== "asset_contact_sheet" &&
     artifact.path.toLowerCase().endsWith(".png") &&
     artifactReadyForConsumption(kernel, artifact.artifactId) &&
     workspaceArtifactHasPngSignature(kernel, artifact)

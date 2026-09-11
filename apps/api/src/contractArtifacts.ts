@@ -9,6 +9,7 @@ import {
 } from "@game-pipeline/shared-schemas";
 import { createHash } from "node:crypto";
 import type { Artifact } from "@game-pipeline/shared-schemas";
+import { engineeringContractGuide } from "./engineeringContractGuide.js";
 
 export type ContractArtifactType = Extract<Artifact["type"], "game_contract" | "scene_blueprint" | "playtest_contract">;
 
@@ -49,8 +50,7 @@ export function parseContractArtifactText(type: ContractArtifactType, content: s
     }
   } catch (error) {
     if (error instanceof ContractValidationError) {
-      const details = error.issues.slice(0, 12).map((issue) => `${issue.path}: ${issue.message}`).join("；");
-      throw new Error(`${contractLabel(type)} 未通过结构校验：${details}`);
+      throw new Error(`${contractLabel(type)} 未通过结构校验：${error.message}\n${engineeringContractGuide([type]).join("\n")}`);
     }
     throw error;
   }

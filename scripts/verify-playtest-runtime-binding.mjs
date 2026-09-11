@@ -1,0 +1,35 @@
+import assert from "node:assert/strict";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { tmpdir } from "node:os";
+import { createHash } from "node:crypto";
+import { readPlaytestRuntimeBinding, playtestRuntimeBindingPath } from "../apps/api/dist/playtestRuntimeBinding.js";
+import { playtestContractExample } from "../apps/api/dist/engineeringContractGuide.js";
+import { defaultPlaytestContractPath } from "../apps/api/dist/playtestContractLoader.js";
+import { verifyRuntimeHandshake } from "../apps/api/dist/runtimeAdapter.js";
+const root = mkdtempSync(join(tmpdir(), "btp-runtime-binding-"));
+try {
+  assert.equal(readPlaytestRuntimeBinding(root), undefined);
+  const contractPath = join(root, defaultPlaytestContractPath);
+  mkdirSync(dirname(contractPath), { recursive: true });
+  const first = JSON.stringify(playtestContractExample, null, 2);
+  writeFileSync(contractPath, first);
+  const binding = readPlaytestRuntimeBinding(root);
+  assert.equal(binding.contractHash, createHash("sha256").update(first).digest("hex"));
+  assert.equal(binding.playtestId, playtestContractExample.playtestId);
+  assert.equal(verifyRuntimeHandshake(binding, binding).hashVerified, true);
+  const revised = { ...playtestContractExample, revision: 2 };
+  writeFileSync(contractPath, JSON.stringify(revised));
+  const next = readPlaytestRuntimeBinding(root);
+  assert.equal(next.revision, 2);
+  assert.notEqual(next.contractHash, binding.contractHash);
+  assert.throws(() => verifyRuntimeHandshake(binding, next), /revision/);
+  writeFileSync(contractPath, "{}");
+  assert.throws(() => readPlaytestRuntimeBinding(root), /结构校验/);
+  rmSync(contractPath);
+  const output = join(root, playtestRuntimeBindingPath);
+  mkdirSync(dirname(output), { recursive: true });
+  writeFileSync(output, JSON.stringify(binding));
+  assert.throws(() => readPlaytestRuntimeBinding(root), /残留运行时契约绑定/);
+  console.log("Playtest runtime binding passed: exact byte hash, revision refresh, invalid/missing contract fail closed.");
+} finally { rmSync(root, { recursive: true, force: true }); }

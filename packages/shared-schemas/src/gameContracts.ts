@@ -329,7 +329,9 @@ export class ContractValidationError extends Error {
   readonly issues: ContractValidationIssue[];
 
   constructor(contractName: string, issues: ContractValidationIssue[]) {
-    super(`${contractName} validation failed with ${issues.length} issue${issues.length === 1 ? "" : "s"}`);
+    super(`${contractName} validation failed with ${issues.length} issue${issues.length === 1 ? "" : "s"}:\n` +
+      issues.slice(0, 40).map((issue) => `${issue.path} [${issue.code}]: ${issue.message}`).join("\n") +
+      (issues.length > 40 ? `\n… ${issues.length - 40} more issues; fix these first and retry.` : ""));
     this.name = "ContractValidationError";
     this.issues = issues;
   }
@@ -901,9 +903,16 @@ function validateGameContractSemantics(contract: GameContract, path: string, iss
     const transitionPath = `${path}.stateModel.transitions[${index}]`;
     checkRef(transition.from, stateIds, `${transitionPath}.from`, "state", issues);
     checkRef(transition.to, stateIds, `${transitionPath}.to`, "state", issues);
-    if (states.get(transition.from)?.terminal
-      && (transition.trigger.type !== "system" || transition.trigger.ref !== "restart" || transition.to !== contract.stateModel.initialState)) {
-      issue(issues, `${transitionPath}.from`, "invalid_value", "Terminal states may only restart into the initial state.");
+    if (states.get(transition.from)?.terminal) {
+      const inputRef = transition.trigger.type === "input" ? transition.trigger.ref : undefined;
+      const explicitPlayerExit = transition.trigger.type === "input" && contract.inputModel.actions.some(
+        (action) => action.actionId === inputRef && action.enabledInStates.includes(transition.from)
+      );
+      const systemRestart = transition.trigger.type === "system" && transition.trigger.ref === "restart";
+      if ((!explicitPlayerExit && !systemRestart) || states.get(transition.to)?.terminal) {
+        issue(issues, `${transitionPath}.from`, "invalid_value",
+          "Terminal states may exit to a nonterminal state only through system/restart or an explicit input enabled in that terminal state.");
+      }
     }
     if (transition.trigger.type === "input") checkRef(transition.trigger.ref, actions, `${transitionPath}.trigger.ref`, "input action", issues);
     if (transition.trigger.type === "signal") checkRef(transition.trigger.ref, signalIds, `${transitionPath}.trigger.ref`, "runtime signal", issues);

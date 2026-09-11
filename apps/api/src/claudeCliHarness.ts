@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, type Dirent } from "node:fs";
 import { join } from "node:path";
@@ -7,6 +7,7 @@ import type { AgentContract, AgentLoopControl } from "@game-pipeline/shared-sche
 import type { AgentHarness, AgentHarnessProgressEvent, AgentHarnessRunInput, AgentHarnessRunResult, AgentHarnessStatus, AgentHarnessToolOperation } from "./agentHarness.js";
 import { cocosEngineSettingsStore } from "./cocosEngineSettings.js";
 import { modelSettingsStore } from "./modelSettings.js";
+import { resolvePathWithinRoot } from "./pathSafety.js";
 
 const defaultTimeoutMs = 20 * 60 * 1000;
 const defaultInitialProgressTimeoutMs = 3 * 60 * 1000;
@@ -126,10 +127,18 @@ export class ClaudeCliHarness implements AgentHarness {
       throw new Error(`Harness authorization mode=${input.authorization.mode} 与 toolMode=${input.toolMode ?? "task"} 不一致。`);
     }
     const invocationId = `inv_${randomUUID()}`;
-    const configDir = join(input.projectRoot, ".be-the-producer", "harness", input.agent.agentId);
+    const configDir = join(input.stateRoot ?? input.projectRoot, ".be-the-producer", "harness", input.agent.agentId);
     const controlPath = join(configDir, `control-${invocationId}.json`);
     const operationLogPath = join(configDir, `operations-${invocationId}.jsonl`);
     mkdirSync(configDir, { recursive: true, mode: 0o700 });
+    // Claude indexes conversations by cwd. The MCP workspace is fresh per run,
+    // but its control-plane cwd must stay stable for the logical session.
+    const sessionCwd = input.stateRoot && input.sessionKey
+      ? resolvePathWithinRoot(input.stateRoot,
+        `.be-the-producer/harness/${input.agent.agentId}/session-cwd/${createHash("sha256").update(input.sessionKey).digest("hex")}`,
+        { allowMissing: true, label: "Claude 会话目录" }).absolutePath
+      : input.projectRoot;
+    mkdirSync(sessionCwd, { recursive: true, mode: 0o700 });
     emitHarnessProgress(input, {
       type: "started",
       invocationId,
@@ -172,7 +181,7 @@ export class ClaudeCliHarness implements AgentHarness {
     let result: Awaited<ReturnType<typeof runProcess>>;
     try {
       result = await runProcess(resolveClaudeExecutable(), args, {
-        cwd: input.projectRoot,
+        cwd: sessionCwd,
         env: claudeEnvironment(input, configDir),
         stdin: input.userPrompt,
         timeoutMs: input.timeoutMs ?? this.options.timeoutMs ?? defaultTimeoutMs,
@@ -196,6 +205,15 @@ export class ClaudeCliHarness implements AgentHarness {
                 idleAfterProgressMs: this.options.idleAfterProgressMs ?? defaultIdleAfterProgressMs,
                 settleAfterExpectedOutputsMs: this.options.settleAfterExpectedOutputsMs ?? defaultSettleAfterExpectedOutputsMs,
                 onOperation: (operation) => {
+                  if (operation.status === "failed" || operation.bridgeOk === false) {
+                    emitHarnessProgress(input, {
+                      type: "tool_failed", invocationId,
+                      createdAt: operation.recordedAt ?? new Date().toISOString(),
+                      toolName: operation.toolName, path: operation.path,
+                      detail: operation.error ?? "工具返回失败，尚未产生可用产物。"
+                    });
+                    return;
+                  }
                   reportedToolProgressCount += 1;
                   const expectedCount = input.expectedPaths?.length ?? 0;
                   const progressPercent = expectedCount > 0
@@ -326,10 +344,17 @@ function claudeToolsForAgent(agent: AgentContract, mode: "conversation" | "task"
   }
   if (agent.agentId === "visual_quality_reviewer") {
     tools.push("mcp__btp_workspace__inspect_visual_assets");
+    tools.push("mcp__btp_workspace__submit_visual_review");
   }
   if (agent.agentId === "qa_evaluator") {
     tools.push("mcp__btp_workspace__run_playtest");
+    tools.push("mcp__btp_workspace__submit_implementation_review");
   }
+  if (["gameplay_programmer", "qa_evaluator", "cocos_tech_lead", "cocos_automation"].includes(agent.agentId)) {
+    tools.push("mcp__btp_workspace__run_implementation_checks");
+  }
+  if (agent.agentId === "gameplay_programmer") tools.push("mcp__btp_workspace__edit_code");
+  if (["cocos_tech_lead", "gameplay_programmer", "asset_production"].includes(agent.agentId)) tools.push("mcp__btp_workspace__edit_artifact");
   if (agent.agentId === "cocos_automation") {
     tools.push(
       "mcp__btp_workspace__cocos_validate_project",
@@ -367,6 +392,7 @@ function mcpConfig(
           BTP_SESSION_KEY: input.sessionKey ?? "",
           BTP_SESSION_SCOPE: input.sessionScope ?? "room",
           BTP_TASK_INPUT_EVIDENCE: JSON.stringify(input.taskInputEvidence ?? []),
+          BTP_VISION_PRODUCER_DECISIONS: JSON.stringify(input.visionProducerDecisions ?? []),
           BTP_CONTROL_PATH: controlPath,
           BTP_OPERATION_LOG_PATH: operationLogPath,
           BTP_PROVIDER_ID: input.provider.providerId,
@@ -411,7 +437,7 @@ function readToolOperations(operationLogPath: string): AgentHarnessToolOperation
   }
 }
 
-function parseToolOperations(operationLogPath: string): AgentHarnessToolOperation[] {
+export function parseToolOperations(operationLogPath: string): AgentHarnessToolOperation[] {
   if (!existsSync(operationLogPath)) return [];
   return readFileSync(operationLogPath, "utf8")
     .split(/\r?\n/)
@@ -434,6 +460,13 @@ function parseToolOperations(operationLogPath: string): AgentHarnessToolOperatio
           ...(typeof parsed.error === "string" ? { error: parsed.error } : {}),
           ...(typeof parsed.hash === "string" ? { hash: parsed.hash } : {}),
           ...(typeof parsed.sizeBytes === "number" ? { sizeBytes: parsed.sizeBytes } : {}),
+          ...(typeof parsed.resubmissionReason === "string" ? { resubmissionReason: parsed.resubmissionReason } : {}),
+          ...(isRecord(parsed.contactSheetReceipt)
+            ? { contactSheetReceipt: parsed.contactSheetReceipt as unknown as NonNullable<AgentHarnessToolOperation["contactSheetReceipt"]> }
+            : {}),
+          ...(isRecord(parsed.normalizationReceipt)
+            ? { normalizationReceipt: parsed.normalizationReceipt as unknown as NonNullable<AgentHarnessToolOperation["normalizationReceipt"]> }
+            : {}),
           ...(typeof parsed.providerId === "string" ? { providerId: parsed.providerId } : {}),
           ...(typeof parsed.model === "string" ? { model: parsed.model } : {}),
           ...(typeof parsed.requestId === "string" ? { requestId: parsed.requestId } : {}),
@@ -589,7 +622,7 @@ function isRecoverableResumeFailure(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   if (/暂停|取消|abort/i.test(message)) return false;
   if (/API key|认证|unauthorized|forbidden|余额|rate.?limit/i.test(message)) return false;
-  return /(?:resume|session|conversation).{0,100}(?:not found|does not exist|cannot be resumed|invalid|expired)|(?:找不到|不存在|失效|无法恢复).{0,40}(?:会话|session)|(?:会话|session).{0,40}(?:找不到|不存在|失效|无法恢复)/i.test(message);
+  return /no (?:conversation|session) found|(?:resume|session|conversation).{0,100}(?:not found|does not exist|cannot be resumed|invalid|expired)|(?:找不到|不存在|失效|无法恢复).{0,40}(?:会话|session)|(?:会话|session).{0,40}(?:找不到|不存在|失效|无法恢复)/i.test(message);
 }
 
 function parseStreamJson(stdout: string): { content: string; sessionId?: string; eventCount: number } {
@@ -696,6 +729,7 @@ function runProcess(
     let requestedError: Error | undefined;
     let lastProgressSignature = "";
     let lastProgressAt = 0;
+    let lastOutputAt = 0;
     let progressDetected = false;
     let firstOutputMs: number | undefined;
     let outputActivityReported = false;
@@ -753,7 +787,7 @@ function runProcess(
       const detail = kind === "idle"
         ? `Claude CLI 连续 ${formatTimeout(timeoutMs)} 没有输出活动，已终止。`
         : kind === "initial_progress"
-          ? `Claude CLI 在 ${formatTimeout(timeoutMs)} 内没有产生工具写入，已停止本轮。`
+          ? `Claude CLI 首次工具写入前连续 ${formatTimeout(timeoutMs)} 无输出进展，已停止本轮。`
           : `Claude CLI 执行超过 ${formatTimeout(timeoutMs)}（总时限）${completionDetail}，已终止。`;
       requestedError = new ClaudeCliTimeoutError(kind, timeoutMs, detail);
       terminate();
@@ -770,12 +804,21 @@ function runProcess(
     resetIdleTimeout();
     const progress = options.progress;
     if (progress) {
-      initialProgressTimeout = setTimeout(() => {
+      const checkInitialProgress = (): void => {
         if (progressDetected || hasRecordedProgress(progress.operationLogPath)) {
           return;
         }
+        // A large blueprint can stream for several minutes before the first
+        // complete JSON write. Treat this as an inactivity limit; the overall
+        // invocation deadline still bounds a model that never writes anything.
+        const remaining = progress.initialProgressTimeoutMs - (Date.now() - Math.max(startedAt, lastOutputAt));
+        if (remaining > 0) {
+          initialProgressTimeout = setTimeout(checkInitialProgress, remaining);
+          return;
+        }
         requestTimeout("initial_progress", progress.initialProgressTimeoutMs);
-      }, progress.initialProgressTimeoutMs);
+      };
+      initialProgressTimeout = setTimeout(checkInitialProgress, progress.initialProgressTimeoutMs);
       progressPoll = setInterval(() => {
         const signature = progressSignature(progress.operationLogPath);
         if (signature && signature !== lastProgressSignature) {
@@ -796,7 +839,9 @@ function runProcess(
         if (!progressDetected || lastProgressAt === 0) {
           return;
         }
-        const elapsed = Date.now() - lastProgressAt;
+        // A streaming model may still be composing a large strict receipt after
+        // a tool call. Do not mistake active output for a stalled worker.
+        const elapsed = Date.now() - Math.max(lastProgressAt, lastOutputAt);
         if (expectedOutputsExist(progress)) {
           if (elapsed >= progress.settleAfterExpectedOutputsMs) {
             requestProgressTermination("expected_outputs_materialized");
@@ -812,6 +857,7 @@ function runProcess(
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => {
+      lastOutputAt = Date.now();
       firstOutputMs ??= Date.now() - startedAt;
       if (!outputActivityReported) {
         outputActivityReported = true;
@@ -821,6 +867,7 @@ function runProcess(
       resetIdleTimeout();
     });
     child.stderr.on("data", (chunk: string) => {
+      lastOutputAt = Date.now();
       firstOutputMs ??= Date.now() - startedAt;
       if (!outputActivityReported) {
         outputActivityReported = true;
@@ -992,7 +1039,7 @@ function classifyClaudeCliFailure(rawDetail: string | undefined): ClaudeCliFailu
       detail: "模型服务认证失败，请检查该角色绑定的 Provider、API Key 和 Base URL。"
     };
   }
-  if (/(?:resume|session|conversation).{0,100}(?:not found|does not exist|cannot be resumed|invalid|expired)|(?:找不到|不存在|失效|无法恢复).{0,40}(?:会话|session)/i.test(detail)) {
+  if (/no (?:conversation|session) found|(?:resume|session|conversation).{0,100}(?:not found|does not exist|cannot be resumed|invalid|expired)|(?:找不到|不存在|失效|无法恢复).{0,40}(?:会话|session)/i.test(detail)) {
     return {
       kind: "session",
       retryable: true,

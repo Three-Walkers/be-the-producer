@@ -336,7 +336,8 @@ export class LocalAgentRuntime {
       bootstrapConceptDiscussion(kernel, message, now);
     }
 
-    const gate = resolveGateAction(kernel, message.content);
+    // An initial brief is data, never a workflow command (even when it describes approvals).
+    const gate = options.bootstrapProjectState ? undefined : resolveGateAction(kernel, message.content);
     const shouldRunLocalDecisionFlow = gate ? protocolFlows : false;
     const transitionApplied = gate && shouldRunLocalDecisionFlow
       ? applyProducerDecisionFlow(kernel, message, gate, now, options.gateEvidencePolicy ?? this.gateEvidencePolicy)
@@ -425,11 +426,16 @@ export function reconcileLocalRuntimeProjectState(
 
   const stageTwoTaskIds = [
     "task_group_stage_2",
+    "task_stage_2_cocos_implementation",
+    "task_stage_2_qa_implementation_review",
+    "task_stage_2_playtest_contract",
     "task_stage_2_asset_pipeline",
     "task_stage_2_visual_quality_review",
     "task_stage_2_cocos_build"
   ];
   const stageTwoArtifactIds = [
+    "artifact_implementation_self_check",
+    "artifact_implementation_review",
     "artifact_asset_manifest_draft",
     "artifact_asset_contact_sheet",
     "artifact_stage_2_visual_quality_review"
@@ -1040,14 +1046,13 @@ function gateSummaryLine(kernel: StudioKernel, gate: GateAction, stageApplicable
 }
 
 function detectGateAction(content: string): GateAction | undefined {
-  const normalized = content.toLowerCase();
-  if (isReleaseMessage(normalized) || normalized.includes(gateActions.release.confirmToken.toLowerCase())) {
+  if (isReleaseMessage(content) || isGateExecutionConfirmation(content, gateActions.release)) {
     return gateActions.release;
   }
-  if (isPlayableApprovalMessage(normalized) || normalized.includes(gateActions.playable.confirmToken.toLowerCase())) {
+  if (isPlayableApprovalMessage(content) || isGateExecutionConfirmation(content, gateActions.playable)) {
     return gateActions.playable;
   }
-  if (isApprovalMessage(normalized) || normalized.includes(gateActions.stage1.confirmToken.toLowerCase())) {
+  if (isApprovalMessage(content) || isGateExecutionConfirmation(content, gateActions.stage1)) {
     return gateActions.stage1;
   }
   return undefined;
@@ -1073,28 +1078,24 @@ function resolveGateAction(kernel: StudioKernel, content: string): GateAction | 
 }
 
 function isGateExecutionConfirmation(content: string, gate: GateAction): boolean {
-  const normalized = content.toLowerCase();
-  return normalized.includes(gate.confirmToken.toLowerCase()) || (normalized.includes("执行确认") && normalized.includes(gate.label.toLowerCase()));
+  return gateCommandHead(content) === gateCommandHead(gate.confirmToken);
+}
+
+// Match a standalone leading command, not arbitrary keywords across a design brief.
+// Keep the UI's "command。explanation" format, but fail closed for quotes/negation/questions.
+function gateCommandHead(content: string): string {
+  return content.trim().split(/[。.!！;；\n]/, 1)[0]!.toLowerCase().replace(/\s/g, "").replace(/:/g, "：");
 }
 
 function isNaturalLanguageGateConfirmation(content: string): boolean {
-  const normalized = content.toLowerCase().replace(/[，。！？!?\s]/g, "");
-  if (["确认", "同意", "继续", "通过", "审批通过", "确认通过"].includes(normalized)) {
-    return true;
-  }
-  return (
-    (normalized.includes("确认") || normalized.includes("同意") || normalized.includes("继续") || normalized.includes("通过")) &&
-    (normalized.includes("结束") || normalized.includes("下一阶段") || normalized.includes("推进") || normalized.includes("进入开发") || normalized.includes("进入发布"))
-  );
+  const normalized = gateCommandHead(content);
+  return /^(?:确认|同意|继续|通过|审批通过|确认通过)$/.test(normalized) ||
+    /^(?:我)?(?:确认|同意)(?:结束本阶段|进入下一阶段|推进到下一阶段|进入开发|进入发布)$/.test(normalized);
 }
 
 function isGenericGateIntent(content: string): boolean {
-  const normalized = content.toLowerCase();
-  return (
-    isNaturalLanguageGateConfirmation(content) ||
-    ((normalized.includes("门禁") || normalized.includes("评审")) &&
-      (normalized.includes("发起") || normalized.includes("开始") || normalized.includes("请求") || normalized.includes("进入")))
-  );
+  return isNaturalLanguageGateConfirmation(content) ||
+    /^(?:请)?(?:发起|开始|请求|进入)(?:本阶段|当前阶段)?(?:的)?门禁评审$/.test(gateCommandHead(content));
 }
 
 function isGateStageApplicable(kernel: StudioKernel, gate: GateAction): boolean {
@@ -1180,28 +1181,24 @@ function approveStageOne(
 }
 
 function isApprovalMessage(content: string): boolean {
-  return (
-    ((content.includes("确认") || content.includes("同意") || content.includes("审批") || content.includes("通过")) &&
-      (content.includes("玩法") || content.includes("美术") || content.includes("范围") || content.includes("stage 1") || content.includes("立项"))) ||
-    ((content.includes("门禁") || content.includes("评审")) &&
-      (content.includes("立项") || content.includes("本阶段") || content.includes("当前阶段") || content.includes("讨论"))) ||
-    ((content.includes("结束") || content.includes("下一阶段") || content.includes("开发落地")) &&
-      (content.includes("确认") || content.includes("同意") || content.includes("开始") || content.includes("进入") || content.includes("推进")))
-  );
+  const head = gateCommandHead(content);
+  return /^(?:请)?(?:确认|同意|批准|审批通过)(?:立项|stage1)$/.test(head) ||
+    /^(?:请)?(?:发起|开始|请求)(?:立项|立项阶段|stage1)(?:的)?门禁评审$/.test(head) ||
+    head === "请求门禁评审：确认立项";
 }
 
 function isPlayableApprovalMessage(content: string): boolean {
-  return (
-    (content.includes("首个可玩") || content.includes("可玩版本") || content.includes("first playable")) &&
-    (content.includes("确认") || content.includes("同意") || content.includes("通过") || content.includes("接受"))
-  );
+  const head = gateCommandHead(content);
+  return /^(?:(?:确认|同意|接受)(?:首个可玩|可玩版本|firstplayable)(?:通过)?|首个可玩通过)$/.test(head) ||
+    /^(?:请)?(?:发起|开始|请求)(?:首个可玩|可玩版本)(?:的)?门禁评审$/.test(head) ||
+    head === "请求门禁评审：首个可玩通过";
 }
 
 function isReleaseMessage(content: string): boolean {
-  return (
-    (content.includes("发布") || content.includes("上线") || content.includes("release")) &&
-    (content.includes("确认") || content.includes("同意") || content.includes("批准") || content.includes("通过"))
-  );
+  const head = gateCommandHead(content);
+  return /^(?:确认|同意|批准)(?:发布|上线|release)$/.test(head) ||
+    /^(?:请)?(?:发起|开始|请求)(?:发布|上线|release)(?:的)?门禁评审$/.test(head) ||
+    head === "请求门禁评审：批准发布";
 }
 
 function readinessText(isReady: boolean): string {
@@ -2016,8 +2013,8 @@ function ensureStageTwoTasksAndArtifacts(
     progressPercent: 50,
     childrenSummary: emptyChildrenSummary(),
     inputArtifacts: ["artifact_gdd_baseline_draft", "artifact_game_contract_draft", "artifact_scene_blueprint_draft"],
-    outputArtifacts: ["artifact_gameplay_source"],
-    acceptanceCriteria: ["玩法 TypeScript 源码已写入 Cocos assets/scripts", "核心循环状态机和 UI 逻辑明确"],
+    outputArtifacts: ["artifact_gameplay_source", "artifact_implementation_self_check"],
+    acceptanceCriteria: ["玩法 TypeScript 源码已写入 Cocos assets/scripts", "核心循环状态机和 UI 逻辑明确", "最后一次代码修改后 run_implementation_checks 的真实 Cocos 类型检查与蓝图集成检查通过，回执绑定当前源码树"],
     blockers: [],
     createdAt: now,
     updatedAt: now
@@ -2037,12 +2034,23 @@ function ensureStageTwoTasksAndArtifacts(
     sortOrder: 118,
     progressPercent: 0,
     childrenSummary: emptyChildrenSummary(),
-    inputArtifacts: ["artifact_game_contract_draft", "artifact_scene_blueprint_draft"],
+    inputArtifacts: ["artifact_gdd_baseline_draft", "artifact_game_contract_draft", "artifact_scene_blueprint_draft"],
     outputArtifacts: ["artifact_playtest_contract_draft"],
     acceptanceCriteria: ["PlaytestContract 通过严格结构校验", "所有循环和超时均有上限", "required 场景覆盖核心循环"],
     blockers: [],
     createdAt: now,
     updatedAt: now
+  });
+  ensureTask(kernel, {
+    taskId: "task_stage_2_qa_implementation_review",
+    projectId, stageId, parentTaskId: groupId, roomId: kernel.getRoom("qa-room").roomId,
+    taskLevel: "task", ownerAgentId: "qa_evaluator", title: "独立审查实现与制作基线的一致性",
+    description: "构建前独立读取 GDD、GameContract、Art Bible、SceneBlueprint 和真实源码，调用 run_implementation_checks；逐项审查核心循环、数值与成长、交互、视觉接入、存档和异常路径。提交有原文证据的 implementation_review JSON，发现偏差时自动回派原作者。不得修改游戏实现或以静态审查代替真实试玩。",
+    status: "todo", priority: 94, sortOrder: 122, progressPercent: 0, childrenSummary: emptyChildrenSummary(),
+    inputArtifacts: ["artifact_gdd_baseline_draft", "artifact_game_contract_draft", "artifact_art_bible_baseline_draft", "artifact_scene_blueprint_draft", "artifact_gameplay_source"],
+    outputArtifacts: ["artifact_implementation_review"],
+    acceptanceCriteria: ["六个审查维度都有基线和实现原文证据", "失败项包含预期与实际和可回派的源码位置", "通过结论必须绑定当前源码树且所有静态错误已清零", "本任务不声称真实游戏验收通过"],
+    blockers: [], createdAt: now, updatedAt: now
   });
   ensureTask(kernel, {
     taskId: "task_stage_2_cocos_build",
@@ -2064,7 +2072,9 @@ function ensureStageTwoTasksAndArtifacts(
       "artifact_stage_2_visual_quality_review",
       "artifact_scene_blueprint_draft",
       "artifact_playtest_contract_draft",
-      "artifact_gameplay_source"
+      "artifact_gameplay_source",
+      "artifact_implementation_self_check",
+      "artifact_implementation_review"
     ],
     outputArtifacts: ["artifact_wechat_dev_build"],
     acceptanceCriteria: [
@@ -2090,7 +2100,7 @@ function ensureStageTwoTasksAndArtifacts(
     priority: 85,
     sortOrder: 130,
     childrenSummary: emptyChildrenSummary(),
-    inputArtifacts: ["artifact_wechat_dev_build", "artifact_playtest_contract_draft"],
+    inputArtifacts: ["artifact_wechat_dev_build", "artifact_playtest_contract_draft", "artifact_gdd_baseline_draft", "artifact_game_contract_draft", "artifact_scene_blueprint_draft", "artifact_gameplay_source"],
     outputArtifacts: ["artifact_qa_playtest_report"],
     acceptanceCriteria: [
       "真实 Cocos Web 构建已在 Chrome 中启动",
@@ -2150,9 +2160,19 @@ function ensureStageTwoTasksAndArtifacts(
     kernel,
     "task_stage_2_cocos_build",
     "inputArtifacts",
-    ["artifact_asset_manifest_draft", "artifact_stage_2_visual_quality_review"],
+    ["artifact_asset_manifest_draft", "artifact_stage_2_visual_quality_review", "artifact_implementation_self_check", "artifact_implementation_review"],
     now
   );
+  ensureTaskArtifactReferences(kernel, "task_stage_2_cocos_implementation", "outputArtifacts", ["artifact_implementation_self_check"], now);
+  ensureTaskArtifactReferences(kernel, "task_stage_2_playtest_contract", "inputArtifacts", ["artifact_gdd_baseline_draft"], now);
+  ensureTaskArtifactReferences(kernel, "task_stage_2_qa_playtest", "inputArtifacts", ["artifact_gdd_baseline_draft", "artifact_game_contract_draft", "artifact_scene_blueprint_draft", "artifact_gameplay_source"], now);
+  ensureTaskArtifactReferences(kernel, groupId, "outputArtifacts", ["artifact_implementation_self_check", "artifact_implementation_review"], now);
+  for (const output of [
+    { artifactId: "artifact_implementation_self_check", path: "docs/engineering/implementation-self-check.json", ownerAgentId: "gameplay_programmer" as const, sourceTaskId: "task_stage_2_cocos_implementation" },
+    { artifactId: "artifact_implementation_review", path: "agents/qa/reviews/implementation-review.json", ownerAgentId: "qa_evaluator" as const, sourceTaskId: "task_stage_2_qa_implementation_review" }
+  ]) ensureArtifact(kernel, { ...output, projectId, type: "bug_report", stageId, status: "draft", version: 1,
+    sourceDecisionIds: [], metadata: { generatedBy: "local_agent_runtime" }, createdAt: now, updatedAt: now });
+  reopenStageOneTaskForMissingEvidence(kernel, "task_stage_2_cocos_implementation", ["artifact_gameplay_source", "artifact_implementation_self_check"], now);
 
   ensureArtifact(kernel, {
     artifactId: "artifact_asset_manifest_draft",
@@ -2305,6 +2325,8 @@ function ensureStageTwoTasksAndArtifacts(
     updatedAt: now
   });
 
+  // This repair also runs on checkpoints; only real transitions emit notices.
+  if (message.messageId === "runtime_quality_reconciliation") return;
   writeAgentMessage(kernel, {
     agentId: "asset_production",
     roomKind: "art-room",

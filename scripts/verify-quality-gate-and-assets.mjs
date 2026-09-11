@@ -267,6 +267,8 @@ function verifyAssetProductionRequiresRealGeneratedPng() {
     ]
   });
   assert.equal(taskOutputsVerified(kernel, task), true, "a valid RGB PNG declared opaque should pass production evidence");
+  delete kernel.listArtifacts().find((a) => a.artifactId === "artifact_asset_contact_sheet").metadata.mediaRole;
+  assert.equal(taskOutputsVerified(kernel, task), true, "canonical contact-sheet identity cannot depend on sanitized mutable mediaRole");
 
   materialize(kernel, {
     artifactId: "artifact_hero_generated",

@@ -87,41 +87,33 @@ SceneBlueprint 是 Agent 可编辑的结构化场景中间层。
 
 ```json
 {
-  "blueprint_version": 1,
-  "scene_name": "MainGame",
-  "canvas": {
-    "design_resolution": [750, 1334],
-    "fit_width": true,
-    "fit_height": false
-  },
-  "nodes": [
-    {
-      "id": "background",
-      "type": "Sprite",
-      "asset_key": "bg_main",
-      "position": [0, 0],
-      "size": [750, 1334],
-      "z_index": 0
-    },
-    {
-      "id": "score_label",
-      "type": "Label",
-      "text": "0",
-      "position": [0, 580],
-      "z_index": 10
-    }
-  ],
-  "scripts": [
-    {
-      "node_id": "game_root",
-      "component": "GameController",
-      "properties": {
-        "configPath": "assets/data/game_config.json"
-      }
-    }
-  ]
+  "schemaVersion": "1.0.0",
+  "kind": "scene_blueprint",
+  "blueprintId": "example.scene",
+  "revision": 1,
+  "gameContract": { "contractId": "example.contract", "revision": 1 },
+  "entrySceneId": "main",
+  "prefabs": [],
+  "scenes": [{
+    "sceneId": "main", "name": "MainGame", "role": "gameplay",
+    "nodes": [{
+      "nodeId": "game_root", "testId": "game.root", "name": "GameRoot", "kind": "container",
+      "transform": { "position": [0, 0], "rotation": 0, "scale": [1, 1], "size": [750, 1334] },
+      "tags": ["root"],
+      "components": [{
+        "componentId": "controller", "type": "ProjectController",
+        "properties": {}, "bindings": [], "references": []
+      }]
+    }]
+  }]
 }
 ```
+
+这是格式示例，不是完整游戏；`ProjectController` 必须由程序真实实现。权威类型是 `packages/shared-schemas/src/gameContracts.ts`，新契约不应使用旧版 `blueprint_version/nodes/scripts` 格式。写入时既校验结构，也校验 GameContract 的实际状态、动作和公开信号引用。
+
+当前物化器仅支持一个 entry scene、`prefabs=[]`，选关/暂停/结算以同一场景面板实现。节点通过 `parentNodeId` 表示层级，`transform.position` 是父节点本地坐标（中心原点、Y 向上），不是画布左上角坐标。`Sprite.properties.assetKey` 对应 manifest 的实际 id；不要把磁盘路径字符串赋给 Cocos `spriteFrame`。
+
+`bindings` 是引用标识注入，不是响应式 UI 系统：例如 `{property:"shellSignalId",source:{type:"runtime_signal",ref:"shells"}}` 将 `"shells"` 注入自定义组件，控制器负责订阅、刷新 Label、切换显隐和接线按钮。不要直接绑定 `Label.string` 或 `Button.interactable`，也不要把 `clickAction` 当成引擎事件。组件 `onLoad` 时引用可能尚未注入，应在 `start` 或显式就绪流程中初始化跨节点依赖。
 
 Bridge 不允许模型直接编辑 Cocos 私有序列化结构。应用蓝图时会生成：
 
@@ -131,6 +123,12 @@ Bridge 不允许模型直接编辑 Cocos 私有序列化结构。应用蓝图时
 - `agents/cocos-automation/scene-ops/*.json`：操作证据。
 
 Bootstrap 会发现 `assets/scripts` 下带 `@ccclass` 的 Component 并建立受控组件注册表。Creator 在真实构建中负责 AssetDB 导入、TypeScript 编译、场景反序列化和资源引用校验。
+
+### 5.1 真实试玩协议
+
+玩法组件必须提供 `globalThis.__BTP_PLAYTEST__` 的 `getHandshake/getSnapshot/perform` 接口，准确类型见 `apps/api/src/runtimeAdapter.ts`。`perform` 和真实触摸必须调用同一套业务入口；snapshot 返回 `sequence/timestampMs/state/signals/nodes/recentEvents`，不是自拟的 `metrics/ui/pass`。
+
+Bridge 在每次构建时读取当前有效 PlaytestContract，写入 `assets/resources/btp/playtest-binding.json` 的版本及原始文件 SHA-256。程序用 `resources.load('btp/playtest-binding', JsonAsset)` 读取并用于握手，避免程序与 QA 并行时硬编码过期哈希。绑定只证明消费的契约版本，不提供玩法事实或测试结论。契约存在但无效，或契约已移除却残留旧绑定时，构建失败关闭，不降级绕过检查。
 
 ## 6. AssetManifest 到 Cocos 导入
 

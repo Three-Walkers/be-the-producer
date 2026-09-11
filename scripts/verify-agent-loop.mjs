@@ -464,13 +464,14 @@ let activeCalls = 0;
 let maximumConcurrency = 0;
 let modelCallCount = 0;
 let responseDelayMs = 40;
+let firstBatchPublishedEarly = false;
 let forcedFailureKind;
 const fakeModelRuntime = {
   async respondToTask(currentKernel, task, input) {
     activeCalls += 1;
     modelCallCount += 1;
     maximumConcurrency = Math.max(maximumConcurrency, activeCalls);
-    await new Promise((resolve) => setTimeout(resolve, responseDelayMs));
+    await new Promise((resolve) => setTimeout(resolve, responseDelayMs + (task.ownerAgentId === "game_designer" ? 200 : 0)));
     activeCalls -= 1;
 
     if (forcedFailureKind) {
@@ -555,6 +556,9 @@ const service = new AgentLoopService({
   getKernel: () => kernel,
   checkpoint: (currentKernel) => {
     syncProjectWorkspace(currentKernel);
+    if (activeCalls > 0 && currentKernel.findTask("task_stage_1_art_direction")?.status === "review") {
+      firstBatchPublishedEarly = true;
+    }
   },
   modelRuntime: fakeModelRuntime
 });
@@ -566,6 +570,7 @@ service.start(projectId, {
 await waitFor(() => kernel.getAgentLoopState().status !== "running", 4_000);
 
 assert.equal(maximumConcurrency, 2, "策划和美术应在同一回合并行执行");
+assert.equal(firstBatchPublishedEarly, true, "fast sibling must publish its outcome while slow sibling is still running");
 assert.equal(kernel.findTask("task_stage_1_design_clarification")?.status, "review");
 assert.equal(kernel.findTask("task_stage_1_art_direction")?.status, "review");
 assert.equal(kernel.getAgentLoopState().status, "waiting_for_producer");

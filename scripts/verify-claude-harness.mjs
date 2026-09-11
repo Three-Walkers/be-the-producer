@@ -30,6 +30,12 @@ if (prompt.includes("ABORT_TEST")) {
 if (prompt.includes("HANG_NO_PROGRESS")) {
   await new Promise((resolve) => setTimeout(resolve, 5000));
 }
+if (prompt.includes("STREAM_BEFORE_WRITE")) {
+  for (let index = 0; index < 6; index++) {
+    process.stdout.write(JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "." } } }) + "\\n");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
 if (prompt.includes("RESUME_FAIL") && args.includes("--resume")) {
   process.stderr.write("Session does not exist or can no longer be resumed.\\n");
   process.exit(1);
@@ -190,6 +196,13 @@ assert.ok(evidence.toolExecutions.some((tool) => tool.status === "completed"));
 assert.equal(kernel.listArtifactLedger().find((entry) => entry.artifactId === "artifact_harness_proof")?.status, "verified");
 assert.ok(kernel.listArtifacts().find((artifact) => artifact.artifactId === "artifact_harness_proof")?.metadata.toolExecutedAt);
 assert.deepEqual(harnessProgress.map((event) => event.type), ["started", "model_output", "completed"]);
+const streamingBeforeWrite = await harness.run({
+  projectId: kernel.project.projectId, projectRoot, agent, provider, model: "qwen-test",
+  systemPrompt: "test", userPrompt: "STREAM_BEFORE_WRITE", authorization,
+  requireToolProgress: true, expectedPaths: ["docs/design/harness-proof.md"]
+});
+assert.equal(streamingBeforeWrite.sessionId, result.sessionId,
+  "active output before a large write must not hit the initial inactivity timeout");
 
 const failedWritePath = "docs/design/harness-proof.md";
 const failedWriteAbsolutePath = join(projectRoot, failedWritePath);
@@ -303,6 +316,7 @@ await harness.run({
   model: "qwen-test",
   systemPrompt: "test",
   userPrompt: "resume the proof",
+  visionProducerDecisions: [{messageId: "producer_scope", content: "Scope fixture", createdAt: "2026-09-11T00:00:00.000Z"}],
   authorization,
   sessionId: result.sessionId,
   sessionKey: "task:harness_test:design-room:task_harness:game_designer:e0",
@@ -316,6 +330,7 @@ for (const unsafeBuiltin of ["Read", "Glob", "Grep", "Bash"]) {
 assert.ok(toolsArg.includes("mcp__btp_workspace__read_file"));
 const mcpConfigArg = JSON.parse(args[args.indexOf("--mcp-config") + 1]);
 assert.equal(mcpConfigArg.mcpServers.btp_workspace.env.BTP_TOOL_MODE, "task");
+assert.equal(JSON.parse(mcpConfigArg.mcpServers.btp_workspace.env.BTP_VISION_PRODUCER_DECISIONS)[0].messageId, "producer_scope");
 assert.equal("BTP_ALLOWED_ROOTS" in mcpConfigArg.mcpServers.btp_workspace.env, false);
 assert.ok(args.includes("--resume"));
 assert.ok(args.includes(result.sessionId));
@@ -395,7 +410,7 @@ await assert.rejects(
     userPrompt: "HANG_NO_PROGRESS",
     authorization
   }),
-  /没有产生工具写入/
+  /首次工具写入前连续.*无输出进展/
 );
 
 const perRunTimeoutStartedAt = Date.now();

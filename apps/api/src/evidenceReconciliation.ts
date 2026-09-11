@@ -9,8 +9,9 @@ import type {
   ArtifactInputProvenance,
   Task
 } from "@game-pipeline/shared-schemas";
-import { artifactReadyForConsumption } from "./taskOutputEvidence.js";
-import { qualityReviewReadyForGate } from "./qualityReviewArtifacts.js";
+import { artifactReadyForConsumption, artifactInputProvenanceIsCurrent } from "./taskOutputEvidence.js";
+import { currentImplementationReport, implementationReportNeedsRefresh, implementationReviewPath } from "./implementationReview.js";
+import { applyQualityReviewChangeRequest, qualityReviewReadyForGate } from "./qualityReviewArtifacts.js";
 
 interface FrozenArtifactEvidence {
   artifactId: string;
@@ -50,14 +51,31 @@ export function reconcileInvalidQualityReviewEvidence(
   const executableStages = new Set(workflowTaskStages(kernel.project.currentStage));
   const reopenedTaskIds: string[] = [];
   const invalidatedArtifactIds: string[] = [];
+  const restoredReferenceIds = restoreHistoricalReviewReferences(kernel, now);
 
   for (const contract of getQualityReviewArtifactContracts()) {
     const artifact = kernel.listArtifacts().find((candidate) => candidate.artifactId === contract.artifactId);
-    if (!artifact?.metadata.toolExecutedAt) continue;
-    const result = qualityReviewReadyForGate(kernel, contract.artifactId, false);
-    if (result.ok) continue;
-
+    if (!artifact) continue;
     const task = kernel.findTask(contract.sourceTaskId);
+    if (!artifact.metadata.toolExecutedAt) {
+      // Old checkpoints made the reason for re-review a scheduler blocker.
+      // Once the author has resubmitted valid inputs, remove only that owned
+      // blocker; keep real/manual dependency failures and the invalid receipt.
+      if (artifact.metadata.qualityReviewEvidenceInvalidationReason && task &&
+          executableStages.has(task.stageId) && task.status !== "cancelled" &&
+          task.blockers.some((blocker) => blocker.startsWith("质量审查证据失效：")) &&
+          task.inputArtifacts.every((id) => artifactReadyForConsumption(kernel, id))) {
+        reopenTaskForEvidenceRepair(kernel, task, now);
+        reopenedTaskIds.push(task.taskId);
+      }
+      continue;
+    }
+    const result = qualityReviewReadyForGate(kernel, contract.artifactId, false);
+    if (result.ok) {
+      if (result.review) applyQualityReviewChangeRequest(kernel, artifact, result.review, now);
+      continue;
+    }
+
     if (!task || !executableStages.has(task.stageId)) continue;
     const reason = result.reason ?? "quality_review_evidence_not_grounded";
     if (
@@ -72,10 +90,38 @@ export function reconcileInvalidQualityReviewEvidence(
   }
 
   return {
-    changed: reopenedTaskIds.length > 0,
+    changed: reopenedTaskIds.length > 0 || restoredReferenceIds.length > 0,
     taskIds: [...new Set(reopenedTaskIds)],
     artifactIds: [...new Set(invalidatedArtifactIds)]
   };
+}
+
+/** Repair only the old cross-stage feedback projection, never files or reviews. */
+export function restoreHistoricalReviewReferences(kernel: StudioKernel, now = new Date().toISOString()): string[] {
+  const active = new Set(workflowTaskStages(kernel.project.currentStage));
+  const workflow = kernel.getWorkflowSnapshot();
+  const restored: string[] = [];
+  for (const artifact of kernel.listArtifacts()) {
+    const source = artifact.sourceTaskId ? kernel.findTask(artifact.sourceTaskId) : undefined;
+    const reviewId = artifact.metadata.qualityChangeReviewArtifactId;
+    const contract = typeof reviewId === "string"
+      ? getQualityReviewArtifactContracts().find((entry) => entry.artifactId === reviewId) : undefined;
+    const reviewerTask = contract ? kernel.findTask(contract.sourceTaskId) : undefined;
+    if (artifact.status !== "change_requested" || !source || source.status !== "done" || active.has(source.stageId) ||
+        !reviewerTask || !active.has(reviewerTask.stageId) || !contract?.subjectArtifactIds.includes(artifact.artifactId) ||
+        !artifact.metadata.qualityChangeReviewInvocationId || artifact.metadata.producerChangeRequestId) continue;
+    const gate = workflow.gates.find((entry) => entry.status === "approved" && entry.requiredArtifacts.includes(artifact.artifactId) &&
+      workflow.decisions.some((decision) => decision.decisionId === entry.decisionId && decision.status === "active"));
+    const ledger = kernel.listArtifactLedger().find((entry) => entry.artifactId === artifact.artifactId);
+    if (!gate || ledger?.status !== "verified" || !ledger.hash || !gate.resolvedAt || artifact.updatedAt > gate.resolvedAt) continue;
+    // Project the candidate without minting fresh byte/provenance evidence.
+    artifact.status = "approved";
+    if (!artifactReadyForConsumption(kernel, artifact.artifactId)) { artifact.status = "change_requested"; continue; }
+    artifact.metadata = Object.fromEntries(Object.entries(artifact.metadata).filter(([key]) => !key.startsWith("qualityChange")));
+    artifact.metadata.historicalReviewReferenceRestoredAt = now;
+    restored.push(artifact.artifactId);
+  }
+  return restored;
 }
 
 /**
@@ -137,6 +183,11 @@ export function reconcileCurrentStageReviewOutputEvidence(
 
     for (const artifactId of staleArtifactIds) {
       if (!invalidatedArtifactIds.has(artifactId)) {
+        const artifact = kernel.listArtifacts().find((entry) => entry.artifactId === artifactId);
+        // Preserve an authentic old verifier receipt as history. Consumption
+        // still fails until a fresh run; destroying its ledger loses the very
+        // evidence needed to schedule re-verification after upstream repairs.
+        if (artifact && implementationReportNeedsRefresh(kernel, artifact)) continue;
         invalidateArtifactEvidence(kernel, artifactId, now);
         invalidatedArtifactIds.add(artifactId);
       }
@@ -154,6 +205,12 @@ export function reconcileCurrentStageReviewOutputEvidence(
 
 function artifactIsReadyForConsumption(kernel: StudioKernel, artifactId: string): boolean {
   try {
+    const artifact = kernel.listArtifacts().find((entry) => entry.artifactId === artifactId);
+    if (artifact?.path === implementationReviewPath) {
+      // A valid rejection completes the review, not the reviewed game. The
+      // build gate still uses artifactReadyForConsumption and demands pass.
+      return artifactInputProvenanceIsCurrent(kernel, artifactId) && !!currentImplementationReport(kernel, artifact);
+    }
     return artifactReadyForConsumption(kernel, artifactId);
   } catch {
     // Unsafe paths and filesystem races are stale evidence, not reasons to make
@@ -246,12 +303,11 @@ function reopenTaskForEvidenceRepair(
   kernel.updateTask(task.taskId, {
     status: "doing",
     progressPercent: Math.min(task.progressPercent ?? 80, 85),
-    blockers: [
-      ...task.blockers.filter((candidate) =>
-        !candidate.startsWith("Agent Loop：") && !candidate.startsWith("质量审查证据失效：")
-      ),
-      ...(blocker ? [blocker] : [])
-    ],
+    // Invalid output is the work this task must repair, not a dependency that
+    // prevents it from running. Upstream readiness is enforced by the scheduler.
+    blockers: task.blockers.filter((candidate) =>
+      !candidate.startsWith("Agent Loop：") && !candidate.startsWith("质量审查证据失效：")
+    ),
     updatedAt: now
   });
   if (kernel.project.executionStatus !== "running") {
@@ -260,7 +316,7 @@ function reopenTaskForEvidenceRepair(
   kernel.updateAgentLoopAgent(task.ownerAgentId, {
     status: "queued",
     taskId: task.taskId,
-    lastError: undefined,
+    lastError: blocker,
     updatedAt: now
   });
 }

@@ -270,7 +270,7 @@ export const defaultAgentContracts: AgentContract[] = [
         outputArtifactTypes: ["scene_blueprint"]
       }
     ],
-    tools: ["write_artifact", "create_scene_blueprint", "create_task", "review_code"],
+    tools: ["write_artifact", "create_scene_blueprint", "create_task", "review_code", "run_implementation_checks"],
     forbiddenActions: ["approve_release_gate", "read_secret_plaintext", "make_producer_decision"],
     handoffTargets: ["gameplay_programmer", "cocos_automation", "qa_evaluator", "wechat_platform"],
     messageTypes: ["progress_update", "build_failure", "blocker", "handoff"],
@@ -309,7 +309,7 @@ export const defaultAgentContracts: AgentContract[] = [
         activationKeywords: ["ui", "hud", "界面", "菜单", "按钮", "触控", "安全区", "小屏"]
       }
     ],
-    tools: ["write_code", "run_typecheck", "create_task", "update_task"],
+    tools: ["write_code", "run_typecheck", "run_implementation_checks", "create_task", "update_task"],
     forbiddenActions: ["change_art_direction", "deploy_release", "read_secret_plaintext"],
     handoffTargets: ["cocos_automation", "qa_evaluator", "cocos_tech_lead"],
     messageTypes: ["deliverable", "progress_update", "build_failure", "blocker", "handoff"],
@@ -332,7 +332,7 @@ export const defaultAgentContracts: AgentContract[] = [
       write: ["role", "artifact", "knowledge"]
     },
     skillBindings: [],
-    tools: ["cocos_validate_project", "cocos_import_assets", "cocos_apply_blueprint", "cocos_build"],
+    tools: ["cocos_validate_project", "cocos_import_assets", "cocos_apply_blueprint", "cocos_build", "run_implementation_checks"],
     forbiddenActions: ["edit_scene_serialization_uncontrolled", "read_secret_plaintext", "approve_release_gate"],
     handoffTargets: ["gameplay_programmer", "qa_evaluator", "wechat_platform"],
     messageTypes: ["deliverable", "progress_update", "build_failure", "blocker", "handoff"],
@@ -365,7 +365,7 @@ export const defaultAgentContracts: AgentContract[] = [
         outputArtifactTypes: ["qa_report", "bug_report"]
       }
     ],
-    tools: ["write_artifact", "run_playtest", "create_bug_report", "create_release_gate"],
+    tools: ["write_artifact", "run_playtest", "run_implementation_checks", "create_bug_report", "create_release_gate"],
     forbiddenActions: ["fix_code_directly", "approve_producer_decision", "read_secret_plaintext"],
     handoffTargets: ["gameplay_programmer", "art_director", "asset_production", "cocos_automation", "wechat_platform", "devops"],
     messageTypes: ["playtest_summary", "bug_report", "qa_failure", "release_gate", "progress_update", "blocker"],

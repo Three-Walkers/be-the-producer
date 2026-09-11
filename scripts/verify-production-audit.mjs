@@ -153,6 +153,22 @@ try {
   assert.equal(regressed.run.blocking, true);
   assert.equal(kernel.listInterventionLedger()[0]?.status, "regressing");
 
+  const referenceKernel = createStudioKernel("project_references", "References", "producer", "计划文档尚待生成");
+  const reference = {
+    claimId: "claim_future_path", projectId: referenceKernel.project.projectId,
+    messageId: "msg_future_plan", agentId: "game_designer", claimType: "path_reference",
+    claimedPath: "agents/design/future.md", relatedArtifactIds: [], verdict: "mismatch",
+    reason: "计划中的文件尚不存在", evidenceRefs: [], resolver: "filesystem", checkedAt: now, metadata: {}
+  };
+  referenceKernel.recordClaimVerification(reference);
+  const referenceAudit = reconcileProductionAudit(referenceKernel, { trigger: "stage_gate", triggerRef: "reference-only" });
+  assert.equal(referenceAudit.run.findings.find((finding) => finding.signature === "claim-mismatch:claim_future_path")?.severity, "low");
+  assert.equal(referenceAudit.run.blocking, false, "a proposed path is not a completion claim");
+  referenceKernel.recordClaimVerification({ ...reference, claimId: "claim_false_write", claimType: "artifact_written" });
+  const falseWriteAudit = reconcileProductionAudit(referenceKernel, { trigger: "stage_gate", triggerRef: "false-write" });
+  assert.equal(falseWriteAudit.run.findings.find((finding) => finding.signature === "claim-mismatch:claim_false_write")?.severity, "high");
+  assert.equal(falseWriteAudit.run.blocking, true, "actual false completion claims must remain blocking");
+
   const normal = enforceProducerGateBoundary(kernel, "我建议先比较两个核心循环，再补充失败反馈。", {
     agentId: "game_designer",
     scope: "conversation",

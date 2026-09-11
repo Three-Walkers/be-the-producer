@@ -57,7 +57,7 @@ export class ImageAssetValidationError extends Error {
 export function validateManifestRuntimeAssetAlphaPolicies(
   projectId: string,
   manifestValue: unknown,
-  options: { requireCurrentSchema?: boolean } = {}
+  options: { requireCurrentSchema?: boolean; enforcePolicy?: boolean } = {}
 ): RuntimeAssetAlphaValidationReceipt[] {
   const manifest = parseAssetManifest(manifestValue);
   if (options.requireCurrentSchema !== false && manifest.migrationRequired) {
@@ -74,7 +74,9 @@ export function validateManifestRuntimeAssetAlphaPolicies(
       throw new ImageAssetValidationError(`runtime PNG 不存在或不是普通文件：${asset.runtimePath}`);
     }
     const inspection = inspectPngAlpha(readFileSync(target.absolutePath), asset.runtimePath);
-    assertPngAlphaPolicy(inspection, asset.alphaPolicy, asset.runtimePath);
+    // A negative review must be able to describe a real, decodable but invalid
+    // image. Acceptance and build callers retain the strict default.
+    if (options.enforcePolicy !== false) assertPngAlphaPolicy(inspection, asset.alphaPolicy, asset.runtimePath);
     return {
       runtimePath: asset.runtimePath,
       assetId: asset.id,
@@ -100,6 +102,11 @@ export function assertPngAlphaPolicy(
     if (receipt.visiblePixels === 0) {
       throw new ImageAssetValidationError(
         `${label} 声明 alphaPolicy=required，但整张图片完全透明，没有可见像素。`
+      );
+    }
+    if (receipt.minimumAlpha > 0.95) {
+      throw new ImageAssetValidationError(
+        `${label} 声明 alphaPolicy=required，但最小 alpha=${receipt.minimumAlpha.toFixed(4)}，只有近不透明噪声，没有有效透明区域。`
       );
     }
   } else if (policy === "opaque" && receipt.transparentPixels > 0) {

@@ -2,7 +2,9 @@ import { createHash } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
 import { defaultAgentContracts, type StudioKernel } from "@game-pipeline/agent-runtime";
 import type { AgentContract, AgentId, AgentLoopControl, Artifact, ArtifactStatus, StudioMessage, Task, TaskId } from "@game-pipeline/shared-schemas";
-import * as ts from "typescript";
+import { runImplementationChecks } from "./implementationChecks.js";
+import { selfCheckPath, implementationReviewPath, validateImplementationReview, applyImplementationReviewFeedback } from "./implementationReview.js";
+import { parseRasterNormalization } from "./rasterNormalization.js";
 import {
   readArtifactContentForModel,
   resolveWorkspacePathTarget,
@@ -56,6 +58,7 @@ export type ExecutableToolName =
   | "append_document"
   | "write_code"
   | "run_typecheck"
+  | "run_implementation_checks"
   | "generate_image"
   | "generate_raster_asset"
   | "inspect_visual_assets"
@@ -139,6 +142,7 @@ const executableToolNames: ExecutableToolName[] = [
   "append_document",
   "write_code",
   "run_typecheck",
+  "run_implementation_checks",
   "generate_image",
   "generate_raster_asset",
   "inspect_visual_assets",
@@ -262,8 +266,22 @@ async function executeToolRequest(kernel: StudioKernel, message: StudioMessage, 
       return executePlaytestTool(kernel, message, agent, request, now, authorization.sourceTaskId);
     }
     if (request.toolName === "run_typecheck") {
-      return runTypeScriptSyntaxCheck(kernel.project.projectId, path);
+      return runTypeScriptSemanticCheck(kernel.project.projectId, path);
     }
+    if (request.toolName === "run_implementation_checks") {
+      const checks = runImplementationChecks(resolveProjectWorkspaceRoot(kernel.project.projectId), cocosEngineSettingsStore.getResolvedConfig().executablePath);
+      const output = agent.agentId === "gameplay_programmer" ? kernel.listArtifacts().find((artifact) => authorization.task.outputArtifacts.includes(artifact.artifactId) && artifact.path === selfCheckPath) : undefined;
+      if (!output) return { toolName: request.toolName, status: "completed", path, details: { ...checks } };
+      assertAgentPathAuthorized(kernel, agent, authorization.task, output.path, "write");
+      const artifact = kernel.upsertArtifact({ ...output, status: "submitted", version: output.version + 1,
+        metadata: { nativeHarnessManaged: true, toolName: request.toolName, toolExecutedAt: now }, updatedAt: now });
+      const result = writeToolArtifactContent(kernel, artifact, { content: JSON.stringify(checks, null, 2), mode: "replace" });
+      kernel.recordArtifactMaterialization(artifact.artifactId, { path: artifact.path, hash: result.hash, sizeBytes: result.sizeBytes,
+        materializedAt: result.materializedAt, operationMetadata: { implementationVerificationHash: result.hash, implementationVerificationTool: request.toolName } });
+      return { toolName: request.toolName, status: "completed", path: artifact.path, artifactId: artifact.artifactId,
+        hash: result.hash, sizeBytes: result.sizeBytes, details: { ...checks } };
+    }
+    if (path === selfCheckPath) throw new Error("Self-check reports are server-owned. Call run_implementation_checks; ordinary text writes cannot forge verification evidence.");
     if (request.toolName === "generate_raster_asset") {
       return await executeRasterAssetGeneration(
         kernel,
@@ -285,6 +303,14 @@ async function executeToolRequest(kernel: StudioKernel, message: StudioMessage, 
     const sourceTaskId = authorization.sourceTaskId;
     const existing = authorization.existing;
     const artifactType = existing?.type ?? request.artifactType ?? inferArtifactType(agent.agentId, path);
+    let implementationReview: ReturnType<typeof validateImplementationReview> | undefined;
+    if (path === implementationReviewPath) {
+      if (agent.agentId !== "qa_evaluator" || request.toolName === "append_document") throw new Error("Independent implementation review must be submitted by QA as a complete JSON document.");
+      const root = resolveProjectWorkspaceRoot(kernel.project.projectId);
+      const checks = runImplementationChecks(root, cocosEngineSettingsStore.getResolvedConfig().executablePath);
+      implementationReview = validateImplementationReview(root, JSON.parse(request.content), checks);
+      request.content = JSON.stringify(implementationReview, null, 2);
+    }
     let qualityReview: ReturnType<typeof stampAndValidateQualityReviewText>["review"] | undefined;
     if (artifactType === "quality_review") {
       const stamped = stampAndValidateQualityReviewText(request.content, {
@@ -389,8 +415,10 @@ async function executeToolRequest(kernel: StudioKernel, message: StudioMessage, 
       path: writeResult.relativePath,
       hash: writeResult.hash,
       sizeBytes: writeResult.sizeBytes,
-      materializedAt: writeResult.materializedAt
+      materializedAt: writeResult.materializedAt,
+      ...(implementationReview ? { operationMetadata: { implementationVerificationHash: writeResult.hash, implementationVerificationTool: request.toolName } } : {})
     });
+    if (implementationReview) applyImplementationReviewFeedback(kernel, materialized, implementationReview);
     if (qualityReview) {
       applyQualityReviewChangeRequest(kernel, materialized, qualityReview, writeResult.materializedAt);
     }
@@ -547,7 +575,7 @@ async function executeRasterAssetGeneration(
     ? kernel.listArtifactLedger().find((entry) => entry.artifactId === existing.artifactId)
     : undefined;
   if (
-    existing &&
+    existing && args.normalization === undefined &&
     existingLedger?.hash &&
     existingLedger.sizeBytes !== undefined &&
     artifactReadyForConsumption(kernel, existing.artifactId) &&
@@ -581,6 +609,7 @@ async function executeRasterAssetGeneration(
   }
   const provider = createConfiguredMultimodalArtProvider();
   const generated = await provider.generateImage({
+    normalization: parseRasterNormalization(args.normalization),
     prompt,
     size,
     ...(negativePrompt ? { negativePrompt } : {}),
@@ -619,6 +648,7 @@ async function executeRasterAssetGeneration(
       mediaWidth: generated.width,
       mediaHeight: generated.height,
       mediaLatencyMs: generated.latencyMs,
+      mediaNormalizationReceipt: generated.normalizationReceipt,
       mediaReferencePaths: referencePaths,
       mediaReviewStatus: "pending_independent_review"
     },
@@ -634,6 +664,7 @@ async function executeRasterAssetGeneration(
     sizeBytes: writeResult.sizeBytes,
     materializedAt: writeResult.materializedAt,
     operationMetadata: mediaGenerationOperationMetadata({
+      normalizationReceipt: generated.normalizationReceipt,
       hash: writeResult.hash,
       sizeBytes: writeResult.sizeBytes,
       provider: generated.provider,
@@ -995,6 +1026,7 @@ function normalizeToolRequest(raw: Record<string, unknown>, agent: AgentContract
   const isServiceTool =
     toolName.startsWith("cocos_") ||
     toolName === "run_playtest" ||
+    toolName === "run_implementation_checks" ||
     toolName === "generate_raster_asset" ||
     toolName === "inspect_visual_assets";
   if ((!path && !isServiceTool) || (!isServiceTool && !["run_typecheck", "render_svg_to_png"].includes(toolName) && !content.trim())) {
@@ -1011,7 +1043,7 @@ function normalizeToolRequest(raw: Record<string, unknown>, agent: AgentContract
   const normalizedArtifactType = normalizeArtifactType(rawArtifactType);
   return {
     toolName,
-    path: path || defaultServiceToolPath(toolName, args),
+    path: path || (toolName === "run_implementation_checks" ? (agent.agentId === "gameplay_programmer" ? selfCheckPath : agent.agentId === "qa_evaluator" ? implementationReviewPath : "agents/engineering/cocos-scene-blueprints/main.scene-blueprint.json") : defaultServiceToolPath(toolName, args)),
     content,
     ...(isServiceTool ? { arguments: args } : {}),
     ...(sourcePath ? { sourcePath } : {}),
@@ -1265,7 +1297,7 @@ function assertToolAllowed(agent: AgentContract, toolName: ExecutableToolName): 
 }
 
 function toolPathAccess(toolName: ExecutableToolName): "read" | "write" {
-  return toolName === "run_typecheck" || toolName === "cocos_import_assets" || toolName === "inspect_visual_assets"
+  return toolName === "run_typecheck" || toolName === "run_implementation_checks" || toolName === "cocos_import_assets" || toolName === "inspect_visual_assets"
     ? "read"
     : "write";
 }
@@ -1331,7 +1363,7 @@ function nextMaterializedArtifactStatus(
   return existingStatus === "change_requested" ? "submitted" : existingStatus ?? "draft";
 }
 
-function runTypeScriptSyntaxCheck(projectId: string, path: string): ToolExecutionResult {
+function runTypeScriptSemanticCheck(projectId: string, path: string): ToolExecutionResult {
   const target = resolveWorkspacePathTarget(projectId, path);
   if (!target.exists || target.type !== "file") {
     throw new Error(`待检查的 TypeScript 文件不存在：${path}`);
@@ -1341,21 +1373,11 @@ function runTypeScriptSyntaxCheck(projectId: string, path: string): ToolExecutio
   }
 
   const source = readFileSync(target.absolutePath, "utf8");
-  const result = ts.transpileModule(source, {
-    fileName: target.absolutePath,
-    reportDiagnostics: true,
-    compilerOptions: {
-      target: ts.ScriptTarget.ES2022,
-      module: ts.ModuleKind.ESNext,
-      experimentalDecorators: true,
-      strict: true
-    }
-  });
-  const errors = (result.diagnostics ?? [])
-    .filter((diagnostic) => diagnostic.category === ts.DiagnosticCategory.Error)
-    .map((diagnostic) => ts.flattenDiagnosticMessageText(diagnostic.messageText, "\n"));
+  const result = runImplementationChecks(resolveProjectWorkspaceRoot(projectId), cocosEngineSettingsStore.getResolvedConfig().executablePath);
+  const errors = result.findings.filter((finding) => finding.code.startsWith("TS") || finding.code === "missing_creator_types")
+    .map((finding) => `${finding.path}:${finding.line ?? 1} ${finding.code} ${finding.details}`);
   if (errors.length > 0) {
-    throw new Error(`TypeScript 语法检查失败：${errors.slice(0, 5).join("；")}`);
+    throw new Error(`TypeScript 语义检查失败（真实 Cocos 类型）：${errors.slice(0, 20).join("；")}`);
   }
 
   return {

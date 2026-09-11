@@ -3,7 +3,7 @@ import type { ModelProviderConfig } from "./modelSettings.js";
 import type { ArtVisionAuthoritativeContextEvidence, ArtVisionSemanticResult } from "./multimodalArtProvider.js";
 import type { VisionSemanticInspectionReceipt } from "./qualityReviewArtifacts.js";
 
-export type AgentHarnessProgressType = "started" | "model_output" | "tool_started" | "tool_completed" | "completed" | "failed";
+export type AgentHarnessProgressType = "started" | "model_output" | "tool_started" | "tool_completed" | "tool_failed" | "completed" | "failed";
 
 export interface AgentHarnessProgressEvent {
   type: AgentHarnessProgressType;
@@ -19,6 +19,8 @@ export interface AgentHarnessProgressEvent {
 export interface AgentHarnessRunInput {
   projectId: string;
   projectRoot: string;
+  /** Persistent harness/session state root. Defaults to projectRoot. */
+  stateRoot?: string;
   agent: AgentContract;
   provider: ModelProviderConfig;
   model: string;
@@ -27,6 +29,7 @@ export interface AgentHarnessRunInput {
   authorization: AgentHarnessAuthorization;
   expectedPaths?: string[];
   taskInputEvidence?: ArtifactInputProvenance[];
+  visionProducerDecisions?: Array<{ messageId: string; content: string; createdAt: string }>;
   requireToolProgress?: boolean;
   toolMode?: "conversation" | "task";
   sessionKey?: string;
@@ -79,6 +82,9 @@ export interface AgentHarnessRunResult {
 }
 
 export interface AgentHarnessToolOperation {
+  resubmissionReason?: string;
+  contactSheetReceipt?: import("./assetContactSheet.js").ContactSheetReceipt;
+  normalizationReceipt?: import("./rasterNormalization.js").RasterNormalizationReceipt | undefined;
   toolName: string;
   path: string;
   access?: "read" | "write";

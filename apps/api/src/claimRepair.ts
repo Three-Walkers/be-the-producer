@@ -30,7 +30,8 @@ export function reconcileClaimRepairs(kernel: StudioKernel): ClaimRepair[] {
     }
   }
 
-  for (const repair of kernel.listClaimRepairs().filter((candidate) => candidate.status === "open")) {
+  for (const repair of kernel.listClaimRepairs().filter((candidate) => candidate.status === "open" ||
+    (candidate.status === "resolved" && kernel.findTask(candidate.taskId)?.status !== "done"))) {
     const resolved = resolveRepairIfEvidenceAppeared(kernel, repair);
     if (resolved) {
       changedRepairs.push(resolved);
@@ -53,7 +54,9 @@ function openOrUpdateRepair(kernel: StudioKernel, claim: ClaimVerification): Cla
   const nearestArtifactPath = stringMetadata(claim.metadata, "nearestArtifactPath");
   const action: ClaimRepairAction = nearestArtifactPath ? "correct_claim" : "supply_evidence";
   const existingRepair = kernel.listClaimRepairs().find((candidate) => candidate.repairId === repairId);
-  if (existingRepair?.status === "resolved") {
+  const isNewClaimAfterRetraction = existingRepair?.resolution === "claim_retracted" &&
+    sourceMessage.createdAt > (existingRepair.resolvedAt ?? existingRepair.updatedAt);
+  if (existingRepair?.status === "resolved" && !isNewClaimAfterRetraction) {
     annotateClaimWithRepair(kernel, claim, existingRepair);
     return undefined;
   }
@@ -97,17 +100,24 @@ function resolveRepairIfEvidenceAppeared(kernel: StudioKernel, repair: ClaimRepa
     .find((claim) => claim.claimId === repair.claimId && claim.verdict === "verified");
   const correctiveVerified = findCorrectiveVerifiedClaim(kernel, repair);
   const resolutionClaim = directVerified ?? correctiveVerified;
-  if (!resolutionClaim) {
+  const sourceMessage = kernel.listMessages().find((message) => message.messageId === repair.messageId);
+  const retraction = kernel.listMessages().find((message) =>
+    message.senderType === "agent" && message.senderId === repair.agentId &&
+    message.createdAt >= (sourceMessage?.createdAt ?? repair.createdAt) &&
+    message.content.trim().split(/\r?\n/, 1)[0] === `撤回声明：${repair.claimId}`
+  );
+  if (!resolutionClaim && !retraction) {
     return undefined;
   }
 
   const now = new Date().toISOString();
-  const resolution: ClaimRepairResolution = directVerified ? "evidence_verified" : "claim_corrected";
+  const resolution: ClaimRepairResolution = directVerified ? "evidence_verified" : correctiveVerified ? "claim_corrected" : "claim_retracted";
   const resolvedRepair: ClaimRepair = {
     ...repair,
     status: "resolved",
     resolution,
-    resolutionClaimId: resolutionClaim.claimId,
+    ...(resolutionClaim ? { resolutionClaimId: resolutionClaim.claimId } : {}),
+    ...(retraction ? { resolutionMessageId: retraction.messageId } : {}),
     resolvedAt: now,
     updatedAt: now
   };
@@ -279,7 +289,7 @@ function writeRepairOpenedMessage(kernel: StudioKernel, sourceMessage: StudioMes
   });
 }
 
-function writeRepairResolvedMessage(kernel: StudioKernel, repair: ClaimRepair, resolutionClaim: ClaimVerification): void {
+function writeRepairResolvedMessage(kernel: StudioKernel, repair: ClaimRepair, resolutionClaim?: ClaimVerification): void {
   const sourceMessage = kernel.listMessages().find((message) => message.messageId === repair.messageId);
   if (!sourceMessage) {
     return;
@@ -292,8 +302,8 @@ function writeRepairResolvedMessage(kernel: StudioKernel, repair: ClaimRepair, r
     marker: "resolved",
     content: [
       `证据守卫已关闭补证任务：${repair.taskId}。`,
-      `修复结果：${repair.resolution === "claim_corrected" ? "Agent 已更正为已验证真实产物路径。" : "原声明路径已补齐工具证据。"}`,
-      `验证引用：${resolutionClaim.claimId}。`
+      `修复结果：${repair.resolution === "claim_retracted" ? "责任 Agent 明确撤回了完成声明；这不代表任何产物完成或质量通过。" : repair.resolution === "claim_corrected" ? "Agent 已更正为已验证真实产物路径。" : "原声明路径已补齐工具证据。"}`,
+      `验证引用：${resolutionClaim?.claimId ?? repair.resolutionMessageId}。`
     ].join("\n")
   });
 }
@@ -404,7 +414,7 @@ function repairNextStep(repair: ClaimRepair): string {
     return `如果原路径写错，${repair.agentId} 必须重新发布更正声明，并引用已验证真实产物 ${repair.nearestArtifactPath}；如果原声明路径确实需要存在，则必须通过工具写入 ${repair.claimedPath ?? "对应路径"}。`;
   }
 
-  return `${repair.agentId} 必须通过 write_artifact / append_document 工具写入声明产物并生成 artifact ledger 证据，或明确撤回该完成类声明。`;
+  return `${repair.agentId} 必须补齐真实工具证据；若原表述不实，可由该角色发送第一行严格为“撤回声明：${repair.claimId}”的消息，随后解释原因。撤回只关闭声明纠错，不会完成产物任务或通过门禁。`;
 }
 
 function repairIdForClaim(claim: ClaimVerification): string {

@@ -72,7 +72,7 @@ ${GAME_PIPELINE_DATA_ROOT:-<repo>/.local/projects}/{projectId}/
 - 增量事件归档、压缩和灾备复制。
 - Invocation Queue 的 lease、heartbeat、重试和 dead-letter queue。
 
-在引入多个 worker 前，应实现数据库版 `ProjectStateRepository`，并把模型调用、Cocos 构建、试玩和发布操作迁入持久化 Invocation Queue。
+本地模型 Worker 已经接入有界进程池，但它仍由单个 API 实例管理。进入多实例部署前，应实现数据库版 `ProjectStateRepository`，并把当前内存队列以及 Cocos 构建、试玩和发布操作迁入持久化 Invocation Queue。
 
 ## 3. API 最小安全边界
 
@@ -117,7 +117,7 @@ JSON 请求要求 `application/json` 或 `+json` Content-Type，拒绝压缩编�
 
 独立回归会构造指向根目录外的目录链接和 dangling symlink，并验证工作区写入/读取、Cocos 资产导入及 QA 契约读取均失败，外部目标字节保持不变。
 
-这是明确的**单进程本地边界**。它防止普通配置错误、Agent 生成路径和本进程内的链接逃逸，但不宣称抵抗具有本机并发写权限的攻击者在校验与 I/O 之间反复替换目录。生产多租户部署仍需要基于目录文件描述符的 `openat`/`O_NOFOLLOW`（或等价平台原语）、隔离 worker/container 和只读挂载来关闭跨进程 TOCTOU。
+这是明确的**本地 Worker 边界**。Direct API 已迁入限内存子进程，Claude task session 在临时 staging 副本中执行，经完整变更检测、克隆 Kernel 预检和可回滚原子提交后才进入正式目录；Claude room session 的 staging 严格只读。它防止普通配置错误、失败执行和 Agent 生成路径直接污染正式项目，但不宣称抵抗具有同一 OS 用户权限的攻击者在校验与 I/O 之间反复替换目录。生产多租户部署仍需要基于目录文件描述符的 `openat`/`O_NOFOLLOW`（或等价平台原语）、container、只读挂载和独立服务身份来关闭跨进程 TOCTOU。
 
 ## 5. 任务授权与产物血缘
 
@@ -141,7 +141,10 @@ npm run verify:api-security
 npm run verify:tool-authorization
 npm run verify:harness-authorization
 npm run verify:path-safety
+npm run verify:agent-worker
+npm run verify:agent-pool
+npm run verify:workspace-isolation
 npm run verify:artifact-provenance
 ```
 
-架构契约和 QA/Cocos 相关验收见 `docs/19_game_scene_playtest_contracts.md`。
+Agent 执行隔离详见 `docs/24_agent_worker_and_workspace_isolation.md`；架构契约和 QA/Cocos 相关验收见 `docs/19_game_scene_playtest_contracts.md`。

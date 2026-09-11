@@ -1,4 +1,7 @@
 import { createHash } from "node:crypto";
+import { composeAssetContactSheet } from "./assetContactSheet.js";
+import { runImplementationChecks, type ImplementationCheckResult } from "./implementationChecks.js";
+import { selfCheckPath, implementationReviewPath, validateImplementationReview, reviewFacets } from "./implementationReview.js";
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
@@ -13,16 +16,20 @@ import {
   contractArtifactTypeForPath
 } from "./contractArtifacts.js";
 import type { ArtifactInputProvenance, ArtifactQualityReview } from "@game-pipeline/shared-schemas";
+import { parseGameContract, parseSceneBlueprint, parsePlaytestContract, validateSceneBlueprintCompatibility,
+  validatePlaytestContractCompatibility, ContractValidationError } from "@game-pipeline/shared-schemas";
 import { getQualityReviewArtifactContracts, type QualityReviewArtifactContract } from "@game-pipeline/agent-runtime";
 import type { AgentHarnessAuthorization, AgentHarnessAuthorizationArtifact } from "./agentHarness.js";
 import { normalizeRelativePathWithinRoot, resolvePathWithinRoot } from "./pathSafety.js";
 import { DashScopeMultimodalArtProvider, type ArtImageMime } from "./multimodalArtProvider.js";
+import { parseRasterNormalization } from "./rasterNormalization.js";
 import {
   assertQualityReviewMatchesVisionSemanticResult,
   assertQualityReviewEvidenceGroundedInWorkspace,
   assertQualityReviewRubric,
   buildVisionReviewAuthoritativeContext,
   mergeVisionSemanticInspectionReceipts,
+  qualityReviewFromVisionResult,
   stampAndValidateQualityReviewText,
   type MergedVisionSemanticReceipt,
   type VisionSemanticInspectionReceipt
@@ -45,6 +52,7 @@ const taskInputEvidence = parseTaskInputEvidence(process.env.BTP_TASK_INPUT_EVID
 const controlPath = process.env.BTP_CONTROL_PATH?.trim();
 const operationLogPath = process.env.BTP_OPERATION_LOG_PATH?.trim();
 const visionInspectionReceipts: VisionSemanticInspectionReceipt[] = [];
+let lastImplementationCheck: ImplementationCheckResult | undefined;
 const reader = createInterface({ input: process.stdin, terminal: false });
 
 reader.on("line", (line) => {
@@ -102,7 +110,7 @@ function recordFailedWorkspaceWrite(request: JsonRpcRequest, error: unknown): vo
     return;
   }
   const name = typeof request.params?.name === "string" ? request.params.name : "";
-  if (!["write_artifact", "append_document", "generate_raster_asset", "inspect_visual_assets"].includes(name)) {
+  if (!["write_artifact", "append_document", "generate_raster_asset", "compose_asset_contact_sheet", "resubmit_existing_asset", "inspect_visual_assets"].includes(name)) {
     return;
   }
   const args = isRecord(request.params?.arguments) ? request.params.arguments : {};
@@ -142,6 +150,7 @@ function toolDefinitions(): Array<Record<string, unknown>> {
           maxBytes: { type: "integer", minimum: 1, maximum: 1048576 },
           lineStart: { type: "integer", minimum: 1, description: "Optional first line, 1-based" },
           lineEnd: { type: "integer", minimum: 1, description: "Optional last line, inclusive" },
+          characterOffset: { type: "integer", minimum: 0, description: "For a very long single line, read a 6000-character window; mutually exclusive with lineStart/lineEnd/withLineNumbers. Otherwise reads are paginated by whole lines (max 200 lines/6000 chars). Follow nextLineStart or nextCharacterOffset." },
           withLineNumbers: { type: "boolean", description: "Prefix every returned line with its authoritative 1-based line number" }
         },
         required: ["path"],
@@ -171,14 +180,16 @@ function toolDefinitions(): Array<Record<string, unknown>> {
     {
       name: "write_artifact",
       title: "Write project artifact",
-      description: "Create or replace exactly one current-task output artifact path.",
+      description: "Create or replace exactly one current-task output artifact path. For JSON artifacts prefer document (an object); the server serializes it without nested JSON-string escaping. All normal schema/provenance checks still apply.",
       inputSchema: {
         type: "object",
         properties: {
           path: { type: "string", description: "Project-relative destination path" },
-          content: { type: "string", description: "Complete UTF-8 file content" }
+          content: { type: "string", description: "Complete UTF-8 file content; omit when document is supplied" },
+          document: { type: "object", description: "Complete structured JSON object for a .json artifact; do not stringify it", additionalProperties: true }
         },
-        required: ["path", "content"],
+        required: ["path"],
+        oneOf: [{ required: ["content"] }, { required: ["document"] }],
         additionalProperties: false
       }
     },
@@ -219,6 +230,13 @@ function toolDefinitions(): Array<Record<string, unknown>> {
       }
     }
   ];
+  if (["cocos_tech_lead", "gameplay_programmer", "asset_production"].includes(agentId)) {
+    tools.push({name: "edit_artifact", title: "Patch an authorized text artifact atomically",
+      description: "Use read_file's full-file hash and exact unique excerpts to patch an existing output without rewriting it. Edits are applied together, then all ordinary write_artifact schema/revision/provenance checks run. Include the required contract revision increment in the same edit list. No intermediate invalid content is saved.",
+      inputSchema: {type: "object", properties: {path: {type: "string"}, expectedHash: {type: "string"}, edits: {type: "array", minItems: 1, maxItems: 40,
+        items: {type: "object", properties: {oldText: {type: "string", minLength: 1}, newText: {type: "string"}}, required: ["oldText", "newText"], additionalProperties: false}}},
+        required: ["path", "expectedHash", "edits"], additionalProperties: false}});
+  }
   if (["art_director", "asset_production"].includes(agentId)) {
     tools.push({
       name: "generate_raster_asset",
@@ -232,7 +250,12 @@ function toolDefinitions(): Array<Record<string, unknown>> {
           negativePrompt: { type: "string" },
           size: { type: "string", pattern: "^[0-9]{3,4}\\*[0-9]{3,4}$" },
           seed: { type: "integer", minimum: 0, maximum: 2147483647 },
-          referencePaths: { type: "array", maxItems: 3, items: { type: "string" } }
+          referencePaths: { type: "array", maxItems: 3, items: { type: "string" } },
+          normalization: {
+            type: "object", description: "Deterministic runtime resize (contain) and alpha processing after generation. remove_white flood-fills only edge-connected near-white background; preserve for real alpha, opaque for backgrounds. Still requires visual review.",
+            properties: { width: { type: "integer", minimum: 1, maximum: 4096 }, height: { type: "integer", minimum: 1, maximum: 4096 }, alpha: { type: "string", enum: ["preserve", "opaque", "remove_white"] } },
+            required: ["width", "height", "alpha"], additionalProperties: false
+          }
         },
         required: ["path", "prompt"],
         additionalProperties: false
@@ -254,6 +277,18 @@ function toolDefinitions(): Array<Record<string, unknown>> {
       }
     });
   }
+  if (agentId === "asset_production") tools.push({
+    name: "resubmit_existing_asset", title: "Resubmit unchanged verified runtime asset",
+    description: "Explicitly resubmit an unchanged, previously generated PNG for independent review. Use only when this asset needs no pixel changes (e.g. a contact-sheet-only revision reopened the batch). Requires exact expectedHash and reason. The parent rechecks original immutable generation evidence; never grants approval or creates new generation evidence.",
+    inputSchema: { type: "object", properties: { path: { type: "string" }, expectedHash: { type: "string", pattern: "^[a-f0-9]{64}$" }, reason: { type: "string", minLength: 1 } }, required: ["path", "expectedHash", "reason"], additionalProperties: false }
+  });
+  if (agentId === "asset_production") tools.push({
+    name: "compose_asset_contact_sheet", title: "Compose actual asset contact sheet",
+    description: "Deterministically arrange 1–32 authorized runtime PNGs into the registered contact sheet with real text labels and sizes. No AI redraw, no made-up pixels; server receipt binds every source hash. Call after final runtime images and before manifest/review.",
+    inputSchema: { type: "object", properties: { path: { type: "string" }, title: { type: "string" },
+      sources: { type: "array", minItems: 1, maxItems: 32, items: { type: "object", properties: { path: { type: "string" }, label: { type: "string" } }, required: ["path", "label"], additionalProperties: false } }
+    }, required: ["path", "sources"], additionalProperties: false }
+  });
   if (agentId === "visual_quality_reviewer") {
     tools.push({
       name: "inspect_visual_assets",
@@ -270,7 +305,35 @@ function toolDefinitions(): Array<Record<string, unknown>> {
       }
     });
   }
+  if (["gameplay_programmer", "qa_evaluator", "cocos_tech_lead", "cocos_automation"].includes(agentId)) {
+    tools.push({ name: "run_implementation_checks", title: "Check real Cocos TypeScript and blueprint integration",
+      description: "Read-only semantic TypeScript checking against installed Creator types, custom component discovery and blueprint integration diagnostics. Returns actionable file/line/owner findings and byte fingerprint. Programmer tasks also materialize their declared self-check report. This is NOT runtime QA or gameplay acceptance.",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false } });
+  }
+  if (agentId === "gameplay_programmer") {
+    tools.push({ name: "edit_code", title: "Precisely edit existing TypeScript",
+      description: "Replace one exact unique source span in an authorized TypeScript file. Read the file first and use its returned hash as expectedHash. Preserves the rest of the module; rerun implementation checks after your final edit. Does not grant new write paths.",
+      inputSchema: { type: "object", properties: { path: { type: "string" }, expectedHash: { type: "string", pattern: "^[a-f0-9]{64}$" },
+        oldText: { type: "string", minLength: 1 }, newText: { type: "string" } }, required: ["path", "expectedHash", "oldText", "newText"], additionalProperties: false } });
+  }
   if (agentId === "qa_evaluator") {
+    if (taskOutputArtifacts().some((artifact) => artifact.path === implementationReviewPath)) {
+      const citation = { type: "object", description: "Prefer path+lineStart+lineEnd from read_file withLineNumbers=true; the server extracts the exact quote. Alternatively provide an exact source quote. Never paraphrase or reformat JSON as evidence.",
+        properties: { path: { type: "string" }, quote: { type: "string", minLength: 4, maxLength: 2400 }, lineStart: { type: "integer", minimum: 1 }, lineEnd: { type: "integer", minimum: 1 } },
+        required: ["path"], anyOf: [{ required: ["quote"] }, { required: ["lineStart", "lineEnd"] }], additionalProperties: false };
+      tools.push({ name: "submit_implementation_review", title: "Submit independent grounded implementation review",
+        description: "Submit the pre-build QA review using this typed schema, after run_implementation_checks. The server binds current source bytes and automatically routes failures to the source/blueprint author. Pass means build-readiness review only, never runtime acceptance. Do not supply checks or hashes yourself.",
+        inputSchema: { type: "object", properties: {
+          schemaVersion: { type: "integer", const: 1 }, kind: { type: "string", const: "implementation_review" },
+          verdict: { type: "string", enum: ["pass", "change_requested"] },
+          coverage: { type: "array", minItems: 6, maxItems: 6, items: { type: "object", properties: {
+            facet: { type: "string", enum: [...reviewFacets] }, verdict: { type: "string", enum: ["pass", "fail", "not_applicable"] },
+            reason: { type: "string" }, baseline: citation, implementation: citation }, required: ["facet", "verdict", "reason", "baseline", "implementation"], additionalProperties: false } },
+          issues: { type: "array", maxItems: 60, items: { type: "object", properties: {
+            title: { type: "string" }, expected: { type: "string" }, actual: { type: "string" }, baseline: citation, implementation: citation },
+            required: ["title", "expected", "actual", "baseline", "implementation"], additionalProperties: false } }
+        }, required: ["schemaVersion", "kind", "verdict", "coverage", "issues"], additionalProperties: false } });
+    }
     tools.push({
       name: "run_playtest",
       title: "Run real Cocos playtest",
@@ -283,6 +346,11 @@ function toolDefinitions(): Array<Record<string, unknown>> {
         additionalProperties: false
       }
     });
+  }
+  if (agentId === "visual_quality_reviewer") {
+    tools.push({ name: "submit_visual_review", title: "Submit the bound independent visual review",
+      description: "After inspect_visual_assets has covered all required images, submit its authoritative aggregate without retyping scores/findings/hashes. The server constructs the canonical quality review and change requests, preserving any failure. No arguments; this cannot override the image model result, skip missing images, or approve a producer gate.",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false } });
   }
   if (agentId === "cocos_automation") {
     tools.push(
@@ -341,6 +409,50 @@ async function callTool(params: Record<string, unknown> | undefined): Promise<Re
   if (!toolDefinitions().some((tool) => tool.name === name)) {
     throw new Error(`当前 ${toolMode} 会话未授权 MCP 工具：${name || "unknown"}`);
   }
+  if (name === "submit_implementation_review") {
+    return callTool({ name: "write_artifact", arguments: { path: implementationReviewPath, document: args } });
+  }
+  if (name === "submit_visual_review") {
+    const output = taskOutputArtifacts().find((artifact) => artifact.type === "quality_review");
+    const contract = getQualityReviewArtifactContracts().find((candidate) => candidate.artifactId === output?.artifactId);
+    if (!output || !contract || contract.ownerAgentId !== agentId || contract.sourceTaskId !== authorization.taskId) throw new Error("Missing task-bound visual review output.");
+    const merged = mergeVisionSemanticInspectionReceipts(visionInspectionReceipts, contract);
+    const targets = contract.subjectArtifactIds.map((id) => {
+      const input = taskInputEvidence.find((entry) => entry.artifactId === id);
+      if (!input) throw new Error(`Missing visual review input evidence: ${id}`);
+      return { artifactId: id, version: input.version, path: input.path, ledgerHash: input.hash, sizeBytes: input.sizeBytes };
+    });
+    const document = qualityReviewFromVisionResult(contract, merged.result, targets, `review.${merged.semanticHash.slice(0, 24)}`);
+    return callTool({ name: "write_artifact", arguments: { path: output.path, document } });
+  }
+  if (name === "edit_code") {
+    const target = resolveAuthorizedTarget(requiredString(args.path, "path"), false, "artifact_write");
+    if (!target.relativePath.startsWith("assets/scripts/") || !/\.tsx?$/.test(target.relativePath) || target.relativePath.endsWith(".d.ts")) throw new Error("edit_code only accepts authorized implementation .ts/.tsx files.");
+    const bytes = readFileSync(target.absolutePath);
+    if (bytes.byteLength > 5 * 1024 * 1024) throw new Error("Source exceeds 5 MB.");
+    if (createHash("sha256").update(bytes).digest("hex") !== requiredString(args.expectedHash, "expectedHash")) throw new Error("Source changed since read_file; reread before editing.");
+    const source = bytes.toString("utf8"), oldText = requiredString(args.oldText, "oldText"), newText = requiredString(args.newText, "newText", true);
+    const start = source.indexOf(oldText);
+    if (start < 0 || source.indexOf(oldText, start + 1) >= 0) throw new Error("oldText must match exactly one source span; include more surrounding code to disambiguate.");
+    if (oldText === newText) throw new Error("edit_code would not change the source.");
+    return callTool({ name: "write_artifact", arguments: { path: target.relativePath, content: source.slice(0, start) + newText + source.slice(start + oldText.length) } });
+  }
+  if (name === "edit_artifact") {
+    const target = resolveAuthorizedTarget(requiredString(args.path, "path"), false, "artifact_write");
+    if (!/\.(?:json|md|ts|tsx)$/.test(target.relativePath)) throw new Error("edit_artifact only supports authorized UTF-8 JSON/Markdown/TypeScript outputs.");
+    const bytes = readFileSync(target.absolutePath);
+    if (createHash("sha256").update(bytes).digest("hex") !== requiredString(args.expectedHash, "expectedHash")) throw new Error("Artifact changed since read_file; reread before editing.");
+    if (!Array.isArray(args.edits) || args.edits.length < 1 || args.edits.length > 40) throw new Error("Provide 1–40 exact edits.");
+    let content = bytes.toString("utf8");
+    for (const edit of args.edits) {
+      if (!isRecord(edit)) throw new Error("Invalid artifact edit.");
+      const oldText = requiredString(edit.oldText, "oldText"), newText = requiredString(edit.newText, "newText", true);
+      const index = content.indexOf(oldText);
+      if (index < 0 || content.indexOf(oldText, index + 1) >= 0 || oldText === newText) throw new Error("Each oldText must match exactly one span and change it; no edits were saved.");
+      content = content.slice(0, index) + newText + content.slice(index + oldText.length);
+    }
+    return callTool({name: "write_artifact", arguments: {path: target.relativePath, content}});
+  }
   if (name === "read_file") {
     const target = resolveAuthorizedTarget(requiredString(args.path, "path"), false, "read");
     if (!existsSync(target.absolutePath) || !statSync(target.absolutePath).isFile()) {
@@ -354,6 +466,14 @@ async function callTool(params: Record<string, unknown> | undefined): Promise<Re
       throw new Error(`文件 ${target.relativePath} 为 ${body.byteLength} bytes，超过本次读取上限 ${maxBytes} bytes。`);
     }
     const sourceText = body.toString("utf8");
+    const fileMetadata = { path: target.relativePath, hash: createHash("sha256").update(body).digest("hex"), sizeBytes: body.byteLength };
+    if (args.characterOffset !== undefined) {
+      const offset = args.characterOffset;
+      if (!Number.isSafeInteger(offset) || Number(offset) < 0 || Number(offset) > sourceText.length || args.lineStart !== undefined || args.lineEnd !== undefined || args.withLineNumbers) throw new Error("Invalid characterOffset or mixed line/character modes.");
+      const start = Number(offset), text = sourceText.slice(start, start + 6000), next = start + text.length;
+      return {content: [{type: "text", text}], structuredContent: {...fileMetadata, text, characterOffset: start,
+        characterCount: sourceText.length, truncated: next < sourceText.length, ...(next < sourceText.length ? {nextCharacterOffset: next} : {})}};
+    }
     const lines = sourceText.split(/\r?\n/);
     const requestedStart = integerArgument(args.lineStart);
     const requestedEnd = integerArgument(args.lineEnd);
@@ -361,35 +481,50 @@ async function callTool(params: Record<string, unknown> | undefined): Promise<Re
       throw new Error("lineEnd 不能小于 lineStart。");
     }
     const lineStart = Math.min(requestedStart ?? 1, lines.length);
-    const lineEnd = Math.min(requestedEnd ?? lines.length, lines.length);
-    const selectedLines = lines.slice(lineStart - 1, lineEnd);
+    let lineEnd = Math.min(requestedEnd ?? lines.length, lines.length, lineStart + 199);
+    let selectedLines = lines.slice(lineStart - 1, lineEnd);
     const withLineNumbers = args.withLineNumbers === true;
-    const text = withLineNumbers
-      ? selectedLines.map((line, index) => `${lineStart + index}: ${line}`).join("\n")
-      : selectedLines.join("\n");
+    const render = () => withLineNumbers ? selectedLines.map((line, index) => `${lineStart + index}: ${line}`).join("\n") : selectedLines.join("\n");
+    let text = render();
+    while (text.length > 6000 && selectedLines.length > 1) { selectedLines.pop(); lineEnd--; text = render(); }
+    if (text.length > 6000) throw new Error(`Line ${lineStart} is too long; use characterOffset=${sourceText.split("\n").slice(0, lineStart - 1).join("\n").length + (lineStart > 1 ? 1 : 0)} and follow nextCharacterOffset. Use the original project-relative path, never a CLI cache path.`);
     return {
       content: [{ type: "text", text }],
       // Claude CLI currently surfaces structuredContent as the tool result when both fields exist.
       // Keep the authorized UTF-8 body in both representations so the Agent can actually inspect it.
       structuredContent: {
-        path: target.relativePath,
-        sizeBytes: body.byteLength,
+        ...fileMetadata,
         text,
         lineStart,
         lineEnd,
         lineCount: lines.length,
-        withLineNumbers
+        withLineNumbers,
+        truncated: lineEnd < lines.length,
+        ...(lineEnd < lines.length ? { nextLineStart: lineEnd + 1 } : {})
       }
     };
   }
   if (name === "write_artifact" || name === "append_document") {
     const path = requiredString(args.path, "path");
-    let content = requiredString(args.content, "content", true);
+    if (args.document !== undefined &&
+        (name !== "write_artifact" || args.content !== undefined || !path.endsWith(".json") || !isRecord(args.document))) {
+      throw new Error("document 仅用于 .json 整份对象写入，不能与 content 同时提供或用于追加。");
+    }
+    let content = args.document !== undefined
+      ? `${JSON.stringify(args.document, null, 2)}\n`
+      : requiredString(args.content, "content", true);
     if (Buffer.byteLength(content, "utf8") > 5 * 1024 * 1024) {
       throw new Error("单次 MCP 文本写入不能超过 5 MB。");
     }
     let target = resolveAuthorizedTarget(path, false, "artifact_write");
     const outputArtifact = taskOutputArtifacts().find((artifact) => artifact.path === target.relativePath);
+    if (target.relativePath === selfCheckPath) throw new Error("Self-check reports are server-owned; call run_implementation_checks after editing source, do not write a result yourself.");
+    if (target.relativePath === implementationReviewPath) {
+      if (agentId !== "qa_evaluator" || name !== "write_artifact" || !lastImplementationCheck) throw new Error("Independent QA must first run_implementation_checks in this invocation, then submit a grounded implementation_review JSON.");
+      const current = runImplementationChecks(projectRoot, cocosEngineSettingsStore.getResolvedConfig().executablePath);
+      if (current.fingerprint !== lastImplementationCheck.fingerprint) throw new Error("Source changed after QA checks; run_implementation_checks again before submitting review.");
+      content = `${JSON.stringify(validateImplementationReview(projectRoot, JSON.parse(content), current), null, 2)}\n`;
+    }
     const canonicalReviewPath = getQualityReviewArtifactContracts().some(
       (contract) => contract.path === target.relativePath
     );
@@ -425,6 +560,19 @@ async function callTool(params: Record<string, unknown> | undefined): Promise<Re
     assertQaEvidenceWriteAllowed(target.relativePath, name);
     assertContractPathContent(target.relativePath, content, name === "append_document" ? "append" : "write");
     const contractType = contractArtifactTypeForPath(target.relativePath);
+    if (name === "write_artifact" && (contractType === "scene_blueprint" || contractType === "playtest_contract")) {
+      const readInput = (type: string) => {
+        const input = taskInputArtifacts().find((artifact) => artifact.type === type);
+        if (!input) throw new Error(`${contractType} requires task-bound ${type} input`);
+        const source = resolveAuthorizedTarget(input.path, false, "read");
+        return JSON.parse(readFileSync(source.absolutePath, "utf8"));
+      };
+      const game = parseGameContract(readInput("game_contract"));
+      const compatibility = contractType === "scene_blueprint"
+        ? validateSceneBlueprintCompatibility(parseSceneBlueprint(JSON.parse(content)), game)
+        : validatePlaytestContractCompatibility(parsePlaytestContract(JSON.parse(content)), game, parseSceneBlueprint(readInput("scene_blueprint")));
+      if (!compatibility.ok) throw new ContractValidationError(`${contractType} upstream compatibility`, compatibility.issues);
+    }
     if (contractType && name === "write_artifact") {
       const previousContent = existsSync(target.absolutePath) && statSync(target.absolutePath).isFile()
         ? readFileSync(target.absolutePath, "utf8")
@@ -503,6 +651,7 @@ async function callTool(params: Record<string, unknown> | undefined): Promise<Re
       return `data:${imageMimeForPath(source.relativePath)};base64,${bytes.toString("base64")}`;
     });
     const generated = await createMcpMultimodalProvider().generateImage({
+      normalization: parseRasterNormalization(args.normalization),
       prompt: requiredString(args.prompt, "prompt"),
       size: typeof args.size === "string" ? args.size : "1024*1024",
       ...(typeof args.negativePrompt === "string" && args.negativePrompt.trim()
@@ -534,6 +683,7 @@ async function callTool(params: Record<string, unknown> | undefined): Promise<Re
       mime: generated.mime,
       endpointFingerprint: generated.endpointFingerprint,
       latencyMs: generated.latencyMs,
+      normalizationReceipt: generated.normalizationReceipt,
       hash,
       sizeBytes: stats.size
     });
@@ -556,9 +706,45 @@ async function callTool(params: Record<string, unknown> | undefined): Promise<Re
         height: generated.height,
         mime: generated.mime,
         endpointFingerprint: generated.endpointFingerprint,
-        latencyMs: generated.latencyMs
+        latencyMs: generated.latencyMs,
+        normalizationReceipt: generated.normalizationReceipt
       }
     };
+  }
+  if (name === "resubmit_existing_asset" && agentId === "asset_production") {
+    const target = resolveAuthorizedTarget(requiredString(args.path, "path"), false, "artifact_write");
+    const artifact = taskOutputArtifacts().find((a) => a.path === target.relativePath && a.ownerAgentId === agentId);
+    if (!artifact || !target.relativePath.startsWith("assets/art/first-playable/") || !target.relativePath.endsWith(".png")) throw new Error("Only own registered runtime PNGs can be resubmitted.");
+    const bytes = readFileSync(target.absolutePath);
+    const hash = createHash("sha256").update(bytes).digest("hex");
+    if (hash !== requiredString(args.expectedHash, "expectedHash")) throw new Error("Resubmission expectedHash does not match current bytes.");
+    const reason = requiredString(args.reason, "reason");
+    recordOperation({ toolName: name, path: target.relativePath, access: "write", status: "completed", hash,
+      sizeBytes: bytes.length, resubmissionReason: reason });
+    return { content: [{ type: "text", text: JSON.stringify({ path: target.relativePath, hash, sizeBytes: bytes.length,
+      status: "pending_parent_verification", note: "No bytes changed. Original generation evidence must pass before submission; independent visual review remains required." }) }] };
+  }
+  if (name === "compose_asset_contact_sheet" && agentId === "asset_production") {
+    const path = requiredString(args.path, "path");
+    const output = taskOutputArtifacts().find((a) => a.artifactId === "artifact_asset_contact_sheet");
+    if (!output || output.path !== normalizeAuthorizationPath(path)) throw new Error("Only the canonical contact sheet output can be composed.");
+    let target = resolveAuthorizedTarget(path, false, "artifact_write");
+    if (!Array.isArray(args.sources) || args.sources.length < 1 || args.sources.length > 32) throw new Error("sources must contain 1–32 PNGs");
+    const sources = args.sources.map((item: unknown) => {
+      if (!isRecord(item)) throw new Error("Invalid contact sheet source");
+      const source = resolveAuthorizedTarget(requiredString(item.path, "source.path"), false, "read");
+      if (!source.relativePath.startsWith("assets/art/first-playable/") || !source.relativePath.endsWith(".png")) throw new Error("Contact sheet sources must be task-authorized runtime PNGs");
+      if (statSync(source.absolutePath).size > 10 * 1024 * 1024) throw new Error("Contact sheet source too large");
+      return { path: source.relativePath, label: requiredString(item.label, "source.label"), buffer: readFileSync(source.absolutePath) };
+    });
+    const composed = composeAssetContactSheet(sources, typeof args.title === "string" ? args.title : "Runtime asset contact sheet");
+    mkdirSync(dirname(target.absolutePath), { recursive: true });
+    target = resolveAuthorizedTarget(path, false, "artifact_write");
+    writeFileSync(target.absolutePath, composed.buffer, { mode: 0o600 });
+    recordOperation({ toolName: name, path: target.relativePath, access: "write", status: "completed",
+      operationType: "asset_contact_sheet", operationId: composed.receipt.outputHash, hash: composed.receipt.outputHash,
+      sizeBytes: composed.buffer.length, contactSheetReceipt: composed.receipt });
+    return { content: [{ type: "text", text: JSON.stringify({ path: target.relativePath, sizeBytes: composed.buffer.length, receipt: composed.receipt }) }] };
   }
   if (name === "inspect_visual_assets" && agentId === "visual_quality_reviewer") {
     const inspectionInvocationId = requiredEnvironment("BTP_HARNESS_INVOCATION_ID");
@@ -686,6 +872,12 @@ async function callTool(params: Record<string, unknown> | undefined): Promise<Re
       throw new Error(`不支持的任务状态：${status}`);
     }
     const reason = requiredString(args.reason, "reason");
+    if (status === "ready_for_review" && agentId === "gameplay_programmer" && taskOutputArtifacts().some((artifact) => artifact.path === selfCheckPath)) {
+      const checks = runImplementationChecks(projectRoot, cocosEngineSettingsStore.getResolvedConfig().executablePath);
+      if (!lastImplementationCheck || checks.fingerprint !== lastImplementationCheck.fingerprint || checks.status !== "pass") {
+        throw new Error(`Cannot submit implementation for review: run_implementation_checks after the final edit and fix its errors. Current result: ${JSON.stringify(checks)}`);
+      }
+    }
     const handoffAgentIds = Array.isArray(args.handoffAgentIds)
       ? args.handoffAgentIds.filter((agentId): agentId is string => typeof agentId === "string" && Boolean(agentId.trim()))
       : [];
@@ -695,6 +887,24 @@ async function callTool(params: Record<string, unknown> | undefined): Promise<Re
       content: [{ type: "text", text: `任务状态已回传：${status}；${reason}` }],
       structuredContent: { status, reason, handoffAgentIds }
     };
+  }
+  if (name === "run_implementation_checks") {
+    // This fixed-scope service reads only engineering sources and the current
+    // blueprint, not arbitrary model-supplied host paths.
+    const result = runImplementationChecks(projectRoot, cocosEngineSettingsStore.getResolvedConfig().executablePath);
+    lastImplementationCheck = result;
+    const output = agentId === "gameplay_programmer" ? taskOutputArtifacts().find((artifact) => artifact.path === selfCheckPath) : undefined;
+    if (output) {
+      const target = resolveAuthorizedTarget(output.path, false, "artifact_write");
+      mkdirSync(dirname(target.absolutePath), { recursive: true });
+      const content = `${JSON.stringify(result, null, 2)}\n`;
+      writeFileSync(target.absolutePath, content, "utf8");
+      recordOperation({ toolName: name, path: output.path, access: "write", status: "completed",
+        hash: createHash("sha256").update(content).digest("hex"), sizeBytes: Buffer.byteLength(content) });
+    } else {
+      recordOperation({ toolName: name, path: "assets/scripts", access: "read", status: "completed" });
+    }
+    return { content: [{ type: "text", text: JSON.stringify(result) }], structuredContent: result };
   }
   if (name === "run_playtest" && agentId === "qa_evaluator") {
     const reportArtifact = taskOutputArtifacts().find((artifact) => artifact.type === "qa_report");
@@ -720,7 +930,10 @@ async function callTool(params: Record<string, unknown> | undefined): Promise<Re
         path: item.path,
         hash: item.hash,
         sizeBytes: item.sizeBytes,
-        status: result.ok ? "completed" : "failed",
+        // A failed playtest is still a successfully produced machine report.
+        // Its fail/blocked verdict must reach QA ingestion to create repairs,
+        // not be discarded as an unauthorized partial tool write.
+        status: "completed",
         operationId: result.operationId,
         operationType: "playtest",
         ...(result.ok ? {} : { error: result.summary })
@@ -958,6 +1171,7 @@ function buildMcpVisionAuthoritativeContext(contract: QualityReviewArtifactContr
   return buildVisionReviewAuthoritativeContext({
     contract,
     artifacts,
+    producerDecisions: JSON.parse(process.env.BTP_VISION_PRODUCER_DECISIONS ?? "[]"),
     readRuntimeAsset: (path) => {
       const target = resolveAuthorizedTarget(path, false, "read");
       if (!existsSync(target.absolutePath) || !statSync(target.absolutePath).isFile()) {

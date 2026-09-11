@@ -131,11 +131,17 @@ try {
     reviewerAgentId: "untrusted_placeholder",
     targets: designInputs
   });
+  validDesignReview.criteria[0].findings[0].summary += ' Producer said "review, not approval".\nKeep this newline.';
   const validReviewResult = runMcp(designReviewAuthorization, "design_quality_reviewer", [
-    rpc(13, "tools/call", { name: "write_artifact", arguments: { path: designReviewPath, content: JSON.stringify(validDesignReview) } })
+    rpc(13, "tools/call", { name: "write_artifact", arguments: { path: designReviewPath, document: validDesignReview } }),
+    rpc(130, "tools/call", { name: "write_artifact", arguments: { path: designReviewPath, document: validDesignReview, content: "{}" } }),
+    rpc(131, "tools/call", { name: "write_artifact", arguments: { path: designReviewPath, document: {} } })
   ], qualityEnv);
   assert.equal(validReviewResult.get(13)?.result?.isError, undefined);
+  assert.equal(validReviewResult.get(130)?.result?.isError, true, "ambiguous content+document must fail before writing");
+  assert.equal(validReviewResult.get(131)?.result?.isError, true, "structured input cannot bypass strict quality schema validation");
   const stampedReview = JSON.parse(readFileSync(join(projectRoot, designReviewPath), "utf8"));
+  assert.equal(stampedReview.criteria[0].findings[0].summary, validDesignReview.criteria[0].findings[0].summary);
   assert.equal(stampedReview.reviewerAgentId, "design_quality_reviewer", "server must stamp reviewer identity");
   assert.deepEqual(stampedReview.modelTrace, {
     providerId: "test-provider",
@@ -374,6 +380,25 @@ globalThis.fetch = async (_input, init = {}) => {
     reviewBeforeSemanticForgery,
     "a major vision observation rewritten as a 100-point pass must be rejected before bytes change"
   );
+  const directVisionSubmission = await runMcpSequential(visualReviewAuthorization, "visual_quality_reviewer", [
+    rpc(156, "tools/call", { name: "submit_visual_review", arguments: {} }),
+    rpc(157, "tools/call", { name: "inspect_visual_assets", arguments: { paths: [artBoardPath] } }),
+    rpc(158, "tools/call", { name: "submit_visual_review", arguments: {} })
+  ], {
+    ...qualityEnv,
+    NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --import=${fakeMajorVisionFetch}`.trim(),
+    BTP_TASK_INPUT_EVIDENCE: JSON.stringify(visualInputs),
+    BTP_HARNESS_INVOCATION_ID: "inv_visual_direct_submission",
+    BTP_MULTIMODAL_API_KEY: "test-only",
+    BTP_VISION_REVIEW_ENDPOINT: "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+    BTP_VISION_REVIEW_MODEL: "qwen3.8-max"
+  });
+  assert.equal(directVisionSubmission.get(156)?.result?.isError, true, "direct submission cannot bypass inspection");
+  assert.equal(directVisionSubmission.get(158)?.result?.isError, undefined, JSON.stringify(directVisionSubmission.get(158)));
+  const directlySubmitted = JSON.parse(readFileSync(join(projectRoot, visualReviewPath), "utf8"));
+  assert.equal(directlySubmitted.verdict, "change_requested", "direct submission preserves a negative result");
+  assert.deepEqual(directlySubmitted.criteria, majorVisionResponse.criteria);
+  assert.ok(directlySubmitted.requiredChanges.length > 0, "negative findings generate actionable author feedback");
 
   const generationFailureLog = join(root, "generation-failure.jsonl");
   const artGenerationAuthorization = {

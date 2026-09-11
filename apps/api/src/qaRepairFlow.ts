@@ -33,6 +33,32 @@ export function materializeQaFailureRepairs(kernel: StudioKernel, qaTask: Task):
   const repairTaskIds: string[] = [];
 
   for (const defect of effectiveDefects) {
+    const originalTaskId = {
+      gameplay_programmer: "task_stage_2_cocos_implementation",
+      cocos_tech_lead: "task_stage_2_cocos_architecture",
+      cocos_automation: "task_stage_2_cocos_build",
+      art_director: "task_stage_2_asset_pipeline"
+    }[defect.ownerAgentId];
+    const originalTask = kernel.findTask(originalTaskId);
+    if (originalTask && originalTask.stageId === qaTask.stageId && originalTask.taskLevel !== "task_group" &&
+        originalTask.status !== "cancelled" && originalTask.outputArtifacts.length > 0 &&
+        (originalTask.ownerAgentId === defect.ownerAgentId || (defect.ownerAgentId === "art_director" && originalTask.ownerAgentId === "asset_production"))) {
+      // Repairs must execute under the original artifact-owning task. A new
+      // ticket cannot overwrite another task's source, and making a failed QA
+      // report a mandatory input creates QA -> repair -> QA dependency cycles.
+      repairAgentIds.add(originalTask.ownerAgentId);
+      if (!repairTaskIds.includes(originalTask.taskId)) repairTaskIds.push(originalTask.taskId);
+      const marker = `QA_PLAYTEST_REPAIR:[playtest:${result.operationId}]:${defect.defectId}`;
+      if (!originalTask.description.includes(marker)) {
+        kernel.updateTask(originalTask.taskId, {status: "doing", progressPercent: 50, blockers: [], updatedAt: now,
+          description: `${originalTask.description}\n${marker}\n${defect.title}：${defect.details}；历史失败证据：${defect.evidencePaths.join("、")}。必须修改本任务拥有的实际产物，重新自检、构建并交回 QA 真实复测；修复说明不能代替实际修复。`});
+        for (const id of originalTask.outputArtifacts) {
+          const output = kernel.listArtifacts().find((artifact) => artifact.artifactId === id);
+          if (output) kernel.upsertArtifact({...output, status: "change_requested", updatedAt: now});
+        }
+      }
+      continue;
+    }
     repairAgentIds.add(defect.ownerAgentId);
     const fingerprint = createHash("sha1").update(`${result.operationId}:${defect.defectId}`).digest("hex").slice(0, 12);
     const taskId = `task_qa_repair_${fingerprint}`;
@@ -166,8 +192,8 @@ function writeQaFailureMessages(
     ].join("\n")
   });
 
-  for (const agentId of [...new Set(seriousDefects.map((defect) => defect.ownerAgentId))]) {
-    const defects = seriousDefects.filter((defect) => defect.ownerAgentId === agentId);
+  for (const agentId of [...new Set(repairTaskIds.map((id) => kernel.findTask(id)?.ownerAgentId).filter((id): id is AgentId => Boolean(id)))]) {
+    const defects = seriousDefects.filter((defect) => defect.ownerAgentId === agentId || (defect.ownerAgentId === "art_director" && agentId === "asset_production"));
     const taskIds = repairTaskIds.filter((taskId) => kernel.findTask(taskId)?.ownerAgentId === agentId);
     writePlaytestMessageOnce(kernel, {
       operationId: result.operationId,

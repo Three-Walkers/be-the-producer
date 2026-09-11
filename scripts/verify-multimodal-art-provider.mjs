@@ -4,7 +4,8 @@ import { createHash } from "node:crypto";
 const {
   DashScopeMultimodalArtProvider,
   MultimodalArtProviderError,
-  hashArtVisionAuthoritativeContext
+  hashArtVisionAuthoritativeContext,
+  parseArtVisionSemanticResult
 } = await import("../apps/api/dist/multimodalArtProvider.js");
 
 const IMAGE_ENDPOINT = "https://dashscope.example/api/v1/services/aigc/multimodal-generation/generation";
@@ -62,6 +63,19 @@ const PNG = Buffer.from(
   "base64"
 );
 const PNG_DATA_URL = `data:image/png;base64,${PNG.toString("base64")}`;
+
+const arithmeticDrift = { ...structuredClone(REVIEW_RESULT), scoreTotal: 85 };
+const arithmeticProvider = provider(async () => jsonResponse({
+  id: "arithmetic-drift", choices: [{ message: { content: JSON.stringify(arithmeticDrift) } }]
+}));
+const correctedArithmetic = await arithmeticProvider.reviewImages({
+  rubric: VISION_RUBRIC, authoritativeContext: AUTHORITATIVE_CONTEXT,
+  images: [{path:VISION_PATH,mime:"image/png",buffer:PNG}]
+});
+assert.equal(correctedArithmetic.result.scoreTotal,90,"server must calculate weighted totals from validated criterion scores");
+assert.equal(correctedArithmetic.rawHash,sha256(JSON.stringify(arithmeticDrift)),"original model response stays hash-bound");
+assert.throws(()=>parseArtVisionSemanticResult(arithmeticDrift,VISION_RUBRIC,[VISION_PATH]),/weighted score/,
+  "persisted or signed receipts must still reject arithmetic tampering");
 
 const mainCalls = [];
 const mainProvider = provider(async (input, init) => {

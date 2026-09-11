@@ -265,7 +265,7 @@ function collectEvidenceLanes(
   ];
   const artifactMissing = [
     ...episodeTasks
-      .filter((task) => ["review", "done"].includes(task.status) && !taskOutputsVerified(kernel, task))
+      .filter((task) => ["review", "done"].includes(task.status) && !taskCompletionEvidenceVerified(kernel, task))
       .map((task) => `任务 ${task.taskId} 的登记输出尚未全部验证`),
     ...kernel.listClaimRepairs().filter((repair) => repair.status === "open").map((repair) => `声明补证 ${repair.repairId} 尚未关闭`)
   ];
@@ -381,7 +381,7 @@ function reconcileFindings(
     });
   }
   for (const task of kernel.listTasks().filter((candidate) => episode.taskIds.includes(candidate.taskId))) {
-    if (!["review", "done"].includes(task.status) || taskOutputsVerified(kernel, task)) continue;
+    if (!["review", "done"].includes(task.status) || taskCompletionEvidenceVerified(kernel, task)) continue;
     drafts.push(taskEvidenceFinding(task));
   }
   for (const repair of kernel.listClaimRepairs().filter((candidate) => candidate.status === "open")) {
@@ -400,13 +400,18 @@ function reconcileFindings(
     });
   }
   for (const claim of kernel.listClaimVerifications().filter((candidate) => candidate.verdict === "mismatch")) {
+    if (kernel.listClaimRepairs().some((repair) =>
+      (repair.claimId === claim.claimId || repair.repairId === claim.metadata.repairId) &&
+      repair.status === "resolved" && repair.resolution === "claim_retracted")) continue;
     if (kernel.listClaimRepairs().some((repair) => repair.claimId === claim.claimId && repair.status === "open")) continue;
     drafts.push({
       signature: `claim-mismatch:${claim.claimId}`,
       ownerAgentId: claim.agentId,
-      severity: "high",
+      // A proposed path is not a claim of completed work. Keep broken references
+      // visible without turning a future-work list into a production blocker.
+      severity: claim.claimType === "path_reference" ? "low" : "high",
       dimension: "artifact_integrity",
-      title: "Agent 声明与实际文件不一致",
+      title: claim.claimType === "path_reference" ? "引用路径尚未物化或需要核对" : "Agent 声明与实际文件不一致",
       reason: claim.reason,
       evidenceRefs: [`claim:${claim.claimId}`, ...claim.evidenceRefs],
       expectedOutcome: "声明引用的文件、版本与工具操作证据完全一致。",
@@ -524,6 +529,23 @@ function upsertIntervention(kernel: StudioKernel, finding: ProductionAuditFindin
     updatedAt: now
   };
   kernel.upsertIntervention(entry);
+}
+
+function taskCompletionEvidenceVerified(kernel: StudioKernel, task: Task): boolean {
+  // Groups aggregate their children; each actual task is audited independently.
+  if (task.taskLevel === "task_group") return true;
+  const repair = kernel.listClaimRepairs().find((entry) => entry.taskId === task.taskId);
+  if (!repair) return taskOutputsVerified(kernel, task);
+  if (repair.status !== "resolved") return false;
+  if (repair.resolution === "claim_retracted") {
+    const message = kernel.listMessages().find((entry) => entry.messageId === repair.resolutionMessageId);
+    const source = kernel.listMessages().find((entry) => entry.messageId === repair.messageId);
+    return Boolean(message && source && message.senderType === "agent" && message.senderId === repair.agentId &&
+      Date.parse(message.createdAt) >= Date.parse(source.createdAt) &&
+      message.content.split(/\r?\n/, 1)[0]?.trim() === `撤回声明：${repair.claimId}`);
+  }
+  return kernel.listClaimVerifications().some((claim) => claim.claimId === repair.resolutionClaimId &&
+    claim.agentId === repair.agentId && claim.verdict === "verified");
 }
 
 function taskEvidenceFinding(task: Task): FindingDraft {
