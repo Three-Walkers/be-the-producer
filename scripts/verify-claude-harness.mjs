@@ -97,7 +97,18 @@ chmodSync(fakeClaude, 0o755);
 process.env.CLAUDE_CLI_PATH = fakeClaude;
 process.env.TEST_SECRET_SHOULD_NOT_LEAK = "super-secret";
 
-const { ClaudeCliHarness, ClaudeCliProcessError, ClaudeSessionResumeError } = await import("../apps/api/dist/claudeCliHarness.js");
+const { ClaudeCliHarness, ClaudeCliProcessError, ClaudeSessionResumeError, diagnoseClaudeCliFailure } = await import("../apps/api/dist/claudeCliHarness.js");
+for (const detail of [
+  'API Error: 400 {"code":"Arrearage","message":"Access denied"}',
+  'API Error: 429 {"code":"insufficient_quota"}',
+  "API Error: credit balance is too low"
+]) {
+  const diagnosed = diagnoseClaudeCliFailure({ stdout: "", stderr: detail });
+  assert.equal(diagnosed.kind, "provider_billing");
+  assert.equal(diagnosed.retryable, false);
+  assert.match(diagnosed.detail, /计费/);
+}
+assert.equal(diagnoseClaudeCliFailure({ stdout: "", stderr: "API Error: 429 too many requests" }).retryable, true);
 const { captureWorkspaceSnapshot, recordHarnessWorkspaceChanges } = await import("../apps/api/dist/harnessWorkspaceEvidence.js");
 const { createStudioKernel, defaultAgentContracts, getQualityReviewArtifactContracts } = await import("@game-pipeline/agent-runtime");
 const { createTaskHarnessAuthorization } = await import("../apps/api/dist/toolAuthorization.js");
@@ -307,6 +318,16 @@ const repeatedWriteEvidence = recordHarnessWorkspaceChanges(
   ["docs/design/harness-proof.md"]
 );
 assert.deepEqual(repeatedWriteEvidence.changedPaths, ["docs/design/harness-proof.md"]);
+const sameFile = unchangedAfter.get("docs/design/harness-proof.md");
+const repeatOperation = { toolName: "write_artifact", path: sameFile.path, hash: sameFile.hash,
+  sizeBytes: sameFile.sizeBytes, access: "write", status: "completed" };
+const authoritativeRepeat = (operation) => recordHarnessWorkspaceChanges(kernel, task, agent, unchangedBefore,
+  unchangedAfter, "inv_authoritative_repeat", undefined, operation ? [operation] : [], { authoritativeWorkspace: true });
+assert.deepEqual(authoritativeRepeat().changedPaths, [], "existing bytes alone cannot resubmit an output");
+assert.deepEqual(authoritativeRepeat({ ...repeatOperation, access: "read" }).changedPaths, []);
+assert.deepEqual(authoritativeRepeat({ ...repeatOperation, status: "failed" }).changedPaths, []);
+assert.deepEqual(authoritativeRepeat({ ...repeatOperation, hash: "0".repeat(64) }).changedPaths, []);
+assert.deepEqual(authoritativeRepeat(repeatOperation).changedPaths, [sameFile.path], "byte-matching authorized idempotent writes must survive staging diff analysis");
 
 await harness.run({
   projectId: kernel.project.projectId,
@@ -328,6 +349,7 @@ for (const unsafeBuiltin of ["Read", "Glob", "Grep", "Bash"]) {
   assert.equal(toolsArg.includes(unsafeBuiltin), false, `Claude task tools must not expose ${unsafeBuiltin}`);
 }
 assert.ok(toolsArg.includes("mcp__btp_workspace__read_file"));
+assert.ok(toolsArg.includes("mcp__btp_workspace__read_image"));
 const mcpConfigArg = JSON.parse(args[args.indexOf("--mcp-config") + 1]);
 assert.equal(mcpConfigArg.mcpServers.btp_workspace.env.BTP_TOOL_MODE, "task");
 assert.equal(JSON.parse(mcpConfigArg.mcpServers.btp_workspace.env.BTP_VISION_PRODUCER_DECISIONS)[0].messageId, "producer_scope");

@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { spawn } from "node:child_process";
+import { createInterface } from "node:readline";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 const tempRoot = mkdtempSync(join(tmpdir(), "game-contract-gates-"));
 process.env.STUDIO_WORKSPACE_ROOT = join(tempRoot, "studio");
@@ -11,8 +14,20 @@ const { createStudioKernel } = await import("@game-pipeline/agent-runtime");
 const { executeAgentToolRequests } = await import("../apps/api/dist/toolExecutor.js");
 const { artifactReadyForConsumption } = await import("../apps/api/dist/taskOutputEvidence.js");
 const { resolveWorkspacePathTarget, syncProjectWorkspace } = await import("../apps/api/dist/workspaceWriter.js");
+const { assertContractRevisionAdvance } = await import("../apps/api/dist/contractArtifacts.js");
 
 try {
+  for (const [type, fixture] of [["game_contract", gameContractFixture()], ["scene_blueprint", sceneBlueprintFixture()], ["playtest_contract", playtestContractFixture()]]) {
+    const historical = { ...structuredClone(fixture), no_longer_valid: true };
+    const next = structuredClone(fixture);
+    if (type === "game_contract") next.identity.revision++;
+    else next.revision++;
+    assert.doesNotThrow(() => assertContractRevisionAdvance(type, JSON.stringify(historical), JSON.stringify(next)), "valid repairs must not be rejected by validating the historical body again");
+    assert.throws(() => assertContractRevisionAdvance(type, JSON.stringify(historical), JSON.stringify(fixture)), /revision.*递增/, "an invalid old body still enforces the revision floor");
+    assert.throws(() => assertContractRevisionAdvance(type, JSON.stringify(historical), JSON.stringify({ ...next, invalid_candidate: true })), /校验/, "new candidate remains strictly validated");
+    assert.throws(() => assertContractRevisionAdvance(type, "{broken", JSON.stringify(next)), /revision.*无法读取/);
+    assert.throws(() => assertContractRevisionAdvance(type, '{"revision":0,"identity":{"revision":0}}', JSON.stringify(next)), /revision.*正整数/);
+  }
   const projectId = "contract_artifact_gates";
   const kernel = createStudioKernel(projectId, "Contract Artifact Gates", "producer_test", "验证契约写入与消费门禁");
   const now = new Date().toISOString();
@@ -171,9 +186,86 @@ try {
     false,
     "schema-compatible external contract edits must fail current file hash/size evidence",
   );
-  console.log("Contract artifact gates passed: placeholder, schema, revision, compatibility, consumption");
+  await verifyRejectedContractDraftEditing();
+  console.log("Contract artifact gates passed: placeholder, schema, revision, compatibility, consumption, isolated draft repair");
 } finally {
   rmSync(tempRoot, { recursive: true, force: true });
+}
+
+async function verifyRejectedContractDraftEditing() {
+  const projectRoot = join(tempRoot, "draft-fixture");
+  const path = "agents/qa/contracts/core-loop.playtest-contract.json";
+  const gamePath = "agents/design/contracts/game-contract.json";
+  const scenePath = "agents/engineering/cocos-scene-blueprints/main.scene-blueprint.json";
+  const reportPath = "agents/qa/playtest-reports/report-001.md";
+  const write = (file, text) => { mkdirSync(dirname(join(projectRoot, file)), { recursive: true }); writeFileSync(join(projectRoot, file), text); };
+  const body = (document) => `${JSON.stringify(document, null, 2)}\n`;
+  const hash = (text) => createHash("sha256").update(text).digest("hex");
+  const original = body({ ...playtestContractFixture(), legacy_invalid_field: true });
+  write(path, original); write(gamePath, body(gameContractFixture())); write(scenePath, body(sceneBlueprintFixture()));
+  write(reportPath, "# Server QA report\n");
+  const authorization = { mode: "task", taskId: "qa_draft_task", inputArtifactIds: ["game", "scene"], outputArtifactIds: ["test", "report"],
+    readRoots: [], serviceReadPaths: [], serviceWritePaths: [], artifacts: [
+      { artifactId: "game", type: "game_contract", path: gamePath, ownerAgentId: "game_designer" },
+      { artifactId: "scene", type: "scene_blueprint", path: scenePath, ownerAgentId: "cocos_tech_lead" },
+      { artifactId: "test", type: "playtest_contract", path, ownerAgentId: "qa_evaluator", sourceTaskId: "qa_draft_task" },
+      { artifactId: "report", type: "qa_report", path: reportPath, ownerAgentId: "qa_evaluator", sourceTaskId: "qa_draft_task" }
+    ] };
+  const operations = join(tempRoot, "draft-operations.jsonl");
+  const client = () => {
+    const child = spawn(process.execPath, [resolve("apps/api/dist/harnessMcpServer.js")], { stdio: ["pipe", "pipe", "pipe"],
+      env: { ...process.env, BTP_PROJECT_ROOT: projectRoot, BTP_AGENT_ID: "qa_evaluator", BTP_TOOL_MODE: "task",
+        BTP_AUTHORIZATION: JSON.stringify(authorization), BTP_OPERATION_LOG_PATH: operations } });
+    let id = 0, stderr = "";
+    const pending = new Map();
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    const reader = createInterface({ input: child.stdout });
+    reader.on("line", (line) => { const message = JSON.parse(line); pending.get(message.id)?.(message.result); pending.delete(message.id); });
+    return { call: (name, args) => new Promise((done, reject) => {
+      const requestId = ++id, timer = setTimeout(() => reject(new Error(`MCP response timeout: ${stderr}`)), 10000);
+      pending.set(requestId, (result) => { clearTimeout(timer); done(result); });
+      child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: requestId, method: "tools/call", params: { name, arguments: args } })}\n`);
+    }), close: () => new Promise((done) => { child.once("close", done); child.stdin.end(); reader.close(); }) };
+  };
+  let mcp = client();
+  const errorHash = (result) => { assert.equal(result.isError, true); const matched = /rejectedDraftHash=([a-f0-9]{64})/.exec(result.content[0].text); assert.ok(matched, result.content[0].text); return matched[1]; };
+  try {
+    const document = { ...playtestContractFixture(), revision: 2, typo: true };
+    const firstHash = errorHash(await mcp.call("write_artifact", { path, document }));
+    assert.equal(firstHash, hash(body(document)));
+    assert.equal(readFileSync(join(projectRoot, path), "utf8"), original, "invalid draft leaves published bytes untouched");
+    const patch = { path, source: "last_rejected", expectedHash: firstHash, edits: [{ oldText: ',\n  "typo": true', newText: "" }] };
+    const ambiguous = await mcp.call("edit_artifact", { ...patch, edits: [{ oldText: '"type"', newText: '"bad_type"' }] });
+    assert.match(ambiguous.content[0].text, /edits\[0\].oldText matches multiple/);
+    const missing = await mcp.call("edit_artifact", { ...patch, edits: [{ oldText: "nonexistent_span", newText: "replacement" }] });
+    assert.match(missing.content[0].text, /edits\[0\].oldText matches zero/);
+    assert.equal((await mcp.call("edit_artifact", { ...patch, expectedHash: "0".repeat(64) })).isError, true, "draft hash is mandatory");
+    assert.equal((await mcp.call("edit_artifact", { ...patch, path: gamePath })).isError, true, "draft cannot cross task ownership");
+    write(path, original + "\n");
+    assert.equal((await mcp.call("edit_artifact", patch)).isError, true, "draft cannot overwrite a concurrently changed published file");
+    write(path, original);
+    assert.equal((await mcp.call("edit_artifact", patch)).isError, undefined);
+    const current = readFileSync(join(projectRoot, path), "utf8");
+    assert.equal(JSON.parse(current).revision, 2);
+    assert.equal(JSON.parse(current).typo, undefined);
+    assert.equal((await mcp.call("edit_artifact", patch)).isError, true, "successful publication clears the rejected draft");
+    const sameRevision = { ...JSON.parse(current), typo: true };
+    const sameHash = errorHash(await mcp.call("write_artifact", { path, document: sameRevision }));
+    const invalidRevision = await mcp.call("edit_artifact", { ...patch, expectedHash: sameHash, edits: [
+      ...patch.edits, { oldText: '"title": "Complete the primary objective"', newText: '"title": "Changed without a revision"' }
+    ] });
+    const nextHash = errorHash(invalidRevision);
+    assert.match(invalidRevision.content[0].text, /revision|版本/);
+    assert.equal(readFileSync(join(projectRoot, path), "utf8"), current);
+    assert.equal((await mcp.call("edit_artifact", { path: reportPath, expectedHash: hash("# Server QA report\n"),
+      edits: [{ oldText: "Server QA report", newText: "Forged pass" }] })).isError, true, "QA execution receipts remain protected");
+    assert.equal(readFileSync(join(projectRoot, reportPath), "utf8"), "# Server QA report\n");
+    await mcp.close(); mcp = client();
+    assert.equal((await mcp.call("edit_artifact", { ...patch, expectedHash: nextHash })).isError, true, "drafts do not leak across invocations");
+    const completed = readFileSync(operations, "utf8").trim().split("\n").map(JSON.parse).filter((operation) => operation.status === "completed");
+    assert.equal(completed.length, 1, "only the fully validated publication becomes successful tool evidence");
+    assert.equal(completed[0].hash, hash(current));
+  } finally { await mcp.close(); }
 }
 
 async function executeSingleWrite(kernel, { agentId, taskId, path, artifactType, content, artifactId }) {

@@ -466,6 +466,7 @@ async function executePlaytestTool(
   const taskOutputIds = sourceTaskId ? kernel.findTask(sourceTaskId)?.outputArtifacts ?? [] : [];
   let primary: ToolExecutionResult | undefined;
   for (const item of result.evidence) {
+    if (item.path !== result.reportPath && !item.path.startsWith("agents/qa/playtest-runs/")) continue;
     const existing = kernel.listArtifacts().find((artifact) =>
       artifact.path === item.path || (taskOutputIds.includes(artifact.artifactId) && item.path === result.reportPath)
     );
@@ -486,6 +487,7 @@ async function executePlaytestTool(
         toolSourceMessageId: message.messageId,
         toolExecutedAt: now,
         playtestOperationId: result.operationId,
+        ...(item.path !== result.reportPath ? { evidenceRole: "supporting" } : {}),
         playtestVerdict: result.verdict,
         playtestChecks: result.checks,
         playtestDefects: result.defects,

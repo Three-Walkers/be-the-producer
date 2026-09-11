@@ -49,13 +49,25 @@ export function createIsolatedWorkspace(projectRoot: string, label: string): Iso
 export function stageWorkspaceCommit(
   canonicalRoot: string,
   stagingRoot: string,
-  changedPaths: string[]
+  changedPaths: string[],
+  deletedPaths: string[] = []
 ): WorkspaceCommitTransaction {
   const transactionRoot = mkdtempSync(join(tmpdir(), "btp-workspace-commit-"));
   const backupRoot = join(transactionRoot, "backup");
   const applied: Array<{ path: string; target: string; backup?: string }> = [];
   let closed = false;
   try {
+    for (const path of [...new Set(deletedPaths)].sort()) {
+      if (changedPaths.includes(path)) throw new Error(`提交路径不能同时写入和删除：${path}`);
+      const staged = resolvePathWithinRoot(stagingRoot, path, { allowMissing: true, label: "Agent 旧构建文件" });
+      if (existsSync(staged.absolutePath)) throw new Error(`删除路径仍存在于新工作区：${path}`);
+      const target = resolvePathWithinRoot(canonicalRoot, path, { allowMissing: false, expectedKind: "file", label: "Agent 旧构建输出" }).absolutePath;
+      const backup = join(backupRoot, path.split("/").join(sep));
+      mkdirSync(dirname(backup), { recursive: true, mode: 0o700 });
+      copyFileSync(target, backup);
+      applied.push({ path, target, backup });
+      unlinkSync(target);
+    }
     for (const path of [...new Set(changedPaths)].sort()) {
       const source = resolvePathWithinRoot(stagingRoot, path, {
         allowMissing: false,

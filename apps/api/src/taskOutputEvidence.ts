@@ -94,9 +94,10 @@ export function taskOutputsVerified(kernel: StudioKernel, task: Task): boolean {
   // A grounded rejection completes reviewer work and triggers author repairs.
   if (task.taskId === implementationReviewTaskId) {
     const report = artifacts.find((artifact) => task.outputArtifacts.includes(artifact.artifactId) && artifact.path === implementationReviewPath);
-    return !!report && artifactInputProvenanceIsCurrent(kernel, report.artifactId) && !!currentImplementationReport(kernel, report);
+    return !!report && !["change_requested", "rejected", "superseded"].includes(report.status) &&
+      artifactInputProvenanceIsCurrent(kernel, report.artifactId) && !!currentImplementationReport(kernel, report);
   }
-  const registeredOutputsVerified = task.outputArtifacts.every((artifactId) => artifactReadyForConsumption(kernel, artifactId));
+  const registeredOutputsVerified = task.outputArtifacts.every((artifactId) => artifactReadyForTaskCompletion(kernel, artifactId));
   if (!registeredOutputsVerified) {
     return false;
   }
@@ -135,6 +136,15 @@ export function taskOutputsVerified(kernel: StudioKernel, task: Task): boolean {
 }
 
 export function artifactReadyForConsumption(kernel: StudioKernel, artifactId: string): boolean {
+  return artifactEvidenceReady(kernel, artifactId, true);
+}
+
+/** Valid reviewer work may reject its subject; downstream consumption may not. */
+export function artifactReadyForTaskCompletion(kernel: StudioKernel, artifactId: string): boolean {
+  return artifactEvidenceReady(kernel, artifactId, false);
+}
+
+function artifactEvidenceReady(kernel: StudioKernel, artifactId: string, requirePassingReview: boolean): boolean {
   const artifact = kernel.listArtifacts().find((candidate) => candidate.artifactId === artifactId);
   const evidence = kernel.listArtifactLedger().find((candidate) => candidate.artifactId === artifactId);
   if (
@@ -181,7 +191,9 @@ export function artifactReadyForConsumption(kernel: StudioKernel, artifactId: st
     }
   }
   if (artifact.type === "quality_review") {
-    return qualityReviewReadyForTaskCompletion(kernel, artifact.artifactId);
+    return requirePassingReview
+      ? qualityReviewReadyForGate(kernel, artifact.artifactId, true).ok
+      : qualityReviewReadyForTaskCompletion(kernel, artifact.artifactId);
   }
   if ([selfCheckPath, implementationReviewPath].includes(artifact.path)) {
     const report = currentImplementationReport(kernel, artifact);

@@ -8,7 +8,8 @@ const tempRoot = mkdtempSync(join(tmpdir(), "be-the-producer-qa-gate-"));
 process.env.STUDIO_WORKSPACE_ROOT = join(tempRoot, "studio");
 process.env.GAME_PIPELINE_DATA_ROOT = join(tempRoot, "data");
 
-const { createStudioKernel } = await import("../packages/agent-runtime/dist/index.js");
+const { createStudioKernel, createStudioKernelFromSnapshot } = await import("../packages/agent-runtime/dist/index.js");
+const { syncProjectWorkspace } = await import("../apps/api/dist/workspaceWriter.js");
 const { resumeQaTasksAfterVerifiedRepairs, materializeQaFailureRepairs } = await import("../apps/api/dist/qaRepairFlow.js");
 const { executeAgentToolRequests } = await import("../apps/api/dist/toolExecutor.js");
 const { writeQaPlaytestReceipt } = await import("../apps/api/dist/qaPlaytestReceipt.js");
@@ -46,6 +47,18 @@ kernel.addTask({
   createdAt: now,
   updatedAt: now
 });
+
+// A closed claim repair has no production outputs. Treating every QA-owned
+// task as a playtest reopens it on every checkpoint and creates a wakeup storm.
+for (const id of ["task_claim_repair_closed", "task_contract_authoring", "task_implementation_review"]) {
+  kernel.addTask({ ...kernel.findTask(taskId), taskId: id, title: id, status: "done", outputArtifacts: [] });
+}
+for (let attempt = 0; attempt < 4; attempt++) {
+  assert.deepEqual(reconcileQaPlaytestResults(kernel).queuedAgentIds, [], "non-playtest QA work must not wake the loop");
+  assert.equal(kernel.findTask("task_claim_repair_closed").status, "done");
+  assert.equal(kernel.findTask("task_contract_authoring").status, "done");
+  assert.equal(kernel.findTask("task_implementation_review").status, "done");
+}
 
 const evidencePaths = [
   "agents/qa/playtest-runs/smoke/01-initial.png",
@@ -189,6 +202,11 @@ writeQaPlaytestReceipt(
 const ingestion = reconcileQaPlaytestResults(kernel);
 assert.deepEqual(ingestion.processedOperationIds, [failingResult.operationId], "服务端必须摄取外部 Harness 生成的受保护收据");
 assert.deepEqual(ingestion.failedOperationIds, [failingResult.operationId]);
+const historicalQa = createStudioKernelFromSnapshot(structuredClone(kernel.toSnapshot()));
+historicalQa.updateTask(taskId, { inputArtifacts: ["not_yet_rebuilt"] });
+const oldQaLedger = JSON.stringify(historicalQa.listArtifactLedger().find((item) => item.artifactId === reportArtifactId));
+assert.doesNotThrow(() => syncProjectWorkspace(historicalQa), "checkpoint after repair invalidates a build must retain historical QA evidence without recapturing its inputs");
+assert.equal(JSON.stringify(historicalQa.listArtifactLedger().find((item) => item.artifactId === reportArtifactId)), oldQaLedger);
 assert.deepEqual(new Set(ingestion.queuedAgentIds), new Set(["gameplay_programmer", "cocos_tech_lead"]));
 assert.equal(kernel.findTask(taskId).status, "blocked", "失败试玩摄取后 QA 任务必须立即阻塞");
 const repairTasks = kernel.listTasks().filter((task) => task.taskId.startsWith("task_qa_repair_"));
@@ -279,6 +297,27 @@ materializeQaFailureRepairs(kernel, kernel.findTask(taskId));
 assert.deepEqual(originalTasks.map(([id]) => kernel.findTask(id).description), beforeRepeatedFeedback, "same QA operation feedback is idempotent");
 resumeQaTasksAfterVerifiedRepairs(kernel);
 assert.equal(kernel.findTask(taskId).status, "doing", "real original-owner writes release QA for a new actual run");
+
+// Producer change requests reopen dependants without erasing historical QA
+// failure markers. The visible doing status must not strand a verified repair.
+kernel.updateTask(taskId, { status: "doing", blockers: [routed.reason] });
+resumeQaTasksAfterVerifiedRepairs(kernel);
+assert.equal(kernel.findTask(taskId).blockers.length, 0, "verified repairs also recover reopened doing tasks");
+assert.equal(kernel.getAgentLoopState().agents.qa_evaluator.status, "queued");
+const resumeTime = kernel.findTask(taskId).updatedAt;
+resumeQaTasksAfterVerifiedRepairs(kernel);
+assert.equal(kernel.findTask(taskId).updatedAt, resumeTime, "without a failure marker, recovery is idempotent");
+const originalInputs = [...kernel.findTask(taskId).inputArtifacts];
+kernel.updateTask(taskId, { status: "doing", blockers: [routed.reason], inputArtifacts: ["still_missing_build"] });
+resumeQaTasksAfterVerifiedRepairs(kernel);
+assert.deepEqual(kernel.findTask(taskId).blockers, [routed.reason], "source repair alone cannot release QA while its build is unavailable");
+kernel.updateTask(taskId, { status: "blocked", inputArtifacts: originalInputs, blockers: [routed.reason, "manual: producer hold"] });
+resumeQaTasksAfterVerifiedRepairs(kernel);
+assert.equal(kernel.findTask(taskId).status, "blocked", "manual hold is preserved");
+assert.equal(kernel.findTask(taskId).blockers.length, 2);
+kernel.updateTask(taskId, { status: "cancelled", blockers: [routed.reason] });
+resumeQaTasksAfterVerifiedRepairs(kernel);
+assert.equal(kernel.findTask(taskId).status, "cancelled", "cancelled work is never resumed");
 
 rmSync(tempRoot, { recursive: true, force: true });
 process.stdout.write("QA playtest gate smoke passed: forged report rejected, failures routed, verified repairs requeued\n");

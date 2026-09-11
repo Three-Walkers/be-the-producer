@@ -10,7 +10,7 @@ process.env.GAME_PIPELINE_DATA_ROOT = join(tempRoot, "data");
 
 const { createStudioKernel, defaultAgentContracts } = await import("@game-pipeline/agent-runtime");
 const { executeAgentToolRequests } = await import("../apps/api/dist/toolExecutor.js");
-const { assertAgentPathAuthorized, authorizeAgentToolRequest } = await import("../apps/api/dist/toolAuthorization.js");
+const { assertAgentPathAuthorized, authorizeAgentToolRequest, createConversationHarnessAuthorization } = await import("../apps/api/dist/toolAuthorization.js");
 const {
   bindMediaGenerationArtifactMetadata,
   hasCurrentGenerateRasterAssetReceipt,
@@ -25,6 +25,12 @@ try {
   addTask(kernel, "task_gameplay_other", "gameplay_programmer", []);
   addTask(kernel, "task_asset", "asset_production", []);
   addTask(kernel, "task_cocos", "cocos_automation", ["artifact_cocos_build"]);
+  const assetAgent = defaultAgentContracts.find((agent) => agent.agentId === "asset_production");
+  const assetConversation = createConversationHarnessAuthorization(kernel, assetAgent);
+  assert.ok(assetConversation.readRoots.includes("agents/art/asset-manifest.json"), "asset author can read its manifest in a room without spawning a writer");
+  assert.ok(!assetConversation.readRoots.includes("agents/art"), "manifest read does not expose the director's entire workspace");
+  assert.deepEqual(assetConversation.outputArtifactIds, []);
+  assert.deepEqual(assetConversation.serviceWritePaths, [], "conversation remains read-only");
 
   kernel.addArtifact({
     artifactId: "artifact_gameplay",

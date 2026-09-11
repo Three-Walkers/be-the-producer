@@ -29,6 +29,7 @@ import { adaptLegacySceneBlueprint } from "./legacySceneBlueprintAdapter.js";
 import { normalizeRelativePathWithinRoot, resolvePathWithinRoot } from "./pathSafety.js";
 import { playtestRuntimeBindingPath, readPlaytestRuntimeBinding } from "./playtestRuntimeBinding.js";
 import { discoverScriptComponents, type ScriptComponent } from "./cocosScriptComponents.js";
+import { withIsolatedCreatorMetadata } from "./cocosBuildIsolation.js";
 
 export interface CocosBridgeEvidence {
   path: string;
@@ -121,7 +122,7 @@ class AssetImportValidationError extends Error {
 const defaultManifestPath = "agents/art/asset-manifest.json";
 export const currentCocosImportReceiptPath = "agents/cocos-automation/imports/current.json";
 const defaultBlueprintPath = "agents/engineering/cocos-scene-blueprints/main.scene-blueprint.json";
-const defaultScenePath = "assets/scenes/MainGame.scene";
+export const defaultCocosScenePath = "assets/scenes/MainGame.scene";
 const defaultBuildOutput = "shared/build-artifacts/wechat/dev";
 
 export class CocosEngineBridge {
@@ -279,7 +280,7 @@ export class CocosEngineBridge {
   applySceneBlueprint(input: CocosApplyBlueprintInput = {}): CocosBridgeResult {
     const operationId = createOperationId("blueprint");
     const blueprintPath = normalizeRelativePath(input.blueprintPath ?? defaultBlueprintPath);
-    const scenePath = normalizeScenePath(input.scenePath ?? defaultScenePath);
+    const scenePath = normalizeScenePath(input.scenePath ?? defaultCocosScenePath);
     const reportPath = `agents/cocos-automation/scene-ops/${operationId}.json`;
     const evidence: CocosBridgeEvidence[] = [];
     try {
@@ -314,7 +315,7 @@ export class CocosEngineBridge {
       ]);
 
       evidence.push(this.writeJson(descriptorPath, normalized));
-      evidence.push(this.writeText(scriptPath, renderRuntimeBootstrap(scriptComponents)));
+      evidence.push(this.writeText(scriptPath, renderRuntimeBootstrap(scriptComponents, scriptUuid)));
       evidence.push(this.writeJson(scriptMetaPath, typescriptMeta(scriptUuid)));
       evidence.push(this.writeJson(scenePath, createBootstrapScene({ sceneName: entryScene.name, resolution }, scriptUuid, sceneUuid)));
       evidence.push(this.writeJson(sceneMetaPath, sceneMeta(sceneUuid)));
@@ -432,13 +433,13 @@ export class CocosEngineBridge {
         ? buildOptionsFromConfig(this.projectRoot, configPath, logAbsolute)
         : buildOptionsInline(platform, debug, outputDir, scene.uuid, logAbsolute);
       const args = ["--project", this.projectRoot, "--build", buildOptions];
-      const processResult = spawnSync(this.config.executablePath, args, {
+      const processResult = withIsolatedCreatorMetadata(this.projectRoot, () => spawnSync(this.config.executablePath, args, {
         cwd: this.projectRoot,
         encoding: "utf8",
         timeout: this.config.timeoutMs,
         maxBuffer: 20 * 1024 * 1024,
         env: minimalCreatorEnvironment(process.env)
-      });
+      }));
       const processOutput = `${processResult.stdout ?? ""}\n${processResult.stderr ?? ""}`.trim();
       const existingLog = existsSync(logAbsolute) && statSync(logAbsolute).isFile() ? readFileSync(logAbsolute, "utf8") : "";
       writeFileSync(logAbsolute, `${existingLog}${existingLog && processOutput ? "\n" : ""}${processOutput}\n`, "utf8");
@@ -1116,7 +1117,7 @@ function validateBridgeComponents(blueprint: SceneBlueprint, discovered: ScriptC
   }
 }
 
-function renderRuntimeBootstrap(components: ScriptComponent[]): string {
+function renderRuntimeBootstrap(components: ScriptComponent[], scriptUuid: string): string {
   const imports = components.map((component, index) => component.defaultExport
     ? `import BtpComponent${index} from ${JSON.stringify(component.importPath)};`
     : `import { ${component.exportName} as BtpComponent${index} } from ${JSON.stringify(component.importPath)};`).join("\n");
@@ -1130,6 +1131,7 @@ function renderRuntimeBootstrap(components: ScriptComponent[]): string {
   Component,
   Graphics,
   JsonAsset,
+  js,
   Label,
   Node,
   resources,
@@ -1258,6 +1260,12 @@ export class BtpRuntimeBootstrap extends Component {
         nextSiblingIndex.set(parentKey, siblingIndex + 1);
       }
       this.applyRuntimeProperties();
+      // addComponent on an active hierarchy invokes onLoad synchronously. Keep
+      // every blueprint subtree inactive until the entire graph and all cross-
+      // node references are configured, then let Cocos run its normal lifecycle.
+      for (const spec of scene.nodes) {
+        if (!spec.parentNodeId) this.nodes.get(this.nodeKey(scene.sceneId, spec.nodeId))!.active = true;
+      }
       console.info('[BTP Bridge] scene blueprint materialized', {
         rootChildren: this.node.children.length,
         componentBindings: this.pendingBindings.length,
@@ -1267,6 +1275,7 @@ export class BtpRuntimeBootstrap extends Component {
 
   private materializeNode(sceneId: string, spec: BlueprintNode, parent: Node): Node {
     const node = new Node(spec.name);
+    if (!spec.parentNodeId) node.active = false;
     parent.addChild(node);
     node.layer = parent.layer;
     const [x, y] = spec.transform.position;
@@ -1431,6 +1440,11 @@ export class BtpRuntimeBootstrap extends Component {
     return new Color((rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255, alpha);
   }
 }
+
+// Headless Creator compilation does not always inject an _RF UUID frame.
+// Bind the exact serialized scene type in either compiler mode, using the
+// engine's public alias API without replacing the class's primary identity.
+js.setClassAlias(BtpRuntimeBootstrap, ${JSON.stringify(compressUuid(scriptUuid))});
 `;
 }
 

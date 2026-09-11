@@ -21,8 +21,10 @@ export { extractMentionedAgents } from "./agentMentions.js";
 import { applyProducerChangeRequest, producerChangeTargets } from "./producerChangeRequest.js";
 import { finalizeMessageActivity, recordServerToolActivity } from "./agentActivity.js";
 import { ModelAgentRuntime } from "./modelAgentRuntime.js";
-import { ProjectPersistenceStore, type ProjectStateRepository, type ProjectSummary } from "./projectPersistence.js";
+import { ProjectPersistenceStore, snapshotSummary, type ProjectStateRepository, type ProjectSummary } from "./projectPersistence.js";
 import { reconcileQaPlaytestResults } from "./qaResultIngestion.js";
+import { reconcileAssetTechnicalFailures } from "./assetTechnicalFeedback.js";
+import { reconcileCocosSupportingEvidence } from "./cocosSupportingEvidence.js";
 import { apiGateEvidencePolicy } from "./gateEvidencePolicy.js";
 import { reconcileProductionAudit } from "./productionAudit.js";
 import {
@@ -73,6 +75,7 @@ export interface StudioProjectStoreDependencies {
 
 export class StudioProjectStore {
   private readonly projects = new Map<string, StudioKernel>();
+  private readonly projectSummaries = new Map<string, ProjectSummary>();
   private readonly runtime: LocalAgentRuntime;
   private readonly modelRuntime: ModelAgentRuntime;
   private readonly persistence: ProjectStateRepository;
@@ -118,7 +121,10 @@ export class StudioProjectStore {
   }
 
   listProjects(): ProjectSummary[] {
-    return this.persistence.listSummaries();
+    // This store owns the loaded project instances. Sidebar polling must not
+    // deserialize/revalidate their entire audit histories from disk every time.
+    return [...this.projectSummaries.values()].map((summary) => ({ ...summary }))
+      .sort((left, right) => right.savedAt.localeCompare(left.savedAt));
   }
 
   createProject(input: CreateProjectInput): {
@@ -130,7 +136,7 @@ export class StudioProjectStore {
     const projectId = `game_${Date.now().toString(36)}_${randomUUID().slice(0, 8)}`;
     const kernel = createStudioKernel(projectId, input.name, input.producerId ?? "producer_local", input.idea);
     this.projects.set(projectId, kernel);
-    this.persistence.save(kernel);
+    this.persistKernel(kernel);
 
     const result: {
       project: StudioKernel["project"];
@@ -143,7 +149,7 @@ export class StudioProjectStore {
       workspace: syncProjectWorkspace(kernel)
     };
 
-    this.persistence.save(kernel);
+    this.persistKernel(kernel);
     return result;
   }
 
@@ -383,15 +389,15 @@ export class StudioProjectStore {
     }
     let modelMessagesHandled = false;
     if (options.modelReplies && result.agentMessages.length === 0) {
+      // Persist producer intent before starting an external model request.
+      // UI activity is ephemeral; final messages, tool outcomes and lifecycle
+      // boundaries still take full durable/evidence checkpoints.
+      this.checkpointKernel(kernel);
       const modelResult = await this.modelRuntime.respond(kernel, message, result.routePlan, {
-        onAgentActivity: () => {
-          this.checkpointKernel(kernel);
-        },
         onAgentMessage: async (agentMessage) => {
           await executeAgentToolRequests(kernel, [agentMessage], {
             onActivity: (toolMessage, event) => {
               recordServerToolActivity(kernel, toolMessage, event);
-              this.checkpointKernel(kernel);
             }
           });
           finalizeMessageActivity(kernel, agentMessage);
@@ -503,6 +509,7 @@ export class StudioProjectStore {
     this.getKernel(projectId);
     this.agentLoop.cancel(projectId);
     this.projects.delete(projectId);
+    this.projectSummaries.delete(projectId);
     this.persistence.delete(projectId);
     deleteProjectWorkspace(projectId);
     return { projectId };
@@ -516,22 +523,25 @@ export class StudioProjectStore {
       reconcileLocalRuntimeProjectState(kernel);
       migrateRuntimeAssetPipeline(kernel);
       this.projects.set(projectId, kernel);
+      reconcileCocosSupportingEvidence(kernel);
       const evidenceBaseline = captureCurrentStageReviewOutputEvidence(kernel);
       syncProjectWorkspace(kernel);
       reconcileCurrentStageReviewOutputEvidence(kernel, evidenceBaseline);
+      reconcileAssetTechnicalFailures(kernel);
       reconcileInvalidQualityReviewEvidence(kernel);
       reconcileProductionAudit(kernel);
       syncProjectWorkspace(kernel);
       // Workspace sync can invalidate placeholder/file evidence even when the
       // runtime topology itself needed no migration. Persist every lazy load so
       // those evidence and task transitions survive a crash or restart.
-      this.persistence.save(kernel);
+      this.persistKernel(kernel);
       return kernel;
     }
     return undefined;
   }
 
   private checkpointKernel(kernel: StudioKernel): WorkspaceSyncResult {
+    reconcileCocosSupportingEvidence(kernel);
     if (kernel.project.executionStatus === "running") {
       reconcileLocalRuntimeProjectState(kernel);
     }
@@ -542,19 +552,27 @@ export class StudioProjectStore {
     reconcileClaimRepairs(kernel);
     workspace = syncProjectWorkspace(kernel);
     reconcileCurrentStageReviewOutputEvidence(kernel, evidenceBaseline);
+    const assetRepairAgentIds = reconcileAssetTechnicalFailures(kernel);
     reconcileInvalidQualityReviewEvidence(kernel);
     reconcileProductionAudit(kernel);
     workspace = syncProjectWorkspace(kernel);
-    this.persistence.save(kernel);
-    if (qaIngestion.queuedAgentIds.length > 0 && kernel.project.executionStatus === "running") {
+    this.persistKernel(kernel);
+    if ((qaIngestion.queuedAgentIds.length > 0 || assetRepairAgentIds.length > 0) && kernel.project.executionStatus === "running") {
       queueMicrotask(() => {
         this.agentLoop.start(kernel.project.projectId, {
-          reason: `QA 真实试玩失败已回流：${qaIngestion.failedOperationIds.join("、")}`,
-          preferredAgentIds: qaIngestion.queuedAgentIds
+          reason: `机器校验/QA 失败已回流：${qaIngestion.failedOperationIds.join("、")}`,
+          preferredAgentIds: [...new Set([...qaIngestion.queuedAgentIds, ...assetRepairAgentIds])]
         });
       });
     }
     return workspace;
+  }
+
+  private persistKernel(kernel: StudioKernel): void {
+    const snapshot = this.persistence.save(kernel);
+    // Update only after durable save succeeds; savedAt remains a real checkpoint
+    // time, not a UI refresh timestamp. Lazy loads use the same path.
+    this.projectSummaries.set(kernel.project.projectId, snapshotSummary(snapshot));
   }
 }
 

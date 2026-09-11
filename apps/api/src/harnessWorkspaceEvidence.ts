@@ -7,11 +7,14 @@ import { artifactFilePath, hashWorkspaceFile, resolveProjectWorkspaceRoot } from
 import { selfCheckPath, implementationReviewPath, validateImplementationReview, applyImplementationReviewFeedback } from "./implementationReview.js";
 import { runImplementationChecks } from "./implementationChecks.js";
 import { cocosEngineSettingsStore } from "./cocosEngineSettings.js";
+import { verifyCocosBuildManifest } from "./cocosEngineBridge.js";
 import { parsePlaytestMarker } from "./playtestEvidence.js";
 import type { AgentHarnessToolOperation } from "./agentHarness.js";
 import { isQaHarnessManagedPath } from "./qaEvidenceProtection.js";
 import { assertAgentPathAuthorized } from "./toolAuthorization.js";
 import { resolvePathWithinRoot } from "./pathSafety.js";
+import { isCocosBuildSupportingArtifact } from "./cocosSupportingEvidence.js";
+import { readVerifiedQaPlaytestReceipts } from "./qaPlaytestReceipt.js";
 import {
   applyQualityReviewChangeRequest,
   assertQualityReviewMatchesVisionSemanticResult,
@@ -170,11 +173,23 @@ export function recordHarnessWorkspaceChanges(
       continue;
     }
     const existing = findArtifactForPath(kernel, task, path);
+    if (existing?.type === "build" && path.startsWith(`${existing.path.replace(/\/+$/, "")}/`) &&
+        path !== artifactFilePath(existing).replaceAll("\\", "/")) {
+      // The directory is one deliverable. Stage every validated file, but only
+      // its canonical report may register the build's byte/import manifest.
+      // Otherwise the last bundle/resource file overwrites authoritative proof.
+      continue;
+    }
     const pathWrites = invocationToolOperations
       ?.filter((operation) =>
-        operation.path === path && toolOperationSucceeded(operation) && operationWritesWorkspace(operation)
+        operation.path === path && (toolOperationSucceeded(operation) || isFailedCocosDiagnostic(operation, file)) && operationWritesWorkspace(operation)
       ) ?? [];
     let sourceOperation = pathWrites.at(-1);
+    if (sourceOperation?.toolName === "run_playtest" && existing?.type !== "qa_report") {
+      // The receipt ingester owns QA evidence registration. Nested Web bundles
+      // are supporting bytes, not hundreds of new required deliverables.
+      continue;
+    }
     if (sourceOperation?.toolName === "resubmit_existing_asset") {
       const precedingWrite = pathWrites.filter((operation) => operation.toolName !== "resubmit_existing_asset").at(-1);
       // Resubmitting immediately after a genuine generation must not replace
@@ -186,6 +201,14 @@ export function recordHarnessWorkspaceChanges(
       }
     }
     const sourceTool = sourceOperation?.toolName;
+    if (sourceOperation && isFailedCocosDiagnostic(sourceOperation, file)) {
+      toolExecutions.push({ toolName: sourceOperation.toolName as ToolExecutionResult["toolName"],
+        status: "failed", path, hash: file.hash, sizeBytes: file.sizeBytes,
+        error: sourceOperation.error ?? "Cocos 操作失败；已保留诊断，不是可消费产物。" });
+      // Diagnostics are retained on disk and in the failed tool record, never
+      // added to required task outputs or registered as successful artifacts.
+      continue;
+    }
     if (sourceOperation?.toolName === "resubmit_existing_asset") {
       if (!existing || existing.ownerAgentId !== agent.agentId || agent.agentId !== "asset_production" ||
           existing.sourceTaskId !== task.taskId || task.taskId !== "task_stage_2_asset_pipeline" ||
@@ -378,6 +401,7 @@ export function recordHarnessWorkspaceChanges(
       createdAt: existing?.createdAt ?? now,
       updatedAt: file.updatedAt
     };
+    if (isCocosBuildSupportingArtifact(artifact)) artifact.metadata.evidenceRole = "supporting";
     let stored = kernel.upsertArtifact(artifact);
     stored.metadata = artifact.metadata;
     stored.status = playtest && playtest.verdict !== "pass" ? "change_requested" : "submitted";
@@ -458,7 +482,7 @@ export function recordHarnessWorkspaceChanges(
       continue;
     }
     toolExecutions.push({
-      toolName: operation.toolName as "write_artifact" | "append_document" | "generate_raster_asset" | "inspect_visual_assets",
+      toolName: operation.toolName,
       status: "failed",
       path: operation.path,
       ...(operation.error ? { error: operation.error } : {})
@@ -490,7 +514,7 @@ export function analyzeHarnessWorkspaceChanges(
     .sort();
   const successfulOperationPaths = new Set(
     (invocationToolOperations ?? [])
-      .filter((operation) => toolOperationSucceeded(operation) && operationWritesWorkspace(operation))
+      .filter((operation) => (toolOperationSucceeded(operation) || isFailedCocosDiagnostic(operation, after.get(operation.path))) && operationWritesWorkspace(operation))
       .map((operation) => operation.path)
   );
   const failedOnlyOperationPaths = new Set(
@@ -513,6 +537,21 @@ export function analyzeHarnessWorkspaceChanges(
   const explicitResubmissions = (invocationToolOperations ?? [])
     .filter((operation) => operation.toolName === "resubmit_existing_asset" && toolOperationSucceeded(operation))
     .map((operation) => operation.path).filter((path) => after.has(path));
+  const declaredOutputPaths = new Set(kernel.listArtifacts().filter((artifact) =>
+    task.outputArtifacts.includes(artifact.artifactId) && artifact.ownerAgentId === agent.agentId &&
+    artifact.sourceTaskId === task.taskId && artifact.type !== "build")
+    .map((artifact) => artifactFilePath(artifact).replaceAll("\\", "/")));
+  for (const operation of invocationToolOperations ?? []) {
+    if (operation.toolName === "resubmit_source" && (agent.agentId !== "gameplay_programmer" ||
+        !kernel.listArtifacts().some((artifact) => artifact.type === "source_code" && artifact.path === operation.path && task.outputArtifacts.includes(artifact.artifactId)))) continue;
+    const file = after.get(operation.path);
+    const selfCheckResubmission = operation.toolName === "run_implementation_checks" && agent.agentId === "gameplay_programmer" && operation.path === selfCheckPath;
+    if ((selfCheckResubmission || ["write_artifact", "write_code", "edit_code", "resubmit_source"].includes(operation.toolName)) && operation.status === "completed" &&
+        operationWritesWorkspace(operation) && declaredOutputPaths.has(operation.path) && file &&
+        operation.hash === file.hash && operation.sizeBytes === file.sizeBytes) {
+      explicitResubmissions.push(operation.path);
+    }
+  }
   const candidateChangedPaths = options.authoritativeWorkspace || !invocationChangedPaths
     ? [...new Set([...workspaceChangedPaths, ...explicitResubmissions])].sort()
     : [...new Set([...invocationChangedPaths, ...failedMutationPaths])].filter((path) => after.has(path)).sort();
@@ -520,6 +559,8 @@ export function analyzeHarnessWorkspaceChanges(
     .filter((path) => !readOnlyOperationPaths.has(path) || before.get(path)?.hash !== after.get(path)?.hash)
     .filter((path) => !failedOnlyOperationPaths.has(path) || failedMutationPaths.includes(path));
   const deletedPaths = [...before.keys()].filter((path) => !after.has(path)).sort();
+  const replacementRoots = verifiedBuildReplacementRoots(kernel, task, after, invocationToolOperations ?? []);
+  const qaServicePaths = verifiedQaServicePaths(kernel, task, agent, after, invocationToolOperations ?? []);
   const protectedMutationPaths = changedPaths.filter((path) => {
     if (!isQaHarnessManagedPath(path)) return false;
     return invocationToolOperations
@@ -529,12 +570,84 @@ export function analyzeHarnessWorkspaceChanges(
       .at(-1)?.toolName !== "run_playtest";
   });
   const violations = [
-    ...changedPaths.filter((path) => !isAllowedAgentPath(kernel, task, agent, path)).map((path) => `未授权写入：${path}`),
+    ...changedPaths.filter((path) => !isAllowedAgentPath(kernel, task, agent, path) && !qaServicePaths.has(path)).map((path) => `未授权写入：${path}`),
     ...protectedMutationPaths.map((path) => `受保护 QA 机器证据被非 run_playtest 工具修改：${path}`),
     ...failedMutationPaths.map((path) => `失败工具仍修改了工作区，拒绝物化：${path}`),
-    ...deletedPaths.map((path) => `删除：${path}`)
+    ...deletedPaths.filter((path) => !replacementRoots.some((root) => path.startsWith(`${root}/`)))
+      .map((path) => `删除：${path}`)
   ];
   return { changedPaths, deletedPaths, violations };
+}
+
+function verifiedQaServicePaths(kernel: StudioKernel, task: Task, agent: AgentContract, after: WorkspaceSnapshot, operations: AgentHarnessToolOperation[]): Set<string> {
+  const allowed = new Set<string>();
+  if (agent.agentId !== "qa_evaluator" || task.ownerAgentId !== agent.agentId) return allowed;
+  const reports = kernel.listArtifacts().filter((artifact) => task.outputArtifacts.includes(artifact.artifactId) &&
+    artifact.type === "qa_report" && artifact.ownerAgentId === agent.agentId && artifact.sourceTaskId === task.taskId);
+  const first = after.values().next().value as WorkspaceFileEvidence | undefined;
+  if (!first) return allowed;
+  const root = first.absolutePath.slice(0, -first.path.length);
+  for (const receipt of readVerifiedQaPlaytestReceipts(root)) {
+    if (!/^playtest_\d{14}_[a-f0-9]{8}$/.test(receipt.operationId) || !reports.some((report) => report.path === receipt.reportPath)) continue;
+    const buildId = receipt.result.buildOperationId;
+    for (const item of receipt.evidence) {
+      const scoped = item.path.startsWith(`shared/build-artifacts/playtest/${receipt.operationId}/`) ||
+        (buildId && /^cocos_build_\d{14}_[a-f0-9]{8}$/.test(buildId) &&
+          [ `agents/cocos-automation/build-ops/${buildId}.json`, `agents/cocos-automation/cocos-build-logs/${buildId}.log` ].includes(item.path));
+      const op = operations.filter((operation) => operation.path === item.path && operationWritesWorkspace(operation)).at(-1);
+      const file = after.get(item.path);
+      if (scoped && file && op?.toolName === "run_playtest" && op.operationType === "playtest" &&
+          op.operationId === receipt.operationId && op.status === "completed" &&
+          op.hash === file.hash && op.sizeBytes === file.sizeBytes) allowed.add(item.path);
+    }
+  }
+  return allowed;
+}
+
+function verifiedBuildReplacementRoots(kernel: StudioKernel, task: Task, after: WorkspaceSnapshot, operations: AgentHarnessToolOperation[]): string[] {
+  if (task.ownerAgentId !== "cocos_automation") return [];
+  return kernel.listArtifacts().filter((artifact) => artifact.type === "build" &&
+    artifact.ownerAgentId === task.ownerAgentId && artifact.sourceTaskId === task.taskId && task.outputArtifacts.includes(artifact.artifactId))
+    .flatMap((artifact) => {
+      const path = artifactFilePath(artifact).replaceAll("\\", "/");
+      const file = after.get(path);
+      const operation = operations.filter((op) => op.path === path && op.toolName === "cocos_build").at(-1);
+      if (!file || !operation || operation.status !== "completed" || operation.bridgeOk !== true ||
+          operation.operationType !== "build" || operation.hash !== file.hash || operation.sizeBytes !== file.sizeBytes ||
+          !operation.directoryManifest || operation.directoryManifest.rootPath !== artifact.path) return [];
+      try {
+        const report = JSON.parse(readFileSync(file.absolutePath, "utf8"));
+        const root = file.absolutePath.slice(0, -file.path.length);
+        return report.status === "success" && report.operationId === operation.operationId && report.outputPath === artifact.path &&
+          report.outputManifest?.digest === operation.directoryManifest.digest && verifyCocosBuildManifest(root, operation.directoryManifest)
+          ? [artifact.path] : [];
+      } catch { return []; }
+    });
+}
+
+/** A failed build is not a successful output, but its server-written diagnostic
+ * is intentional evidence, not an unauthorized partial game mutation. Keep it
+ * and prior successful work while preserving bridgeOk=false and failed tools.
+ * Never accept failed scene/source/asset writes through this exception. */
+function isFailedCocosDiagnostic(operation: AgentHarnessToolOperation, file?: WorkspaceFileEvidence): boolean {
+  if (!file || operation.status !== "failed" || operation.bridgeOk !== false ||
+      operation.hash !== file.hash || operation.sizeBytes !== file.sizeBytes || !operation.operationId) return false;
+  const kinds: Record<string, { type: string; root: string }> = {
+    cocos_validate_project: { type: "validate_project", root: "validation" },
+    cocos_import_assets: { type: "import_assets", root: "imports" },
+    cocos_apply_blueprint: { type: "apply_scene_blueprint", root: "scene-ops" },
+    cocos_build: { type: "build", root: "build-ops" }
+  };
+  const kind = kinds[operation.toolName];
+  if (!kind || operation.operationType !== kind.type || !/^cocos_[a-z]+_\d{14}_[a-f0-9]{8}$/.test(operation.operationId)) return false;
+  if (kind.type === "build" && file.path === `agents/cocos-automation/cocos-build-logs/${operation.operationId}.log`) return true;
+  try {
+    const document = JSON.parse(readFileSync(file.absolutePath, "utf8"));
+    if (document.operationId !== operation.operationId || document.operationType !== kind.type || document.status !== "failed") return false;
+    return file.path === `agents/cocos-automation/${kind.root}/${operation.operationId}.json` ||
+      (kind.type === "build" && typeof document.outputPath === "string" &&
+        file.path === `${document.outputPath}/build-report.json`);
+  } catch { return false; }
 }
 
 function failedHarnessToolExecutions(
@@ -543,7 +656,7 @@ function failedHarnessToolExecutions(
   return (invocationToolOperations ?? []).flatMap((operation) => {
     if (toolOperationSucceeded(operation) || !failedToolExecutionName(operation.toolName)) return [];
     return [{
-      toolName: operation.toolName as "write_artifact" | "append_document" | "generate_raster_asset" | "inspect_visual_assets",
+      toolName: operation.toolName,
       status: "failed" as const,
       path: operation.path,
       ...(operation.error ? { error: operation.error } : {})
@@ -647,6 +760,7 @@ function requiredOperationString(value: unknown, field: string, path: string): s
 
 function failedToolExecutionName(
   value: string
-): value is "write_artifact" | "append_document" | "generate_raster_asset" | "inspect_visual_assets" {
-  return ["write_artifact", "append_document", "generate_raster_asset", "inspect_visual_assets"].includes(value);
+): value is ToolExecutionResult["toolName"] {
+  return ["write_artifact", "append_document", "generate_raster_asset", "inspect_visual_assets",
+    "cocos_validate_project", "cocos_import_assets", "cocos_apply_blueprint", "cocos_build"].includes(value);
 }

@@ -132,7 +132,8 @@ export async function runPlaytestContract(input: PlaytestContractRunnerInput): P
       const result = await executeStep({
         step,
         adapter: input.adapter,
-        capture: () => capture(scenarioDeadline),
+        capture,
+        previousSnapshot: snapshots.at(-1) ?? initial,
         pollIntervalMs: input.pollIntervalMs ?? 100,
         scenarioDeadline
       });
@@ -187,15 +188,18 @@ export async function runPlaytestContract(input: PlaytestContractRunnerInput): P
 async function executeStep(input: {
   step: PlaytestStep;
   adapter: RuntimeAdapter;
-  capture: () => Promise<RuntimeAdapterSnapshot>;
+  capture: (deadline: number) => Promise<RuntimeAdapterSnapshot>;
+  previousSnapshot: RuntimeAdapterSnapshot;
   pollIntervalMs: number;
   scenarioDeadline: number;
 }): Promise<PlaytestContractStepResult> {
-  const { step, adapter, capture } = input;
+  const { step, adapter } = input;
   const deadline = Math.min(Date.now() + step.timeoutMs, input.scenarioDeadline);
+  const capture = () => input.capture(deadline);
   let iterations = 0;
-  let snapshot = await capture();
+  let snapshot = input.previousSnapshot;
   try {
+    snapshot = await capture();
     if (step.repeat) {
       let reachedUntil = false;
       if (evaluateAssertions(step.repeat.until, snapshot).every((result) => result.passed)) {
@@ -231,6 +235,9 @@ async function executeStep(input: {
     } else {
       iterations = step.action ? 1 : 0;
       await performAction(adapter, step.action, deadline);
+      // Assertions and final-state/quality-gate evidence must describe the
+      // outcome, even when they were already true before the action (or empty).
+      if (step.action) snapshot = await capture();
     }
 
     let assertions = evaluateAssertions(step.assertions, snapshot);
@@ -244,13 +251,13 @@ async function executeStep(input: {
       assertions = evaluateAssertions(step.assertions, snapshot);
     }
     const passed = assertions.every((result) => result.passed);
-    if (Date.now() > input.scenarioDeadline) {
+    if (Date.now() > deadline) {
       return stepFailure(
         step,
         iterations,
         snapshot,
         assertions,
-        "场景绝对执行预算已耗尽。"
+        "步骤绝对执行预算已耗尽。"
       );
     }
     return {

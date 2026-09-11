@@ -3,6 +3,7 @@ import {
   ContractValidationError,
   parseProductionContractBundle,
   validateGameContract,
+  validatePlaytestContract,
   validatePlaytestContractCompatibility,
 } from "../packages/shared-schemas/dist/index.js";
 
@@ -162,6 +163,38 @@ for (const bundle of fixtures) {
   assert.deepEqual(parseProductionContractBundle(bundle), bundle);
 }
 
+const isolatedScenarios = structuredClone(fixtures[0].playtestContract);
+isolatedScenarios.scenarios.push({ ...structuredClone(isolatedScenarios.scenarios[0]), scenarioId: "second_path" });
+assert.equal(validatePlaytestContract(isolatedScenarios).ok, true, "independent scenarios may repeat explicit setup from the same reset state");
+isolatedScenarios.scenarios[1].startState = "playing";
+const resetMismatch = validatePlaytestContract(isolatedScenarios);
+assert.equal(resetMismatch.ok, false, "startState cannot silently request setup or inherit the preceding scenario");
+assert.ok(resetMismatch.issues.some((item) => item.path.endsWith("scenarios[1].startState") && item.message.includes("navigation/setup")));
+
+const gateFixture = (gates) => ({ ...structuredClone(fixtures[0].playtestContract), qualityGates: gates.map((gate, index) => ({
+  gateId: `gate_${index}`, signalId: "health", aggregation: "last", ...gate
+})) });
+for (const [left, right] of [
+  [{ operator: "eq", expected: 0 }, { operator: "gt", expected: 0 }],
+  [{ operator: "eq", expected: 0 }, { operator: "gte", expected: 1 }],
+  [{ operator: "eq", expected: 1 }, { operator: "lt", expected: 1 }],
+  [{ operator: "eq", expected: 1 }, { operator: "lte", expected: 0 }],
+  [{ operator: "eq", expected: 0 }, { operator: "eq", expected: 20 }],
+  [{ operator: "eq", expected: true }, { operator: "not_eq", expected: true }],
+  [{ operator: "eq", expected: "won" }, { operator: "eq", expected: "lost" }]
+]) {
+  for (const order of [[left, right], [right, left]]) {
+    const conflict = validatePlaytestContract(gateFixture(order));
+    assert.equal(conflict.ok, false, "contradictory run-wide gates are rejected regardless of order");
+    assert.ok(conflict.issues.some((item) => item.message.includes("step assertions")));
+  }
+}
+assert.equal(validatePlaytestContract(gateFixture([
+  { operator: "eq", expected: 0 }, { operator: "gte", expected: 0 },
+  { operator: "eq", expected: 20, aggregation: "max" },
+  { operator: "eq", expected: 20, signalId: "other_signal" }
+])).ok, true, "compatible thresholds, separate aggregates and separate signals are not conflated");
+
 const endlessContract = structuredClone(fixtures[2].gameContract);
 endlessContract.stateModel.lifecycle = "endless";
 endlessContract.stateModel.states = endlessContract.stateModel.states.filter((state) => state.stateId === "ready" || state.stateId === "playing");
@@ -218,6 +251,14 @@ assert.throws(() => parseProductionContractBundle(privateSignalScene), ContractV
 const unboundedRepeat = structuredClone(fixtures[0]);
 unboundedRepeat.playtestContract.scenarios[0].steps[1].repeat.maxIterations = 101;
 assert.throws(() => parseProductionContractBundle(unboundedRepeat), ContractValidationError);
+
+const sharedRepeatDeadline = structuredClone(fixtures[0].playtestContract);
+sharedRepeatDeadline.environment.maxScenarioDurationMs = 60000;
+sharedRepeatDeadline.scenarios[0].steps[1].timeoutMs = 30000;
+sharedRepeatDeadline.scenarios[0].steps[1].repeat.maxIterations = 100;
+assert.equal(validatePlaytestContract(sharedRepeatDeadline).ok, true, "100 repeat iterations share one 30-second step deadline, not 100 deadlines");
+sharedRepeatDeadline.scenarios[0].steps[1].timeoutMs = 60000;
+assert.equal(validatePlaytestContract(sharedRepeatDeadline).ok, false, "setup plus repeated step still cannot exceed the total scenario budget");
 
 const conflictingComponentProperty = structuredClone(fixtures[0]);
 conflictingComponentProperty.sceneBlueprint.scenes[0].nodes[0].components[0].bindings[0].property = "fixtureGenre";

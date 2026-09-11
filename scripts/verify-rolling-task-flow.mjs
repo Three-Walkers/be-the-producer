@@ -65,6 +65,9 @@ try {
     relatedArtifactIds: [], metadata: {}, createdAt: new Date().toISOString() };
   assert.deepEqual(producerChangeTargets(kernel, { ...change, messageType: "progress_update" }), [], "progress questions never reopen work");
   assert.deepEqual(producerChangeTargets(kernel, { ...change, mentions: [] }), [], "unaddressed free text must not roll back arbitrary roles");
+  assert.deepEqual(producerChangeTargets(kernel, { ...change, content: "@QA 只重试 [task:follow]" }).map((task) => task.taskId), ["follow"], "explicit task scope takes precedence over role mentions");
+  assert.deepEqual(producerChangeTargets(kernel, { ...change, relatedTaskIds: ["follow"] }).map((task) => task.taskId), ["follow"]);
+  assert.deepEqual(producerChangeTargets(kernel, { ...change, content: "@QA 重试 [task:unknown_task]" }), [], "unknown explicit task must not broaden to all role work");
   kernel.recordMessage(change);
   assert.deepEqual(applyProducerChangeRequest(kernel, change).sort(), ["fast", "follow"]);
   assert.equal(kernel.findTask("fast").status, "doing");

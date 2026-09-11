@@ -239,7 +239,7 @@ export class ProjectPersistenceStore implements ProjectStateRepository {
   }
 }
 
-function snapshotSummary(snapshot: StudioKernelSnapshot): ProjectSummary {
+export function snapshotSummary(snapshot: StudioKernelSnapshot): ProjectSummary {
   return {
     projectId: snapshot.project.projectId,
     name: snapshot.project.name,

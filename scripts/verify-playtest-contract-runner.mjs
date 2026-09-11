@@ -232,6 +232,57 @@ assert.equal(multiResult.scenarios[1].passed, true);
 assert.equal(multiResult.scenarios[2].passed, false);
 assert.equal(multiResult.passed, true, "optional scenario failure must not block the overall verdict");
 
+// A pre-action snapshot is not evidence of post-action correctness. Previously
+// already-true assertions could pass without sampling what the action changed.
+const postActionContract = contract("post.action", "fixture.game", {
+  scenarioId: "preserve.balance", title: "Action must preserve the required balance", required: true,
+  priority: "critical", startState: "MENU", expectedEndState: "MENU", requiredArtifacts: ["runtime_trace"],
+  steps: [{ stepId: "spend", required: true, action: { type: "system", command: "start" },
+    assertions: [{ type: "signal", signalId: "balance", operator: "eq", expected: 120 }], timeoutMs: 10 }]
+});
+const postActionAdapter = new FakeAdapter(postActionContract, "MENU", (adapter) => { adapter.signals.balance = 0; }, { balance: 120 });
+const postActionResult = await runPlaytestContract({ contract: postActionContract, adapter: postActionAdapter, pollIntervalMs: 1 });
+assert.equal(postActionResult.passed, false, "never certify the pre-action value as the post-action outcome");
+assert.equal(postActionResult.scenarios[0].steps[0].assertions[0].actual, 0);
+assert.equal(postActionResult.snapshots.at(-1).signals.balance, 0);
+
+const terminalChange = structuredClone(postActionContract);
+terminalChange.scenarios[0].steps[0].assertions = [];
+const terminalAdapter = new FakeAdapter(terminalChange, "MENU", (adapter) => { adapter.state = "BROKEN"; });
+const terminalResult = await runPlaytestContract({ contract: terminalChange, adapter: terminalAdapter });
+assert.equal(terminalResult.passed, false, "an action without assertions must still update the final-state evidence");
+assert.equal(terminalResult.scenarios[0].finalState, "BROKEN");
+
+const snapshotBudgetContract = structuredClone(postActionContract);
+snapshotBudgetContract.environment.maxScenarioDurationMs = 1000;
+snapshotBudgetContract.scenarios[0].steps[0].timeoutMs = 20;
+for (const stallBeforeAction of [false, true]) {
+  const budgetAdapter = new FakeAdapter(snapshotBudgetContract, "MENU", () => {}, { balance: 120 });
+  const realSnapshot = budgetAdapter.getSnapshot.bind(budgetAdapter);
+  let reads = 0;
+  budgetAdapter.getSnapshot = async () => {
+    if (++reads >= (stallBeforeAction ? 2 : 3)) await new Promise((resolve) => setTimeout(resolve, 80));
+    return realSnapshot();
+  };
+  const budgetResult = await runPlaytestContract({ contract: snapshotBudgetContract, adapter: budgetAdapter });
+  assert.equal(budgetResult.passed, false, "snapshot reads must use the step deadline, not the longer scenario budget");
+  assert.match(budgetResult.scenarios[0].steps[0].details, /预算/);
+  const samples = budgetResult.snapshots.length;
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(budgetResult.snapshots.length, samples, "late reads must not append evidence after a step timeout");
+}
+const malformedReadAdapter = new FakeAdapter(snapshotBudgetContract, "MENU", () => {}, { balance: 120 });
+const knownSnapshot = malformedReadAdapter.getSnapshot.bind(malformedReadAdapter);
+let snapshotReads = 0;
+malformedReadAdapter.getSnapshot = async () => {
+  if (++snapshotReads > 1) throw new Error("runtime node bounds invalid");
+  return knownSnapshot();
+};
+const malformedReadResult = await runPlaytestContract({ contract: snapshotBudgetContract, adapter: malformedReadAdapter });
+assert.equal(malformedReadResult.passed, false);
+assert.match(malformedReadResult.scenarios[0].steps[0].details, /bounds invalid/);
+assert.equal(malformedReadResult.snapshots.length, 1, "retain only the snapshot actually observed before the failure");
+
 const watchdogContract = {
   ...endlessContract,
   playtestId: "scenario.watchdog",

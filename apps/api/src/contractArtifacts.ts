@@ -74,10 +74,19 @@ export function assertContractRevisionAdvance(
   previousContent: string | undefined,
   nextContent: string
 ): void {
-  if (!previousContent || hashContractText(previousContent) === hashContractText(nextContent)) return;
-  const previous = parseContractArtifactText(type, previousContent);
+  // New content must satisfy today's full rules. Historical content may be
+  // precisely what the author is repairing after a validator upgrade.
   const next = parseContractArtifactText(type, nextContent);
-  const previousRevision = contractRevision(type, previous);
+  if (!previousContent || hashContractText(previousContent) === hashContractText(nextContent)) return;
+  let previousRevision: number;
+  try {
+    previousRevision = contractRevision(type, JSON.parse(previousContent));
+  } catch {
+    throw new Error(`${contractLabel(type)} 旧文件的 revision 无法读取；请恢复可识别版本号的历史原文件后重试，不能猜测或重置版本。`);
+  }
+  if (!Number.isSafeInteger(previousRevision) || previousRevision < 1) {
+    throw new Error(`${contractLabel(type)} 旧文件的 revision 必须为正整数；无法安全确定历史版本，不能直接覆盖。`);
+  }
   const nextRevision = contractRevision(type, next);
   if (nextRevision <= previousRevision) {
     throw new Error(

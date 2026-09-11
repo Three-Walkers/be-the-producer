@@ -117,7 +117,8 @@ export function qualityReviewFromVisionResult(
   reviewId: string
 ): ArtifactQualityReview {
   const failedFindings = new Map(semantic.criteria.filter((criterion) => criterion.status !== "pass")
-    .flatMap((criterion) => criterion.findings).map((finding) => [finding.issueCode, finding]));
+    .flatMap((criterion) => criterion.findings).filter((finding) => finding.severity !== "note")
+    .map((finding) => [finding.issueCode, finding]));
   return parseQualityReview({
     schemaVersion: "1.0.0", kind: "artifact_quality_review", reviewId,
     domain: contract.domain, reviewerAgentId: contract.ownerAgentId, targets,

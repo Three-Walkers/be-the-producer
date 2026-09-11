@@ -104,6 +104,20 @@ try {
   assert.equal(edits[2].isError, true, "ambiguous code replacement rejected");
   assert.equal(edits[3].isError, undefined);
   assert.equal(readFileSync(join(project, sourcePath), "utf8"), source.replace("= 10", "= 12"), "precise edit preserves the rest of the module");
+  const resubmittedBytes = readFileSync(join(project, sourcePath));
+  const resubmittedHash = createHash("sha256").update(resubmittedBytes).digest("hex");
+  const submissions = requests("gameplay_programmer", [{ artifactId: "code", type: "source_code", path: sourcePath }], [
+    { name: "resubmit_source", arguments: { path: sourcePath, expectedHash: sourceHash, reason: "Platform-only change; source independently checked." } },
+    { name: "resubmit_source", arguments: { path: "assets/scripts/btp/BtpRuntimeBootstrap.ts", expectedHash: resubmittedHash, reason: "Must not access generated bridge source." } },
+    { name: "resubmit_source", arguments: { path: selfCheckPath, expectedHash: resubmittedHash, reason: "Must not forge server reports." } },
+    { name: "resubmit_source", arguments: { path: sourcePath, expectedHash: resubmittedHash, reason: "Platform-only change; source independently checked." } }
+  ]);
+  assert.equal(submissions[0].isError, true, "stale hash cannot resubmit source");
+  assert.equal(submissions[1].isError, true);
+  assert.equal(submissions[2].isError, true);
+  assert.equal(submissions[3].isError, undefined, JSON.stringify(submissions[3]));
+  assert.deepEqual(readFileSync(join(project, sourcePath)), resubmittedBytes);
+  assert.equal(parseToolOperations(join(root, "operations.jsonl")).at(-1).resubmissionReason, "Platform-only change; source independently checked.");
   write(join(project, sourcePath), source);
   process.env.STUDIO_WORKSPACE_ROOT = root;
   const longSource = source + "// fixture padding\n".repeat(400);
@@ -161,6 +175,15 @@ try {
   const apiResults = await executeAgentToolRequests(real, [apiMessage]);
   assert.equal(apiResults[0]?.status, "completed", JSON.stringify(apiResults));
   assert.equal(artifactReadyForConsumption(real, "artifact_implementation_self_check"), true, "API and MCP share the same immutable self-check gate");
+  const recheckSnapshot = captureWorkspaceSnapshot(project);
+  const recheckFile = recheckSnapshot.get(selfCheckPath);
+  const previousSelfCheck = real.listArtifacts().find((a) => a.artifactId === "artifact_implementation_self_check");
+  real.upsertArtifact({ ...previousSelfCheck, status: "change_requested" });
+  const rechecked = recordHarnessWorkspaceChanges(real, real.findTask(programmerId), defaultAgentContracts.find((a) => a.agentId === "gameplay_programmer"),
+    recheckSnapshot, recheckSnapshot, "unchanged_recheck", undefined, [{ toolName: "run_implementation_checks", path: selfCheckPath,
+      hash: recheckFile.hash, sizeBytes: recheckFile.sizeBytes, status: "completed", access: "write" }], { authoritativeWorkspace: true });
+  assert.deepEqual(rechecked.changedPaths, [selfCheckPath], "rerun deterministic self-check remains evidence even when identical bytes are produced");
+  assert.equal(artifactReadyForConsumption(real, "artifact_implementation_self_check"), true);
   syncProjectWorkspace(real);
   assert.equal(artifactReadyForConsumption(real, "artifact_implementation_self_check"), true, "checkpoint must not replace service evidence with a placeholder");
   assert.equal(taskOutputsVerified(real, real.findTask(programmerId)), true);
@@ -204,6 +227,9 @@ try {
     "checkpoint must not destroy a legitimate QA rejection merely because the build cannot consume it");
   const historical = createStudioKernelFromSnapshot(structuredClone(real.toSnapshot()));
   const historicalReport = historical.listArtifacts().find(a => a.artifactId === "artifact_implementation_review");
+  historical.upsertArtifact({ ...historicalReport, status: "change_requested" });
+  assert.equal(taskOutputsVerified(historical, historical.findTask(reviewerId)), false,
+    "explicitly reopened review cannot auto-complete by reusing unchanged old receipt bytes");
   historical.upsertArtifact({...historicalReport, version: historicalReport.version + 1, status: "change_requested",
     metadata: {...historicalReport.metadata, toolExecutedAt: undefined, filesystemEvidenceInvalidationReason: "review_output_not_current_after_workspace_sync"}});
   historical.updateTask(reviewerId, {status: "blocked", blockers: ["Agent Loop：Agent 请求评审，但任务输出尚未全部通过 Artifact Ledger 验证。"]});

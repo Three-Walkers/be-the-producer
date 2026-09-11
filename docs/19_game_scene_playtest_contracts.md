@@ -115,11 +115,13 @@ GameContract 不负责场景布局、Prefab 路径、Cocos 组件名、截图坐
 
 ### 5.1 必需项与有界执行
 
+- 每个 scenario 都重新加载游戏，不继承前一个用例的运行状态。v1 没有隐藏 fixture/set-state 接口；所有 `startState` 必须相同，各用例通过自己的真实输入步骤建立建造、战斗、暂停或终局前置条件。`startState` 是断言，不是导航指令。
+- `qualityGates` 聚合整次运行的全部快照，没有按用例名或状态隐式筛选。互相矛盾的全局等值/阈值条件会被拒绝；胜利 HP>0 与失败 HP=0 这类分支标准应保留在各自步骤断言中，不能为了通过校验删除必要覆盖。
 - Release gate 至少需要一个 `required: true` scenario。
 - Required scenario 至少需要一个 `required: true` step。
 - 非 required 项可以提供探索性覆盖，但失败不能伪装为 required gate 通过。
 - 单步超时最大为 60 秒，单场景最大为 300 秒。
-- `repeat.maxIterations` 最大为 100；按最坏重复次数计算的步骤总时长不得超过场景超时。
+- `repeat.maxIterations` 最大为 100；单步全部重复、轮询和断言共享 `timeoutMs` 的绝对截止时间，不再次乘循环次数。全部步骤的 `timeoutMs` 之和不得超过场景超时，执行器还会对包括重载和取证的整场景施加硬超时。
 - `repeat.until` 必须包含至少一个 assertion，禁止无条件或无限循环。
 
 没有终局的游戏可以在观察窗口结束后断言仍处于 active state。支持重开的游戏使用 `system/restart` action，并依据 GameContract 的显式 restart transition 验证新一轮状态。

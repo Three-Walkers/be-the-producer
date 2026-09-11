@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { PNG } from "pngjs";
-import { inspectPngAlpha } from "./imageAssetValidation.js";
+import { assertPngAlphaPolicy, inspectPngAlpha } from "./imageAssetValidation.js";
 
 export interface RasterNormalization {
   width: number;
@@ -87,6 +87,13 @@ export function normalizeGeneratedRaster(raw: Buffer, options: RasterNormalizati
     output.data[o + 3] = opaque ? 255 : Math.round(a / count * 255);
   }
   const buffer = PNG.sync.write(output);
+  if (options.alpha === "remove_white") {
+    try {
+      assertPngAlphaPolicy(inspectPngAlpha(buffer), "required", "remove_white 输出");
+    } catch (error) {
+      throw new Error(`背景移除未产生可用的透明素材（removedPixels=${removedPixels}）：${error instanceof Error ? error.message : String(error)} 请重新生成具有边缘相连纯白背景的素材，或使用模型输出的真实 alpha；不要把棋盘格当作透明通道。`);
+    }
+  }
   return { buffer, receipt: {
     version: 1, rawHash: hash(raw), rawSizeBytes: raw.length, rawWidth: sw, rawHeight: sh,
     options, removedPixels, outputHash: hash(buffer)

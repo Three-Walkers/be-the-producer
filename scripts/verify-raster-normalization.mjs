@@ -37,6 +37,15 @@ assertPngAlphaPolicy(inspectPngAlpha(small.buffer), "required");
 assert.throws(() => assertPngAlphaPolicy(inspectPngAlpha(small.buffer), "opaque"), /非全不透明/);
 const flattened = normalizeGeneratedRaster(result.buffer, { width: 8, height: 8, alpha: "opaque" });
 assertPngAlphaPolicy(inspectPngAlpha(flattened.buffer), "opaque");
+const darkMatte = new PNG({ width: 16, height: 16 });
+darkMatte.data.fill(60);
+for (let i = 3; i < darkMatte.data.length; i += 4) darkMatte.data[i] = 254;
+assert.throws(() => normalizeGeneratedRaster(PNG.sync.write(darkMatte), { width: 16, height: 16, alpha: "remove_white" }),
+  /背景移除未产生可用的透明素材.*removedPixels=0/, "unsuccessful matte removal must fail before PNG publication");
+assert.throws(() => normalizeGeneratedRaster(PNG.sync.write(new PNG({ width: 2, height: 2 })),
+  { width: 2, height: 2, alpha: "remove_white" }), /没有可见像素/);
+assertPngAlphaPolicy(inspectPngAlpha(normalizeGeneratedRaster(result.buffer,
+  { width: 16, height: 16, alpha: "remove_white" }).buffer), "required", "existing genuine alpha survives");
 for (let i = 3; i < source.data.length; i += 4) source.data[i] = 252;
 assert.throws(() => assertPngAlphaPolicy(inspectPngAlpha(PNG.sync.write(source)), "required"), /没有有效透明区域/);
 assert.throws(() => parseRasterNormalization({ width: 99999, height: 1, alpha: "preserve" }));

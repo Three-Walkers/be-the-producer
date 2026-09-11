@@ -50,6 +50,7 @@ export type ClaudeCliProcessFailureKind =
   | "provider_rate_limited"
   | "provider_overloaded"
   | "provider_timeout"
+  | "provider_billing"
   | "authentication"
   | "session"
   | "process_exit";
@@ -329,10 +330,11 @@ function assertClaudeCompatibleProvider(input: AgentHarnessRunInput): void {
 
 function claudeToolsForAgent(agent: AgentContract, mode: "conversation" | "task"): string[] {
   if (mode === "conversation") {
-    return ["mcp__btp_workspace__read_file", "mcp__btp_workspace__list_files"];
+    return ["mcp__btp_workspace__read_file", "mcp__btp_workspace__read_image", "mcp__btp_workspace__list_files"];
   }
   const tools = [
     "mcp__btp_workspace__read_file",
+    "mcp__btp_workspace__read_image",
     "mcp__btp_workspace__write_artifact",
     "mcp__btp_workspace__append_document",
     "mcp__btp_workspace__list_files",
@@ -353,8 +355,8 @@ function claudeToolsForAgent(agent: AgentContract, mode: "conversation" | "task"
   if (["gameplay_programmer", "qa_evaluator", "cocos_tech_lead", "cocos_automation"].includes(agent.agentId)) {
     tools.push("mcp__btp_workspace__run_implementation_checks");
   }
-  if (agent.agentId === "gameplay_programmer") tools.push("mcp__btp_workspace__edit_code");
-  if (["cocos_tech_lead", "gameplay_programmer", "asset_production"].includes(agent.agentId)) tools.push("mcp__btp_workspace__edit_artifact");
+  if (agent.agentId === "gameplay_programmer") tools.push("mcp__btp_workspace__edit_code", "mcp__btp_workspace__resubmit_source");
+  if (["game_designer", "qa_evaluator", "cocos_tech_lead", "gameplay_programmer", "asset_production"].includes(agent.agentId)) tools.push("mcp__btp_workspace__edit_artifact");
   if (agent.agentId === "cocos_automation") {
     tools.push(
       "mcp__btp_workspace__cocos_validate_project",
@@ -1004,6 +1006,15 @@ function extractPlainFailureCandidate(source: string): string | undefined {
 
 function classifyClaudeCliFailure(rawDetail: string | undefined): ClaudeCliFailureDiagnosis {
   const detail = sanitizeClaudeCliFailureDetail(rawDetail ?? "");
+  // Some providers return billing failures as HTTP 400 or 429. A retry cannot
+  // repair an account balance; classify these before transient status codes.
+  if (/\bArrearage\b|insufficient[_ -]quota|billing[_ -]hard[_ -]limit|credit balance.{0,30}(?:low|insufficient)|insufficient.{0,20}(?:credit|balance)|欠费|余额不足/i.test(detail)) {
+    return {
+      kind: "provider_billing",
+      retryable: false,
+      detail: "模型服务因账户欠费、余额不足或计费额度限制拒绝请求。请恢复该 Provider 的计费状态后明确重试任务；未更换模型或跳过审查，已有任务和产物证据保留。"
+    };
+  }
   if (/API Error:\s*terminated|\bterminated\b/i.test(detail)) {
     return {
       kind: "provider_terminated",

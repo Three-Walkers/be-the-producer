@@ -92,7 +92,7 @@ const taskReadRoots: Record<string, string[]> = {
   game_designer: ["agents/design", "docs/design"],
   design_quality_reviewer: ["agents/review/design"],
   art_director: ["agents/art", "docs/art"],
-  asset_production: ["agents/art/processed-assets", "assets/art"],
+  asset_production: ["agents/art/processed-assets", "agents/art/asset-manifest.json", "assets/art"],
   visual_quality_reviewer: ["agents/review/art"],
   cocos_tech_lead: ["agents/engineering", "docs/engineering"],
   gameplay_programmer: ["assets/scripts", "docs/engineering"],

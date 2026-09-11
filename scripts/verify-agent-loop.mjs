@@ -489,6 +489,7 @@ const fakeModelRuntime = {
         metadata: {
           failure: true,
           failureKind: forcedFailureKind,
+          ...(forcedFailureKind === "provider_billing" ? { harnessRetryable: false } : {}),
           loopIteration: input.iteration
         },
         createdAt: new Date().toISOString()
@@ -573,8 +574,8 @@ assert.equal(maximumConcurrency, 2, "策划和美术应在同一回合并行执�
 assert.equal(firstBatchPublishedEarly, true, "fast sibling must publish its outcome while slow sibling is still running");
 assert.equal(kernel.findTask("task_stage_1_design_clarification")?.status, "review");
 assert.equal(kernel.findTask("task_stage_1_art_direction")?.status, "review");
-assert.equal(kernel.getAgentLoopState().status, "waiting_for_producer");
-assert.match(kernel.getAgentLoopState().waitingReason ?? "", /评审/);
+assert.equal(kernel.getAgentLoopState().status, "blocked", "fixture 的审查 JSON 工具失败不能被作者 review 状态掩盖");
+assert.match(kernel.getAgentLoopState().waitingReason ?? "", /质量审查收据不是合法 JSON/);
 assert.equal(kernel.getAgentLoopState().agents.game_designer?.status, "waiting");
 assert.equal(
   kernel.getAgentLoopState().agents.game_designer?.lastError,
@@ -598,7 +599,7 @@ for (const artifactId of ["artifact_gdd_baseline_draft", "artifact_game_contract
 }
 
 const restored = createStudioKernelFromSnapshot(kernel.toSnapshot());
-assert.equal(restored.getAgentLoopState().status, "waiting_for_producer", "重启后应保留 Loop 状态");
+assert.equal(restored.getAgentLoopState().status, "blocked", "重启后应保留真实 Loop 阻塞状态");
 assert.equal(restored.getAgentLoopState().iteration, kernel.getAgentLoopState().iteration, "重启后应保留 Loop 轮次");
 restored.updateAgentLoopAgent("game_designer", {
   status: "queued",
@@ -662,6 +663,18 @@ await waitFor(() => kernel.getAgentLoopState().status !== "running", 4_000);
 assert.equal(modelCallCount - callsBeforeNoProgressFailure, 2, "无工具进展的 Harness 超时最多自动尝试两次");
 assert.equal(kernel.findTask("task_harness_no_progress")?.status, "blocked");
 assert.match(kernel.findTask("task_harness_no_progress")?.blockers.join("；") ?? "", /连续失败 2 次/);
+forcedFailureKind = undefined;
+
+kernel.updateTask("task_harness_no_progress", { status: "doing", blockers: [] });
+forcedFailureKind = "provider_billing";
+const callsBeforeBillingFailure = modelCallCount;
+service.start(projectId, { reason: "non-retryable provider failure smoke" });
+await waitFor(() => kernel.getAgentLoopState().status !== "running", 4_000);
+assert.equal(modelCallCount - callsBeforeBillingFailure, 1, "billing/auth failures must not consume a transient retry loop");
+assert.match(kernel.findTask("task_harness_no_progress").blockers.join("；"), /等待制作人/);
+service.start(projectId, { reason: "restart must preserve permanent provider blocker" });
+await waitFor(() => kernel.getAgentLoopState().status !== "running", 4_000);
+assert.equal(modelCallCount - callsBeforeBillingFailure, 1, "restart must not implicitly retry a non-retryable account failure");
 forcedFailureKind = undefined;
 
 addDirectToolFixture({

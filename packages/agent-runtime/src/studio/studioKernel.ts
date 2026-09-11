@@ -1195,7 +1195,7 @@ export class StudioKernel {
   }
 
   private attachArtifactToSourceTask(artifact: Artifact): void {
-    if (!artifact.sourceTaskId) {
+    if (!artifact.sourceTaskId || artifact.metadata.evidenceRole === "supporting") {
       return;
     }
 

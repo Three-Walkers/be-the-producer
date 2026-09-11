@@ -4,6 +4,9 @@ import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { runInNewContext } from "node:vm";
+import ts from "typescript";
+import { verifyBootstrapLifecycle } from "./verify-cocos-bootstrap-lifecycle.mjs";
 import {
   CocosEngineBridge,
   minimalCreatorEnvironment,
@@ -11,8 +14,10 @@ import {
   verifyCocosBuildManifest
 } from "../apps/api/dist/cocosEngineBridge.js";
 import { CocosEngineSettingsStore } from "../apps/api/dist/cocosEngineSettings.js";
-import { artifactReadyForConsumption } from "../apps/api/dist/taskOutputEvidence.js";
-import { createStudioKernel } from "../packages/agent-runtime/dist/index.js";
+import { artifactReadyForConsumption, taskOutputsVerified } from "../apps/api/dist/taskOutputEvidence.js";
+import { createStudioKernel, defaultAgentContracts } from "../packages/agent-runtime/dist/index.js";
+import { captureWorkspaceSnapshot, recordHarnessWorkspaceChanges, analyzeHarnessWorkspaceChanges } from "../apps/api/dist/harnessWorkspaceEvidence.js";
+import { reconcileCocosSupportingEvidence } from "../apps/api/dist/cocosSupportingEvidence.js";
 
 const root = mkdtempSync(join(tmpdir(), "btp-cocos-bridge-"));
 const projectRoot = join(root, "project");
@@ -258,6 +263,22 @@ assert.equal(existsSync(join(projectRoot, "assets", "scenes", "MainGame.scene"))
 assert.equal(existsSync(join(projectRoot, "assets", "scenes", "MainGame.scene.meta")), true);
 assert.equal(existsSync(join(projectRoot, "assets", "scripts", "btp", "BtpRuntimeBootstrap.ts")), true);
 const bootstrapSource = readFileSync(join(projectRoot, "assets", "scripts", "btp", "BtpRuntimeBootstrap.ts"), "utf8");
+const bootstrapScene = JSON.parse(readFileSync(join(projectRoot, "assets/scenes/MainGame.scene"), "utf8"));
+const bootstrapType = bootstrapScene[5].__type__;
+// Execute the generated module with both name-only and UUID-instrumented
+// compiler identities. Its serialized scene component must resolve in both.
+for (const primaryId of ["BtpRuntimeBootstrap", bootstrapType]) {
+  const registry = new Map();
+  const fixtureExports = {};
+  const Component = class {};
+  const cc = { Component, _decorator: { ccclass: () => (ctor) => { registry.set(primaryId, ctor); return ctor; } },
+    js: { setClassAlias: (ctor, alias) => { assert.ok(!registry.has(alias) || registry.get(alias) === ctor); registry.set(alias, ctor); } } };
+  const compiled = ts.transpileModule(bootstrapSource, { compilerOptions: {
+    module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, experimentalDecorators: true
+  } }).outputText;
+  runInNewContext(compiled, { exports: fixtureExports, require: (id) => id === "cc" ? cc : { GameController: Component } });
+  assert.equal(registry.get(bootstrapType), fixtureExports.BtpRuntimeBootstrap, "scene UUID must resolve without depending on compiler _RF injection");
+}
 assert.match(bootstrapSource, /GameController/);
 assert.match(bootstrapSource, /node\.layer = parent\.layer/);
 assert.match(bootstrapSource, /spec\.testId/);
@@ -275,6 +296,7 @@ assert.ok(bootstrapSource.indexOf("setSiblingIndex(siblingIndex)") < bootstrapSo
 assert.match(bootstrapSource, /invalid Sprite\.sizeMode/);
 assert.doesNotMatch(bootstrapSource, /yarn|basket|joystick|assetAliases/i);
 const normalizedDescriptor = JSON.parse(readFileSync(join(projectRoot, "assets", "resources", "btp", "scene-blueprint.json"), "utf8"));
+verifyBootstrapLifecycle(bootstrapSource, normalizedDescriptor);
 assert.equal(normalizedDescriptor.kind, "scene_blueprint");
 assert.equal(normalizedDescriptor.schemaVersion, "1.0.0");
 assert.equal(normalizedDescriptor.entrySceneId, "puzzle_room");
@@ -568,6 +590,56 @@ provenanceKernel.recordArtifactMaterialization("artifact_wechat_dev_build", {
   directoryManifest: report.outputManifest
 });
 assert.equal(artifactReadyForConsumption(provenanceKernel, "artifact_wechat_dev_build"), true);
+const buildSnapshot = captureWorkspaceSnapshot(projectRoot);
+const buildPaths = [...buildSnapshot.keys()].filter((path) => path.startsWith("shared/build-artifacts/wechat/dev/"));
+const buildTask = provenanceKernel.findTask("task_stage_2_cocos_build");
+const buildOperations = build.evidence.map((item) => ({
+  toolName: "cocos_build", ...item, status: "completed", bridgeOk: true,
+  operationId: build.operationId, operationType: "build",
+  ...(item.path === build.reportPath ? { directoryManifest: report.outputManifest } : {})
+}));
+const previousBuild = new Map(buildSnapshot);
+const oldChunkPath = "shared/build-artifacts/wechat/dev/old-hash-chunk.js";
+previousBuild.set(oldChunkPath, { path: oldChunkPath, hash: "old", sizeBytes: 3 });
+const cocosAgent = defaultAgentContracts.find((agent) => agent.agentId === "cocos_automation");
+const replacement = analyzeHarnessWorkspaceChanges(provenanceKernel, buildTask, cocosAgent,
+  previousBuild, buildSnapshot, buildPaths, buildOperations);
+assert.deepEqual(replacement.deletedPaths, [oldChunkPath]);
+assert.deepEqual(replacement.violations, [], "a successful exact new build manifest authorizes replacing obsolete build files");
+for (const badOperations of [[], buildOperations.map(op => ({ ...op, bridgeOk: false })),
+  buildOperations.map(op => ({ ...op, hash: "0".repeat(64) }))]) {
+  assert.ok(analyzeHarnessWorkspaceChanges(provenanceKernel, buildTask, cocosAgent,
+    previousBuild, buildSnapshot, buildPaths, badOperations).violations.some(v => v.includes(oldChunkPath)));
+}
+const deletedSource = new Map(buildSnapshot);
+deletedSource.delete("assets/scripts/gameplay/GameController.ts");
+assert.ok(analyzeHarnessWorkspaceChanges(provenanceKernel, buildTask, cocosAgent,
+  buildSnapshot, deletedSource, buildPaths, buildOperations).violations.some(v => v.includes("assets/scripts/gameplay/GameController.ts")),
+  "successful build does not authorize source deletion");
+const harnessEvidence = recordHarnessWorkspaceChanges(provenanceKernel, buildTask,
+  defaultAgentContracts.find((agent) => agent.agentId === "cocos_automation"), buildSnapshot, buildSnapshot,
+  "inv_build_directory", buildPaths, buildOperations);
+assert.deepEqual(harnessEvidence.violations, []);
+assert.deepEqual(harnessEvidence.artifactIds, ["artifact_wechat_dev_build"]);
+assert.equal(artifactReadyForConsumption(provenanceKernel, "artifact_wechat_dev_build"), true,
+  "bundle files after build-report.json must not overwrite the aggregate build receipt");
+assert.equal(provenanceKernel.listArtifacts().find(a => a.artifactId === "artifact_wechat_dev_build").metadata.bridgeOk, true);
+assert.equal(provenanceKernel.listArtifactLedger().find(a => a.artifactId === "artifact_wechat_dev_build").directoryManifest.digest, report.outputManifest.digest);
+
+const historic = { ...provenanceKernel.listArtifacts().find(a => a.artifactId === "artifact_wechat_dev_build"),
+  artifactId: "historic_import", type: "asset_spec", path: "agents/cocos-automation/imports/cocos_import_20260911000000_abcdef12.json",
+  status: "change_requested", metadata: {} };
+provenanceKernel.upsertArtifact(historic);
+assert.ok(provenanceKernel.findTask(buildTask.taskId).outputArtifacts.includes(historic.artifactId), "reproduce legacy sidecar attachment");
+reconcileCocosSupportingEvidence(provenanceKernel);
+const supporting = provenanceKernel.listArtifacts().find(a => a.artifactId === historic.artifactId);
+assert.equal(supporting.status, "change_requested", "migration does not fake historical approval");
+assert.equal(supporting.sourceTaskId, buildTask.taskId, "source provenance remains intact");
+provenanceKernel.upsertArtifact(supporting); // Workspace synchronization must not reattach it.
+reconcileCocosSupportingEvidence(provenanceKernel);
+assert.deepEqual(provenanceKernel.findTask(buildTask.taskId).outputArtifacts, ["artifact_wechat_dev_build"]);
+assert.equal(taskOutputsVerified(provenanceKernel, provenanceKernel.findTask(buildTask.taskId)), true,
+  "historical bridge sidecars are not additional build deliverables");
 const newerImport = bridge.importAssets();
 assert.equal(newerImport.ok, true, newerImport.error);
 assert.equal(

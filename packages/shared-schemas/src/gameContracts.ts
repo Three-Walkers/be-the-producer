@@ -1468,6 +1468,21 @@ function validatePlaytestContractShape(value: unknown, path: string, issues: Con
 function validatePlaytestContractSemantics(contract: PlaytestContract, path: string, issues: ContractValidationIssue[]): void {
   reportDuplicateIds(contract.scenarios.map((scenario) => scenario.scenarioId), `${path}.scenarios`, issues);
   reportDuplicateIds(contract.qualityGates.map((gate) => gate.gateId), `${path}.qualityGates`, issues);
+  // v1 reset() reloads the same entry point before EVERY scenario. startState
+  // is an assertion, not a fixture setter or an implicit navigation request.
+  const resetState = contract.scenarios[0]?.startState;
+  contract.scenarios.forEach((scenario, index) => {
+    if (scenario.startState !== resetState) issue(issues, `${path}.scenarios[${index}].startState`, "invalid_value",
+      `Every scenario reloads the game independently and must assert the same reset state '${resetState}'. '${scenario.startState}' is not established automatically. Add real navigation/setup actions to this scenario's steps; do not change game behavior to satisfy test setup.`);
+  });
+  // Aggregates cover the whole run, not the scenario suggested by a gate's
+  // name. Reject provably contradictory constraints; do not weaken either one.
+  contract.qualityGates.forEach((gate, index) => {
+    const equality = contract.qualityGates.find((other) => other !== gate && other.operator === "eq" &&
+      other.signalId === gate.signalId && other.aggregation === gate.aggregation && !qualityGateAcceptsValue(gate, other.expected));
+    if (equality) issue(issues, `${path}.qualityGates[${index}]`, "invalid_value",
+      `Global quality gates '${equality.gateId}' and '${gate.gateId}' contradict each other for ${gate.aggregation}(${gate.signalId}). Aggregates include all scenarios. Express scenario-specific expectations as step assertions, retaining success and failure coverage.`);
+  });
   if (contract.environment.maxScenarioDurationMs > MAX_PLAYTEST_SCENARIO_DURATION_MS) {
     issue(
       issues,
@@ -1490,7 +1505,9 @@ function validatePlaytestContractSemantics(contract: PlaytestContract, path: str
       );
     }
     const worstCaseDurationMs = scenario.steps.reduce(
-      (sum, step) => sum + step.timeoutMs * (step.repeat?.maxIterations ?? 1),
+      // executeStep uses ONE absolute deadline across every repeat iteration,
+      // polling and assertions. Multiplying again rejects bounded scenarios.
+      (sum, step) => sum + step.timeoutMs,
       0,
     );
     if (worstCaseDurationMs > contract.environment.maxScenarioDurationMs) {
@@ -1528,6 +1545,19 @@ function validatePlaytestContractSemantics(contract: PlaytestContract, path: str
       }
     });
   });
+}
+
+function qualityGateAcceptsValue(gate: PlaytestQualityGate, value: PlaytestQualityGate["expected"]): boolean {
+  if (gate.operator === "eq") return value === gate.expected;
+  if (gate.operator === "not_eq") return value !== gate.expected;
+  // Type incompatibilities are validated separately; no coercion or guessing.
+  if (typeof value !== "number" || typeof gate.expected !== "number") return true;
+  switch (gate.operator) {
+    case "gt": return value > gate.expected;
+    case "gte": return value >= gate.expected;
+    case "lt": return value < gate.expected;
+    case "lte": return value <= gate.expected;
+  }
 }
 
 export function validatePlaytestContract(value: unknown): ContractValidationResult<PlaytestContract> {

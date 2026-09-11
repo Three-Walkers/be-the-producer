@@ -4,6 +4,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync 
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
+import { crc32, deflateSync } from "node:zlib";
 import { getQualityReviewArtifactContracts } from "../packages/agent-runtime/dist/index.js";
 import { mergeArtVisionSemanticResults } from "../apps/api/dist/multimodalArtProvider.js";
 
@@ -62,9 +63,48 @@ try {
     rpc(10, "tools/list"),
     rpc(11, "tools/call", { name: "write_artifact", arguments: { path: ownPath, content: "conversation overwrite" } })
   ]);
-  assert.deepEqual(toolNames(conversationResponses, 10).sort(), ["list_files", "read_file"]);
+  assert.deepEqual(toolNames(conversationResponses, 10).sort(), ["list_files", "read_file", "read_image"]);
   assert.equal(conversationResponses.get(11)?.result?.isError, true);
   assert.match(readFileSync(join(projectRoot, ownPath), "utf8"), /own = 2/);
+
+  const screenshotPath = "agents/qa/playtest-runs/fixture/menu.png";
+  const pngChunk = (type, data) => {
+    const payload = Buffer.concat([Buffer.from(type), data]);
+    const length = Buffer.alloc(4), crc = Buffer.alloc(4);
+    length.writeUInt32BE(data.length); crc.writeUInt32BE(crc32(payload));
+    return Buffer.concat([length, payload, crc]);
+  };
+  const header = Buffer.alloc(13); header.writeUInt32BE(1, 0); header.writeUInt32BE(1, 4); header[8] = 8; header[9] = 6;
+  const screenshot = Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), pngChunk("IHDR", header),
+    pngChunk("IDAT", deflateSync(Buffer.from([0, 255, 0, 0, 255]))), pngChunk("IEND", Buffer.alloc(0))]);
+  mkdirSync(dirname(join(projectRoot, screenshotPath)), { recursive: true });
+  writeFileSync(join(projectRoot, screenshotPath), screenshot);
+  writeFileSync(join(projectRoot, "agents/qa/playtest-runs/fixture/corrupt.png"), "not pixels");
+  writeFileSync(join(projectRoot, "agents/qa/playtest-runs/fixture/large.png"), Buffer.alloc(8 * 1024 * 1024 + 1));
+  const pixelLog = join(root, "pixel-operations.jsonl");
+  writeFileSync(pixelLog, "");
+  const pixelAuthorization = { ...gameplayAuthorization, outputArtifactIds: [], artifacts: [], readRoots: [], serviceReadPaths: ["agents/qa/playtest-runs/fixture"] };
+  for (const role of ["qa_evaluator", "gameplay_programmer"]) {
+    const pixels = runMcp(pixelAuthorization, role, [
+      rpc(900, "tools/call", { name: "read_image", arguments: { path: screenshotPath } }),
+      rpc(901, "tools/call", { name: "read_image", arguments: { path: "agents/qa/playtest-runs/fixture/corrupt.png" } }),
+      rpc(902, "tools/call", { name: "read_image", arguments: { path: "agents/qa/playtest-runs/fixture/large.png" } }),
+      rpc(903, "tools/call", { name: "read_image", arguments: { path: "agents/private/secret.png" } }),
+      rpc(904, "tools/call", { name: "read_file", arguments: { path: screenshotPath } }),
+      rpc(905, "tools/call", { name: "read_image", arguments: { path: "../outside.png" } })
+    ], { BTP_OPERATION_LOG_PATH: pixelLog });
+    const viewed = pixels.get(900)?.result;
+    assert.equal(viewed?.isError, undefined, JSON.stringify(viewed));
+    assert.equal(viewed?.content?.[1]?.type, "image");
+    assert.equal(viewed?.content?.[1]?.mimeType, "image/png");
+    assert.deepEqual(Buffer.from(viewed.content[1].data, "base64"), screenshot);
+    assert.equal(viewed.structuredContent.hash, createHash("sha256").update(screenshot).digest("hex"));
+    assert.equal(viewed.structuredContent.width, 1);
+    for (const id of [901, 902, 903, 904, 905]) assert.equal(pixels.get(id)?.result?.isError, true, `reject ${role} image request ${id}`);
+    assert.match(pixels.get(904).result.content[0].text, /read_image/);
+  }
+  assert.deepEqual(readFileSync(join(projectRoot, screenshotPath)), screenshot, "viewing cannot rewrite screenshot evidence");
+  assert.equal(readFileSync(pixelLog, "utf8").trim(), "", "image viewing must not create write or review-verdict evidence");
 
   const contractPath = "agents/design/contracts/game-contract.json";
   const contractOperationLog = join(root, "contract-operations.jsonl");
@@ -271,6 +311,7 @@ globalThis.fetch = async (_input, init = {}) => {
     ]
   };
   const batchVisualReview = await runMcpSequential(batchVisualAuthorization, "visual_quality_reviewer", [
+    rpc(150, "tools/call", { name: "write_artifact", arguments: { path: visualReviewPath, content: "{}" } }),
     rpc(151, "tools/call", {
       name: "inspect_visual_assets",
       arguments: { paths: [extraVisualPath] }
@@ -297,7 +338,47 @@ globalThis.fetch = async (_input, init = {}) => {
     BTP_OPERATION_LOG_PATH: visualBatchOperationLog
   });
   assert.equal(batchVisualReview.get(151)?.result?.isError, undefined);
+  assert.equal(batchVisualReview.get(150)?.result?.isError, true);
+  assert.match(batchVisualReview.get(150)?.result?.content?.[0]?.text ?? "", /schemaVersion[\s\S]*submit_visual_review/,
+    "schema failures must immediately point reviewers to the authoritative typed submission tool");
   assert.equal(batchVisualReview.get(152)?.result?.isError, undefined);
+  // A contact sheet is not inspection of each runtime source. Reject an
+  // incomplete review while the same worker can still inspect the missing PNG.
+  const runtimeContract = getQualityReviewArtifactContracts().find((candidate) => candidate.domain === "visual_assets");
+  const manifestPath = "agents/art/asset-manifest.json";
+  const contactPath = "agents/art/processed-assets/first-playable-contact-sheet.png";
+  const runtimePath = "assets/art/first-playable/coverage-hero.png";
+  writeProjectFile(runtimePath, readFileSync(join(projectRoot, artBoardPath)));
+  writeProjectFile(contactPath, readFileSync(join(projectRoot, artBoardPath)));
+  writeProjectFile(manifestPath, JSON.stringify({ schemaVersion: "2.0.0", assets: [{ id: "hero", runtimePath, alphaPolicy: "opaque" }] }));
+  const runtimeAuth = {
+    ...visualReviewAuthorization, taskId: runtimeContract.sourceTaskId,
+    inputArtifactIds: [...runtimeContract.subjectArtifactIds, "artifact_coverage_hero"], outputArtifactIds: [runtimeContract.artifactId],
+    artifacts: [visualReviewAuthorization.artifacts[0],
+      { artifactId: "artifact_asset_manifest_draft", type: "asset_manifest", path: manifestPath, ownerAgentId: "asset_production", sourceTaskId: "task_stage_2_asset_pipeline" },
+      { artifactId: "artifact_asset_contact_sheet", type: "asset", path: contactPath, ownerAgentId: "asset_production", sourceTaskId: "task_stage_2_asset_pipeline" },
+      { artifactId: "artifact_coverage_hero", type: "asset", path: runtimePath, ownerAgentId: "asset_production", sourceTaskId: "task_stage_2_asset_pipeline" },
+      { artifactId: runtimeContract.artifactId, type: "quality_review", path: runtimeContract.path, ownerAgentId: "visual_quality_reviewer", sourceTaskId: runtimeContract.sourceTaskId }]
+  };
+  const runtimeInputs = runtimeAuth.artifacts.filter((artifact) => runtimeAuth.inputArtifactIds.includes(artifact.artifactId))
+    .map((artifact) => inputEvidence(artifact.artifactId, 1, artifact.path));
+  const runtimeFetch = join(root, "fake-runtime-vision-fetch.mjs");
+  writeFileSync(runtimeFetch, `let calls=0; const results=${JSON.stringify([
+    visionSemanticFixture(runtimeContract, contactPath, "sheet"), visionSemanticFixture(runtimeContract, runtimePath, "runtime")
+  ])}; globalThis.fetch=async()=>new Response(JSON.stringify({id:'coverage-'+calls,choices:[{message:{content:JSON.stringify(results[Math.min(calls++,1)])}}]}),{status:200,headers:{'content-type':'application/json'}});`);
+  const coverage = await runMcpSequential(runtimeAuth, "visual_quality_reviewer", [
+    rpc(170, "tools/call", { name: "inspect_visual_assets", arguments: { paths: [contactPath] } }),
+    rpc(171, "tools/call", { name: "submit_visual_review", arguments: {} }),
+    rpc(172, "tools/call", { name: "inspect_visual_assets", arguments: { paths: [runtimePath] } }),
+    rpc(173, "tools/call", { name: "submit_visual_review", arguments: {} })
+  ], { ...qualityEnv, NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --import=${runtimeFetch}`.trim(),
+    BTP_TASK_INPUT_EVIDENCE: JSON.stringify(runtimeInputs), BTP_HARNESS_INVOCATION_ID: "inv_runtime_coverage",
+    BTP_MULTIMODAL_API_KEY: "test-only", BTP_VISION_REVIEW_ENDPOINT: "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+    BTP_VISION_REVIEW_MODEL: "qwen3.8-max" });
+  assert.equal(coverage.get(170)?.result?.isError, undefined, JSON.stringify(coverage.get(170)));
+  assert.equal(coverage.get(171)?.result?.isError, true);
+  assert.match(coverage.get(171)?.result?.content?.[0]?.text ?? "", /尚未覆盖.*coverage-hero\.png/);
+  assert.equal(coverage.get(173)?.result?.isError, undefined, JSON.stringify(coverage.get(173)));
   assert.equal(
     batchVisualReview.get(153)?.result?.isError,
     undefined,
@@ -447,6 +528,7 @@ globalThis.fetch = async (_input, init = {}) => {
     serviceWritePaths: [buildPath, "agents/cocos-automation/build-ops", "agents/cocos-automation/cocos-build-logs"]
   };
   const failure = runMcp(cocosAuthorization, "cocos_automation", [
+    rpc(19, "tools/list"),
     rpc(20, "tools/call", { name: "cocos_build", arguments: { platform: "wechatgame", outputDir: buildPath } })
   ], {
     BTP_OPERATION_LOG_PATH: operationLog,
@@ -456,6 +538,14 @@ globalThis.fetch = async (_input, init = {}) => {
     BTP_COCOS_TIMEOUT_MS: "5000"
   });
   assert.equal(failure.get(20)?.result?.isError, true);
+  const sceneTool = failure.get(19).result.tools.find((tool) => tool.name === "cocos_apply_blueprint");
+  assert.equal(sceneTool.inputSchema.properties.scenePath.default, "assets/scenes/MainGame.scene");
+  assert.match(sceneTool.inputSchema.properties.scenePath.description, /Authorized write paths: none/);
+  const wrongScene = runMcp({ ...cocosAuthorization,
+    serviceWritePaths: [...cocosAuthorization.serviceWritePaths, "assets/scenes/MainGame.scene", "assets/scenes/MainGame.scene.meta"]
+  }, "cocos_automation", [rpc(21, "tools/call", { name: "cocos_apply_blueprint", arguments: { scenePath: "assets/scenes/Main.scene" } })]);
+  assert.equal(wrongScene.get(21).result.isError, true);
+  assert.match(wrongScene.get(21).result.content[0].text, /当前任务的场景写入授权为：assets\/scenes\/MainGame.scene/);
   const operations = readFileSync(operationLog, "utf8").trim().split(/\r?\n/).map((line) => JSON.parse(line));
   assert.ok(operations.length > 0);
   assert.ok(operations.every((operation) => operation.status === "failed" && operation.bridgeOk === false));

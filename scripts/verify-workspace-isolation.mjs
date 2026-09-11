@@ -34,6 +34,17 @@ try {
     commit.finalize();
     assert.equal(readFileSync(join(canonical, "agents/design/gdd.md"), "utf8"), "candidate\n");
     assert.equal(readFileSync(join(canonical, "agents/design/new.md"), "utf8"), "new candidate\n");
+    const oldChunk = "shared/build-artifacts/wechat/dev/old-chunk.js";
+    mkdirSync(join(canonical, "shared/build-artifacts/wechat/dev"), { recursive: true });
+    writeFileSync(join(canonical, oldChunk), "old build bytes\n");
+    const replacement = stageWorkspaceCommit(canonical, isolated.root, [], [oldChunk]);
+    assert.equal(existsSync(join(canonical, oldChunk)), false);
+    replacement.rollback();
+    assert.equal(readFileSync(join(canonical, oldChunk), "utf8"), "old build bytes\n");
+    assert.throws(() => stageWorkspaceCommit(canonical, isolated.root, ["missing-new-file.js"], [oldChunk]));
+    assert.equal(readFileSync(join(canonical, oldChunk), "utf8"), "old build bytes\n", "failed replacement restores deleted files atomically");
+    stageWorkspaceCommit(canonical, isolated.root, [], [oldChunk]).finalize();
+    assert.equal(existsSync(join(canonical, oldChunk)), false);
   } finally {
     isolated.dispose();
   }

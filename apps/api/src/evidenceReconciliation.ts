@@ -3,13 +3,14 @@ import {
   workflowTaskStages,
   type StudioKernel
 } from "@game-pipeline/agent-runtime";
+import { createHash } from "node:crypto";
 import type {
   ArtifactDirectoryManifest,
   ArtifactEvidenceStatus,
   ArtifactInputProvenance,
   Task
 } from "@game-pipeline/shared-schemas";
-import { artifactReadyForConsumption, artifactInputProvenanceIsCurrent } from "./taskOutputEvidence.js";
+import { artifactReadyForConsumption, artifactReadyForTaskCompletion, artifactInputProvenanceIsCurrent } from "./taskOutputEvidence.js";
 import { currentImplementationReport, implementationReportNeedsRefresh, implementationReviewPath } from "./implementationReview.js";
 import { applyQualityReviewChangeRequest, qualityReviewReadyForGate } from "./qualityReviewArtifacts.js";
 
@@ -62,9 +63,16 @@ export function reconcileInvalidQualityReviewEvidence(
       // Once the author has resubmitted valid inputs, remove only that owned
       // blocker; keep real/manual dependency failures and the invalid receipt.
       if (artifact.metadata.qualityReviewEvidenceInvalidationReason && task &&
-          executableStages.has(task.stageId) && task.status !== "cancelled" &&
-          task.blockers.some((blocker) => blocker.startsWith("质量审查证据失效：")) &&
+          executableStages.has(task.stageId) && task.status === "blocked" &&
+          task.blockers.every((blocker) => blocker.startsWith("质量审查证据失效：") || blocker.startsWith("Agent Loop：已交接给")) &&
           task.inputArtifacts.every((id) => artifactReadyForConsumption(kernel, id))) {
+        const fingerprint = createHash("sha256").update(JSON.stringify(task.inputArtifacts.map((id) => {
+          const input = kernel.listArtifacts().find((entry) => entry.artifactId === id);
+          const ledger = kernel.listArtifactLedger().find((entry) => entry.artifactId === id);
+          return [id, input?.version, ledger?.path, ledger?.hash, ledger?.sizeBytes];
+        }))).digest("hex");
+        if (artifact.metadata.qualityReviewRepairInputFingerprint === fingerprint) continue;
+        kernel.upsertArtifact({ ...artifact, metadata: { ...artifact.metadata, qualityReviewRepairInputFingerprint: fingerprint }, updatedAt: now });
         reopenTaskForEvidenceRepair(kernel, task, now);
         reopenedTaskIds.push(task.taskId);
       }
@@ -211,7 +219,7 @@ function artifactIsReadyForConsumption(kernel: StudioKernel, artifactId: string)
       // build gate still uses artifactReadyForConsumption and demands pass.
       return artifactInputProvenanceIsCurrent(kernel, artifactId) && !!currentImplementationReport(kernel, artifact);
     }
-    return artifactReadyForConsumption(kernel, artifactId);
+    return artifactReadyForTaskCompletion(kernel, artifactId);
   } catch {
     // Unsafe paths and filesystem races are stale evidence, not reasons to make
     // the entire checkpoint fail before the task can be reopened for repair.
