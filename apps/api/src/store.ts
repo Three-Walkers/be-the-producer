@@ -23,6 +23,7 @@ import { finalizeMessageActivity, recordServerToolActivity } from "./agentActivi
 import { ModelAgentRuntime } from "./modelAgentRuntime.js";
 import { ProjectPersistenceStore, type ProjectStateRepository, type ProjectSummary } from "./projectPersistence.js";
 import { reconcileQaPlaytestResults } from "./qaResultIngestion.js";
+import { reconcileAssetTechnicalFailures } from "./assetTechnicalFeedback.js";
 import { apiGateEvidencePolicy } from "./gateEvidencePolicy.js";
 import { reconcileProductionAudit } from "./productionAudit.js";
 import {
@@ -519,6 +520,7 @@ export class StudioProjectStore {
       const evidenceBaseline = captureCurrentStageReviewOutputEvidence(kernel);
       syncProjectWorkspace(kernel);
       reconcileCurrentStageReviewOutputEvidence(kernel, evidenceBaseline);
+      reconcileAssetTechnicalFailures(kernel);
       reconcileInvalidQualityReviewEvidence(kernel);
       reconcileProductionAudit(kernel);
       syncProjectWorkspace(kernel);
@@ -542,15 +544,16 @@ export class StudioProjectStore {
     reconcileClaimRepairs(kernel);
     workspace = syncProjectWorkspace(kernel);
     reconcileCurrentStageReviewOutputEvidence(kernel, evidenceBaseline);
+    const assetRepairAgentIds = reconcileAssetTechnicalFailures(kernel);
     reconcileInvalidQualityReviewEvidence(kernel);
     reconcileProductionAudit(kernel);
     workspace = syncProjectWorkspace(kernel);
     this.persistence.save(kernel);
-    if (qaIngestion.queuedAgentIds.length > 0 && kernel.project.executionStatus === "running") {
+    if ((qaIngestion.queuedAgentIds.length > 0 || assetRepairAgentIds.length > 0) && kernel.project.executionStatus === "running") {
       queueMicrotask(() => {
         this.agentLoop.start(kernel.project.projectId, {
-          reason: `QA 真实试玩失败已回流：${qaIngestion.failedOperationIds.join("、")}`,
-          preferredAgentIds: qaIngestion.queuedAgentIds
+          reason: `机器校验/QA 失败已回流：${qaIngestion.failedOperationIds.join("、")}`,
+          preferredAgentIds: [...new Set([...qaIngestion.queuedAgentIds, ...assetRepairAgentIds])]
         });
       });
     }

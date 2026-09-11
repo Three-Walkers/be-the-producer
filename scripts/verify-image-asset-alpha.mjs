@@ -21,6 +21,7 @@ const {
   mediaGenerationOperationMetadata
 } = await import("../apps/api/dist/mediaArtifactEvidence.js");
 const { parseCurrentAssetManifestText } = await import("../apps/api/dist/assetManifestArtifacts.js");
+const { reconcileAssetTechnicalFailures } = await import("../apps/api/dist/assetTechnicalFeedback.js");
 
 const RGB_OPAQUE = png({ width: 2, height: 1, colorType: 2, rows: [[255, 0, 0, 0, 255, 0]] });
 const RGBA_OPAQUE = png({ width: 2, height: 1, colorType: 6, rows: [[255, 0, 0, 255, 0, 255, 0, 255]] });
@@ -31,6 +32,7 @@ try {
   verifySchemaMigrationBoundary();
   verifyPngDecodingAndPolicies();
   verifyProductionTaskRevalidatesEveryManifestAsset();
+  verifyTechnicalFailureRouting();
   process.stdout.write(
     "Image asset alpha verification passed: v2 policy declarations, PNG pixel alpha, and Stage 2 hard gate enforced\n"
   );
@@ -72,6 +74,13 @@ function verifySchemaMigrationBoundary() {
 }
 
 function verifyPngDecodingAndPolicies() {
+  const mutable = inspectPngAlpha(RGBA_OPAQUE);
+  mutable.minimumAlpha = 0;
+  mutable.transparentPixels = 2;
+  assert.throws(() => assertPngAlphaPolicy(inspectPngAlpha(RGBA_OPAQUE), "required"), /完全不透明/,
+    "a caller cannot mutate cached measurements into acceptance");
+  assert.doesNotThrow(() => assertPngAlphaPolicy(inspectPngAlpha(RGBA_ALPHA), "required"),
+    "new bytes must be measured even for equal dimensions and the same default label");
   const rgb = inspectPngAlpha(RGB_OPAQUE, "rgb.png");
   assert.equal(rgb.alphaSource, "none");
   assert.equal(rgb.transparentPixels, 0);
@@ -200,6 +209,51 @@ function verifyProductionTaskRevalidatesEveryManifestAsset() {
 
   materializeManifest(kernel, taskId, heroPath, undefined, 5, true);
   assert.equal(taskOutputsVerified(kernel, kernel.findTask(taskId)), false, "legacy manifest must fail production gate");
+}
+
+function verifyTechnicalFailureRouting() {
+  const kernel = createStudioKernel("asset_feedback", "Feedback", "producer_test", "repair assets");
+  const taskId = "task_stage_2_asset_pipeline";
+  addTask(kernel, taskId);
+  const heroPath = "assets/art/first-playable/hero.png";
+  const bytesPath = join(process.env.STUDIO_WORKSPACE_ROOT, kernel.project.projectId, heroPath);
+  materialize(kernel, { artifactId: "hero", taskId, path: heroPath, content: RGBA_OPAQUE,
+    metadata: { toolName: "generate_raster_asset", toolExecutedAt: new Date().toISOString(), ...providerMetadata("feedback") } });
+  materializeManifest(kernel, taskId, heroPath, "required", 1);
+  kernel.updateTask(taskId, { status: "blocked", blockers: ["Agent Loop：连续两轮没有产生工具结果，已停止自动重试。"] });
+  const ledger = structuredClone(kernel.listArtifactLedger());
+  assert.deepEqual(reconcileAssetTechnicalFailures(kernel), ["asset_production"]);
+  assert.equal(kernel.findTask(taskId).status, "doing");
+  assert.match(kernel.findTask(taskId).description, /hero\.png.*sha256:/);
+  assert.match(kernel.findTask(taskId).description, /完全不透明/);
+  assert.equal(kernel.listArtifacts().find((a) => a.artifactId === "artifact_asset_manifest_draft").status, "change_requested");
+  assert.deepEqual(kernel.listArtifactLedger(), ledger, "feedback cannot forge or destroy byte receipts");
+  const count = kernel.listMessages().length;
+  kernel.updateTask(taskId, { status: "blocked", blockers: ["Agent Loop：retry exhausted"] });
+  assert.deepEqual(reconcileAssetTechnicalFailures(kernel), []);
+  assert.equal(kernel.findTask(taskId).status, "blocked", "same failure must not reset retries forever");
+  assert.equal(kernel.listMessages().length, count);
+  materializeManifest(kernel, taskId, heroPath, "required", 2);
+  assert.deepEqual(reconcileAssetTechnicalFailures(kernel), [], "a cosmetic manifest version bump is not new evidence");
+  assert.equal(kernel.listArtifacts().find((a) => a.artifactId === "artifact_asset_manifest_draft").status, "change_requested");
+  writeFileSync(bytesPath, RGBA_ALPHA);
+  assert.deepEqual(reconcileAssetTechnicalFailures(kernel), []);
+  assert.doesNotMatch(kernel.findTask(taskId).description, /ASSET_TECHNICAL_REPAIR/);
+  assert.equal(kernel.listArtifacts().find((a) => a.artifactId === "artifact_asset_manifest_draft").status, "change_requested",
+    "technical recovery alone must not publish the manifest or approve a gate");
+  writeFileSync(bytesPath, RGBA_OPAQUE);
+  kernel.updateTask(taskId, { status: "blocked", blockers: ["人工：等待素材授权", "Agent Loop：retry exhausted"] });
+  assert.deepEqual(reconcileAssetTechnicalFailures(kernel), []);
+  assert.deepEqual(kernel.findTask(taskId).blockers, ["人工：等待素材授权"]);
+  assert.equal(kernel.findTask(taskId).status, "blocked", "manual blockers must survive automatic repair");
+  kernel.updateTask(taskId, { status: "cancelled" });
+  const cancelled = structuredClone(kernel.toSnapshot());
+  assert.deepEqual(reconcileAssetTechnicalFailures(kernel), []);
+  assert.deepEqual(kernel.toSnapshot(), cancelled, "cancelled work must not reopen");
+  kernel.updateTask(taskId, { status: "blocked", blockers: ["Agent Loop：等待制作人：全部完成，等待阶段门禁验收"] });
+  assert.deepEqual(reconcileAssetTechnicalFailures(kernel), ["asset_production"],
+    "new actionable work clears an agent's stale stage-approval wait, not the actual gate");
+  assert.equal(kernel.findTask(taskId).status, "doing");
 }
 
 function addTask(kernel, taskId) {
