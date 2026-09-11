@@ -147,3 +147,18 @@ request took 18 seconds). The single-process store now keeps a small summary
 projection from successful durable saves, including real `savedAt` timestamps.
 Creation, lazy loading and deletion maintain that projection; callers receive
 copies. This is not a cross-process cache-coherence or database replacement.
+
+## Build aggregate versus supporting evidence
+
+Every changed file under a directory build used to re-register the same build
+artifact. A bundle after `build-report.json` could replace its import/manifest
+metadata with no receipt. All validated files are still committed atomically, but
+only the canonical report registers the aggregate build evidence. Hash/manifest
+checks on the entire output and current import receipt remain mandatory.
+
+Historical bridge operation reports, imported runtime copies and generated bridge
+files retain their provenance as supporting evidence; they are not new promised
+deliverables of the build task. A narrow migration removes these bridge-managed
+paths from its required output list without deleting files/history or approving old
+statuses. Workspace synchronization preserves that distinction. The canonical
+build remains mandatory. Regression coverage is in `verify-cocos-engine-bridge.mjs`.

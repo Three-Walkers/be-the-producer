@@ -24,6 +24,7 @@ import { ModelAgentRuntime } from "./modelAgentRuntime.js";
 import { ProjectPersistenceStore, snapshotSummary, type ProjectStateRepository, type ProjectSummary } from "./projectPersistence.js";
 import { reconcileQaPlaytestResults } from "./qaResultIngestion.js";
 import { reconcileAssetTechnicalFailures } from "./assetTechnicalFeedback.js";
+import { reconcileCocosSupportingEvidence } from "./cocosSupportingEvidence.js";
 import { apiGateEvidencePolicy } from "./gateEvidencePolicy.js";
 import { reconcileProductionAudit } from "./productionAudit.js";
 import {
@@ -522,6 +523,7 @@ export class StudioProjectStore {
       reconcileLocalRuntimeProjectState(kernel);
       migrateRuntimeAssetPipeline(kernel);
       this.projects.set(projectId, kernel);
+      reconcileCocosSupportingEvidence(kernel);
       const evidenceBaseline = captureCurrentStageReviewOutputEvidence(kernel);
       syncProjectWorkspace(kernel);
       reconcileCurrentStageReviewOutputEvidence(kernel, evidenceBaseline);
@@ -539,6 +541,7 @@ export class StudioProjectStore {
   }
 
   private checkpointKernel(kernel: StudioKernel): WorkspaceSyncResult {
+    reconcileCocosSupportingEvidence(kernel);
     if (kernel.project.executionStatus === "running") {
       reconcileLocalRuntimeProjectState(kernel);
     }

@@ -12,6 +12,7 @@ import type { AgentHarnessToolOperation } from "./agentHarness.js";
 import { isQaHarnessManagedPath } from "./qaEvidenceProtection.js";
 import { assertAgentPathAuthorized } from "./toolAuthorization.js";
 import { resolvePathWithinRoot } from "./pathSafety.js";
+import { isCocosBuildSupportingArtifact } from "./cocosSupportingEvidence.js";
 import {
   applyQualityReviewChangeRequest,
   assertQualityReviewMatchesVisionSemanticResult,
@@ -170,6 +171,13 @@ export function recordHarnessWorkspaceChanges(
       continue;
     }
     const existing = findArtifactForPath(kernel, task, path);
+    if (existing?.type === "build" && path.startsWith(`${existing.path.replace(/\/+$/, "")}/`) &&
+        path !== artifactFilePath(existing).replaceAll("\\", "/")) {
+      // The directory is one deliverable. Stage every validated file, but only
+      // its canonical report may register the build's byte/import manifest.
+      // Otherwise the last bundle/resource file overwrites authoritative proof.
+      continue;
+    }
     const pathWrites = invocationToolOperations
       ?.filter((operation) =>
         operation.path === path && (toolOperationSucceeded(operation) || isFailedCocosDiagnostic(operation, file)) && operationWritesWorkspace(operation)
@@ -386,6 +394,7 @@ export function recordHarnessWorkspaceChanges(
       createdAt: existing?.createdAt ?? now,
       updatedAt: file.updatedAt
     };
+    if (isCocosBuildSupportingArtifact(artifact)) artifact.metadata.evidenceRole = "supporting";
     let stored = kernel.upsertArtifact(artifact);
     stored.metadata = artifact.metadata;
     stored.status = playtest && playtest.verdict !== "pass" ? "change_requested" : "submitted";

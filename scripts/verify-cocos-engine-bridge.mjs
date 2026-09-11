@@ -11,8 +11,10 @@ import {
   verifyCocosBuildManifest
 } from "../apps/api/dist/cocosEngineBridge.js";
 import { CocosEngineSettingsStore } from "../apps/api/dist/cocosEngineSettings.js";
-import { artifactReadyForConsumption } from "../apps/api/dist/taskOutputEvidence.js";
-import { createStudioKernel } from "../packages/agent-runtime/dist/index.js";
+import { artifactReadyForConsumption, taskOutputsVerified } from "../apps/api/dist/taskOutputEvidence.js";
+import { createStudioKernel, defaultAgentContracts } from "../packages/agent-runtime/dist/index.js";
+import { captureWorkspaceSnapshot, recordHarnessWorkspaceChanges } from "../apps/api/dist/harnessWorkspaceEvidence.js";
+import { reconcileCocosSupportingEvidence } from "../apps/api/dist/cocosSupportingEvidence.js";
 
 const root = mkdtempSync(join(tmpdir(), "btp-cocos-bridge-"));
 const projectRoot = join(root, "project");
@@ -568,6 +570,37 @@ provenanceKernel.recordArtifactMaterialization("artifact_wechat_dev_build", {
   directoryManifest: report.outputManifest
 });
 assert.equal(artifactReadyForConsumption(provenanceKernel, "artifact_wechat_dev_build"), true);
+const buildSnapshot = captureWorkspaceSnapshot(projectRoot);
+const buildPaths = [...buildSnapshot.keys()].filter((path) => path.startsWith("shared/build-artifacts/wechat/dev/"));
+const buildTask = provenanceKernel.findTask("task_stage_2_cocos_build");
+const harnessEvidence = recordHarnessWorkspaceChanges(provenanceKernel, buildTask,
+  defaultAgentContracts.find((agent) => agent.agentId === "cocos_automation"), buildSnapshot, buildSnapshot,
+  "inv_build_directory", buildPaths, build.evidence.map((item) => ({
+    toolName: "cocos_build", ...item, status: "completed", bridgeOk: true,
+    operationId: build.operationId, operationType: "build",
+    ...(item.path === build.reportPath ? { directoryManifest: report.outputManifest } : {})
+  })));
+assert.deepEqual(harnessEvidence.violations, []);
+assert.deepEqual(harnessEvidence.artifactIds, ["artifact_wechat_dev_build"]);
+assert.equal(artifactReadyForConsumption(provenanceKernel, "artifact_wechat_dev_build"), true,
+  "bundle files after build-report.json must not overwrite the aggregate build receipt");
+assert.equal(provenanceKernel.listArtifacts().find(a => a.artifactId === "artifact_wechat_dev_build").metadata.bridgeOk, true);
+assert.equal(provenanceKernel.listArtifactLedger().find(a => a.artifactId === "artifact_wechat_dev_build").directoryManifest.digest, report.outputManifest.digest);
+
+const historic = { ...provenanceKernel.listArtifacts().find(a => a.artifactId === "artifact_wechat_dev_build"),
+  artifactId: "historic_import", type: "asset_spec", path: "agents/cocos-automation/imports/cocos_import_20260911000000_abcdef12.json",
+  status: "change_requested", metadata: {} };
+provenanceKernel.upsertArtifact(historic);
+assert.ok(provenanceKernel.findTask(buildTask.taskId).outputArtifacts.includes(historic.artifactId), "reproduce legacy sidecar attachment");
+reconcileCocosSupportingEvidence(provenanceKernel);
+const supporting = provenanceKernel.listArtifacts().find(a => a.artifactId === historic.artifactId);
+assert.equal(supporting.status, "change_requested", "migration does not fake historical approval");
+assert.equal(supporting.sourceTaskId, buildTask.taskId, "source provenance remains intact");
+provenanceKernel.upsertArtifact(supporting); // Workspace synchronization must not reattach it.
+reconcileCocosSupportingEvidence(provenanceKernel);
+assert.deepEqual(provenanceKernel.findTask(buildTask.taskId).outputArtifacts, ["artifact_wechat_dev_build"]);
+assert.equal(taskOutputsVerified(provenanceKernel, provenanceKernel.findTask(buildTask.taskId)), true,
+  "historical bridge sidecars are not additional build deliverables");
 const newerImport = bridge.importAssets();
 assert.equal(newerImport.ok, true, newerImport.error);
 assert.equal(
