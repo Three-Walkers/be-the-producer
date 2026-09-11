@@ -488,6 +488,7 @@ globalThis.fetch = async (_input, init = {}) => {
     serviceWritePaths: [buildPath, "agents/cocos-automation/build-ops", "agents/cocos-automation/cocos-build-logs"]
   };
   const failure = runMcp(cocosAuthorization, "cocos_automation", [
+    rpc(19, "tools/list"),
     rpc(20, "tools/call", { name: "cocos_build", arguments: { platform: "wechatgame", outputDir: buildPath } })
   ], {
     BTP_OPERATION_LOG_PATH: operationLog,
@@ -497,6 +498,9 @@ globalThis.fetch = async (_input, init = {}) => {
     BTP_COCOS_TIMEOUT_MS: "5000"
   });
   assert.equal(failure.get(20)?.result?.isError, true);
+  const sceneTool = failure.get(19).result.tools.find((tool) => tool.name === "cocos_apply_blueprint");
+  assert.equal(sceneTool.inputSchema.properties.scenePath.default, "assets/scenes/MainGame.scene");
+  assert.match(sceneTool.inputSchema.properties.scenePath.description, /Authorized write paths: none/);
   const operations = readFileSync(operationLog, "utf8").trim().split(/\r?\n/).map((line) => JSON.parse(line));
   assert.ok(operations.length > 0);
   assert.ok(operations.every((operation) => operation.status === "failed" && operation.bridgeOk === false));

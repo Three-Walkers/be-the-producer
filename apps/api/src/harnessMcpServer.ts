@@ -6,7 +6,7 @@ import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statS
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
 import { rasterizeSvgFile } from "./svgRasterizer.js";
-import { CocosEngineBridge, type CocosBridgeResult } from "./cocosEngineBridge.js";
+import { CocosEngineBridge, defaultCocosScenePath, type CocosBridgeResult } from "./cocosEngineBridge.js";
 import { cocosEngineSettingsStore } from "./cocosEngineSettings.js";
 import { CocosPlaytestHarness } from "./cocosPlaytestHarness.js";
 import { assertQaEvidenceWriteAllowed } from "./qaEvidenceProtection.js";
@@ -382,7 +382,8 @@ function toolDefinitions(): Array<Record<string, unknown>> {
           type: "object",
           properties: {
             blueprintPath: { type: "string", description: "Project-relative SceneBlueprint JSON path" },
-            scenePath: { type: "string", description: "Destination under assets/scenes ending in .scene" }
+            scenePath: { type: "string", default: defaultCocosScenePath,
+              description: `Omit to use ${defaultCocosScenePath}. Authorized write paths: ${authorization.serviceWritePaths.filter((path) => path.startsWith("assets/scenes")).join(", ") || "none"}. Do not invent a different filename or request broader directory permissions.` }
           },
           additionalProperties: false
         }
@@ -1342,7 +1343,7 @@ function assertCocosRequestAuthorized(name: string, args: Record<string, unknown
   }
   if (name === "cocos_apply_blueprint") {
     const blueprintPath = typeof args.blueprintPath === "string" ? args.blueprintPath : "agents/engineering/cocos-scene-blueprints/main.scene-blueprint.json";
-    const scenePath = typeof args.scenePath === "string" ? args.scenePath : "assets/scenes/MainGame.scene";
+    const scenePath = typeof args.scenePath === "string" ? args.scenePath : defaultCocosScenePath;
     assertPathAuthorized(blueprintPath, "read");
     assertPathAuthorized("assets/scripts", "read");
     for (const path of [scenePath, `${scenePath}.meta`, "assets/resources/btp", "assets/scripts/btp", "agents/cocos-automation/scene-ops"]) {

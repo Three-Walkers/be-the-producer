@@ -26,6 +26,7 @@ import {
   type WorkspaceSnapshot
 } from "./harnessWorkspaceEvidence.js";
 import { createIsolatedWorkspace, stageWorkspaceCommit } from "./isolatedWorkspace.js";
+import { defaultCocosScenePath } from "./cocosEngineBridge.js";
 import { readArtifactContentForModel, resolveProjectWorkspaceRoot, syncProjectWorkspace } from "./workspaceWriter.js";
 import {
   artifactReadyForConsumption,
@@ -732,8 +733,8 @@ function taskHarnessServicePaths(
         "assets/resources/btp",
         "assets/resources/btp-art",
         "assets/scripts/btp",
-        "assets/scenes/MainGame.scene",
-        "assets/scenes/MainGame.scene.meta"
+        defaultCocosScenePath,
+        `${defaultCocosScenePath}.meta`
       ]
     };
   }

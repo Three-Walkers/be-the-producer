@@ -121,7 +121,7 @@ class AssetImportValidationError extends Error {
 const defaultManifestPath = "agents/art/asset-manifest.json";
 export const currentCocosImportReceiptPath = "agents/cocos-automation/imports/current.json";
 const defaultBlueprintPath = "agents/engineering/cocos-scene-blueprints/main.scene-blueprint.json";
-const defaultScenePath = "assets/scenes/MainGame.scene";
+export const defaultCocosScenePath = "assets/scenes/MainGame.scene";
 const defaultBuildOutput = "shared/build-artifacts/wechat/dev";
 
 export class CocosEngineBridge {
@@ -279,7 +279,7 @@ export class CocosEngineBridge {
   applySceneBlueprint(input: CocosApplyBlueprintInput = {}): CocosBridgeResult {
     const operationId = createOperationId("blueprint");
     const blueprintPath = normalizeRelativePath(input.blueprintPath ?? defaultBlueprintPath);
-    const scenePath = normalizeScenePath(input.scenePath ?? defaultScenePath);
+    const scenePath = normalizeScenePath(input.scenePath ?? defaultCocosScenePath);
     const reportPath = `agents/cocos-automation/scene-ops/${operationId}.json`;
     const evidence: CocosBridgeEvidence[] = [];
     try {
