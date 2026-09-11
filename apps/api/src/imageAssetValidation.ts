@@ -1,4 +1,5 @@
 import { inflateSync } from "node:zlib";
+import { createHash } from "node:crypto";
 import {
   parseAssetManifest,
   type AssetAlphaPolicy,
@@ -10,6 +11,10 @@ import { resolveWorkspacePathTarget } from "./workspaceWriter.js";
 const PNG_SIGNATURE = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
 const MAX_DIMENSION = 8192;
 const MAX_PIXELS = 33_554_432;
+// Cache measurements, never acceptance. Always hash the current bytes, not a
+// filename/mtime, and bound memory without retaining compressed image buffers.
+const alphaMeasurements = new Map<string, PngAlphaInspectionReceipt>();
+const MAX_ALPHA_MEASUREMENTS = 256;
 
 export type PngAlphaSource = "none" | "channel" | "palette" | "color_key";
 
@@ -118,6 +123,22 @@ export function assertPngAlphaPolicy(
 
 /** Decode PNG image data and measure effective per-pixel alpha. */
 export function inspectPngAlpha(body: Buffer, label = "PNG"): PngAlphaInspectionReceipt {
+  const hash = createHash("sha256").update(body).digest("hex");
+  const cached = alphaMeasurements.get(hash);
+  if (cached) {
+    alphaMeasurements.delete(hash);
+    alphaMeasurements.set(hash, cached);
+    return { ...cached };
+  }
+  const receipt = decodePngAlpha(body, label);
+  alphaMeasurements.set(hash, { ...receipt });
+  if (alphaMeasurements.size > MAX_ALPHA_MEASUREMENTS) {
+    alphaMeasurements.delete(alphaMeasurements.keys().next().value!);
+  }
+  return receipt;
+}
+
+function decodePngAlpha(body: Buffer, label: string): PngAlphaInspectionReceipt {
   const parsed = parsePng(body, label);
   const passes = parsed.interlace === 0
     ? [{ startX: 0, startY: 0, stepX: 1, stepY: 1 }]
