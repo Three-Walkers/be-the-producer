@@ -344,10 +344,17 @@ function claudeToolsForAgent(agent: AgentContract, mode: "conversation" | "task"
   }
   if (agent.agentId === "visual_quality_reviewer") {
     tools.push("mcp__btp_workspace__inspect_visual_assets");
+    tools.push("mcp__btp_workspace__submit_visual_review");
   }
   if (agent.agentId === "qa_evaluator") {
     tools.push("mcp__btp_workspace__run_playtest");
+    tools.push("mcp__btp_workspace__submit_implementation_review");
   }
+  if (["gameplay_programmer", "qa_evaluator", "cocos_tech_lead", "cocos_automation"].includes(agent.agentId)) {
+    tools.push("mcp__btp_workspace__run_implementation_checks");
+  }
+  if (agent.agentId === "gameplay_programmer") tools.push("mcp__btp_workspace__edit_code");
+  if (["cocos_tech_lead", "gameplay_programmer", "asset_production"].includes(agent.agentId)) tools.push("mcp__btp_workspace__edit_artifact");
   if (agent.agentId === "cocos_automation") {
     tools.push(
       "mcp__btp_workspace__cocos_validate_project",
@@ -385,6 +392,7 @@ function mcpConfig(
           BTP_SESSION_KEY: input.sessionKey ?? "",
           BTP_SESSION_SCOPE: input.sessionScope ?? "room",
           BTP_TASK_INPUT_EVIDENCE: JSON.stringify(input.taskInputEvidence ?? []),
+          BTP_VISION_PRODUCER_DECISIONS: JSON.stringify(input.visionProducerDecisions ?? []),
           BTP_CONTROL_PATH: controlPath,
           BTP_OPERATION_LOG_PATH: operationLogPath,
           BTP_PROVIDER_ID: input.provider.providerId,
@@ -429,7 +437,7 @@ function readToolOperations(operationLogPath: string): AgentHarnessToolOperation
   }
 }
 
-function parseToolOperations(operationLogPath: string): AgentHarnessToolOperation[] {
+export function parseToolOperations(operationLogPath: string): AgentHarnessToolOperation[] {
   if (!existsSync(operationLogPath)) return [];
   return readFileSync(operationLogPath, "utf8")
     .split(/\r?\n/)
@@ -452,6 +460,13 @@ function parseToolOperations(operationLogPath: string): AgentHarnessToolOperatio
           ...(typeof parsed.error === "string" ? { error: parsed.error } : {}),
           ...(typeof parsed.hash === "string" ? { hash: parsed.hash } : {}),
           ...(typeof parsed.sizeBytes === "number" ? { sizeBytes: parsed.sizeBytes } : {}),
+          ...(typeof parsed.resubmissionReason === "string" ? { resubmissionReason: parsed.resubmissionReason } : {}),
+          ...(isRecord(parsed.contactSheetReceipt)
+            ? { contactSheetReceipt: parsed.contactSheetReceipt as unknown as NonNullable<AgentHarnessToolOperation["contactSheetReceipt"]> }
+            : {}),
+          ...(isRecord(parsed.normalizationReceipt)
+            ? { normalizationReceipt: parsed.normalizationReceipt as unknown as NonNullable<AgentHarnessToolOperation["normalizationReceipt"]> }
+            : {}),
           ...(typeof parsed.providerId === "string" ? { providerId: parsed.providerId } : {}),
           ...(typeof parsed.model === "string" ? { model: parsed.model } : {}),
           ...(typeof parsed.requestId === "string" ? { requestId: parsed.requestId } : {}),

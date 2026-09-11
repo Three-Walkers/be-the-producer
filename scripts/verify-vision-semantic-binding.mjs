@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PNG as Png } from "pngjs";
 
 const tempRoot = mkdtempSync(join(tmpdir(), "btp-vision-semantic-binding-"));
 process.env.STUDIO_WORKSPACE_ROOT = join(tempRoot, "studio");
@@ -14,9 +15,14 @@ const { modelSettingsStore } = await import("../apps/api/dist/modelSettings.js")
 const { writeToolArtifactBinaryContent, writeToolArtifactContent } = await import("../apps/api/dist/workspaceWriter.js");
 const {
   assertVisionSemanticReceiptAuthoritativeContextCurrent,
-  buildCurrentVisionReviewAuthoritativeContext
+  buildCurrentVisionReviewAuthoritativeContext,
+  applyQualityReviewChangeRequest,
+  currentGeneratedRuntimeAssetPathsForReview,
+  qualityReviewReadyForGate
 } = await import("../apps/api/dist/qualityReviewArtifacts.js");
+const { reconcileInvalidQualityReviewEvidence, restoreHistoricalReviewReferences } = await import("../apps/api/dist/evidenceReconciliation.js");
 const { hashArtVisionRequestSemantics } = await import("../apps/api/dist/multimodalArtProvider.js");
+const { mediaGenerationOperationMetadata, bindMediaGenerationArtifactMetadata } = await import("../apps/api/dist/mediaArtifactEvidence.js");
 
 const PNG = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
@@ -131,6 +137,33 @@ try {
     assert.match(String(reviewArtifact?.metadata.visionInspectionSemanticHash), /^[a-f0-9]{64}$/);
     assert.match(String(reviewArtifact?.metadata.visionAuthoritativeContextHash), /^[a-f0-9]{64}$/);
     assert.match(String(reviewArtifact?.metadata.visionRequestSemanticHash), /^[a-f0-9]{64}$/);
+    const changeRequestReady = qualityReviewReadyForGate(kernel, contract.artifactId, false);
+    assert.equal(changeRequestReady.ok, true,
+      `a grounded change request stays valid after applying its own feedback: ${changeRequestReady.reason}`);
+    assert.equal(qualityReviewReadyForGate(kernel, contract.artifactId).ok, false,
+      "a valid change request must never pass the producer gate");
+    const originalVersion = reviewArtifact.version;
+    assert.equal(reconcileInvalidQualityReviewEvidence(kernel).changed, false,
+      "checkpoint reconciliation must not destroy the receipt it just accepted");
+    assert.equal(kernel.listArtifacts().find((artifact) => artifact.artifactId === contract.artifactId).version, originalVersion);
+    const subject = kernel.listArtifacts().find((artifact) => artifact.artifactId === board.artifactId);
+    const ownReviewId = subject.metadata.qualityChangeReviewId;
+    subject.metadata.qualityChangeReviewId = "another.review";
+    assert.equal(qualityReviewReadyForGate(kernel, contract.artifactId, false).ok, false,
+      "feedback from another review cannot be projected away");
+    subject.metadata.qualityChangeReviewId = ownReviewId;
+
+    const oldContext = buildCurrentVisionReviewAuthoritativeContext(kernel, contract);
+    const scopeDecision = {messageId: "scope_decision", projectId, roomId: kernel.getRoom("studio-main").roomId,
+      senderType: "agent", senderId: "art_director", messageType: "decision_record", content: "HUD 布局由 Cocos 组件实现，不烘焙整块 PNG。",
+      mentions: [], relatedTaskIds: [], relatedArtifactIds: [], metadata: {}, createdAt: new Date().toISOString()};
+    kernel.recordMessage(scopeDecision);
+    assert.equal(buildCurrentVisionReviewAuthoritativeContext(kernel, contract).hash, oldContext.hash, "agent claims cannot become authoritative producer decisions");
+    kernel.recordMessage({...scopeDecision, messageId: "producer_scope", senderType: "producer", senderId: "producer_test"});
+    const newContext = buildCurrentVisionReviewAuthoritativeContext(kernel, contract);
+    assert.notEqual(newContext.hash, oldContext.hash, "producer scope must be bound into the immutable vision request");
+    assert.deepEqual(JSON.parse(newContext.prompt).producerDecisions.map(d => d.messageId), ["producer_scope"]);
+    assert.equal(qualityReviewReadyForGate(kernel, contract.artifactId, false).ok, false, "old inspection cannot be reused after scope changes");
 
     kernel.upsertArtifact({ ...board, status: "submitted", updatedAt: new Date().toISOString() });
     const revisedArtBible = reviseTextArtifact(kernel, artBible, "# Art Bible\n\nReadable silhouettes. Canonical palette changed to cobalt.\n");
@@ -145,6 +178,15 @@ try {
     })]);
     assert.equal(staleContextWrite?.status, "failed");
     assert.match(staleContextWrite?.error ?? "", /权威上下文|Art Bible|过期/);
+    const invalidated = reconcileInvalidQualityReviewEvidence(kernel);
+    assert.ok(invalidated.artifactIds.includes(contract.artifactId));
+    const reopened = kernel.findTask(contract.sourceTaskId);
+    assert.equal(reopened.status, "doing");
+    assert.equal(reopened.blockers.length, 0, "the reason for re-review must not block the re-review task itself");
+    kernel.updateTask(reopened.taskId, { status: "blocked", blockers: ["质量审查证据失效：legacy deadlock"] });
+    reconcileInvalidQualityReviewEvidence(kernel);
+    assert.equal(kernel.findTask(reopened.taskId).status, "doing", "legacy stuck reviewers resume after valid inputs return");
+    assert.equal(kernel.findTask(reopened.taskId).blockers.length, 0);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -222,6 +264,45 @@ function verifyStageTwoManifestContextStaleness() {
     () => assertVisionSemanticReceiptAuthoritativeContextCurrent(kernel, contract, oldBinding),
     /权威上下文已过期|Asset Manifest/
   );
+  const bible = kernel.listArtifacts().find((a) => a.artifactId === "artifact_art_bible_baseline_draft");
+  kernel.executeWorkflow({ type: "submit_review", actor: { actorId: "orchestrator", role: "orchestrator" },
+    expectedRevision: kernel.getWorkflowSnapshot().revision, occurredAt: new Date().toISOString(),
+    idempotencyKey: "fixture-concept-review", requiredArtifacts: [bible.artifactId], checks: ["fixture"], label: "Concept" });
+  kernel.executeWorkflow({ type: "record_gate_decision", actor: { actorId: "producer_test", role: "producer" },
+    expectedRevision: kernel.getWorkflowSnapshot().revision, occurredAt: new Date().toISOString(),
+    idempotencyKey: "fixture-concept-approval", gateId: kernel.getWorkflowSnapshot().activeGateId, verdict: "approved", notes: "fixture" });
+  kernel.findTask("task_stage_2_asset_pipeline").stageId = "production";
+  addTask(kernel, contract.sourceTaskId, contract.ownerAgentId, [], [contract.artifactId]);
+  kernel.findTask("task_stage_1_art_direction").status = "done";
+  bible.status = "approved";
+  const feedback = { reviewId: "review.stage2", verdict: "change_requested", reviewerAgentId: contract.ownerAgentId,
+    targets: [{ artifactId: bible.artifactId }, { artifactId: manifest.artifactId }],
+    modelTrace: { invocationId: "inv.stage2" }, requiredChanges: [{ issueCode: "asset.fix", summary: "Fix alpha" }] };
+  applyQualityReviewChangeRequest(kernel, { artifactId: contract.artifactId }, feedback);
+  assert.equal(bible.status, "approved", "historical reference is not a current author deliverable");
+  assert.equal(manifest.status, "change_requested");
+  assert.equal(kernel.findTask("task_stage_1_art_direction").status, "done");
+  bible.status = "change_requested";
+  Object.assign(bible.metadata, { qualityChangeReviewArtifactId: contract.artifactId, qualityChangeReviewInvocationId: "inv.stage2" });
+  const originalWorkflow = kernel.getWorkflowSnapshot.bind(kernel);
+  kernel.getWorkflowSnapshot = () => ({ gates: [], decisions: [] });
+  assert.deepEqual(restoreHistoricalReviewReferences(kernel), [], "no producer approval means no automatic restoration");
+  kernel.getWorkflowSnapshot = () => ({ gates: [{ status: "approved", requiredArtifacts: [bible.artifactId],
+    decisionId: "decision", resolvedAt: "2099-01-01T00:00:00.000Z" }], decisions: [{ decisionId: "decision", status: "active" }] });
+  assert.deepEqual(restoreHistoricalReviewReferences(kernel), [bible.artifactId]);
+  assert.equal(bible.status, "approved");
+  assert.equal(bible.metadata.qualityChangeReviewArtifactId, undefined);
+  kernel.getWorkflowSnapshot = originalWorkflow;
+  // Deliberately wrong opaque policy can be measured/rejected, but never pass.
+  const translucent = new Png({ width: 1, height: 1 });
+  translucent.data.set([100, 80, 60, 252]);
+  const runtimeArtifact = kernel.listArtifacts().find((a) => a.artifactId === "artifact_runtime_hero");
+  // Materialize through fixture generation receipts, exactly as real tool output.
+  materializeBinary(kernel, { artifactId: runtimeArtifact.artifactId, taskId: "task_stage_2_asset_pipeline",
+    type: "asset", path: runtimePath, ownerAgentId: "asset_production", content: Png.sync.write(translucent) });
+  reviseTextArtifact(kernel, manifest, JSON.stringify({ schemaVersion: "2.0.0", assets: [{ id: "hero", runtimePath, alphaPolicy: "opaque" }] }));
+  assert.deepEqual(currentGeneratedRuntimeAssetPathsForReview(kernel, feedback), [runtimePath]);
+  assert.throws(() => currentGeneratedRuntimeAssetPathsForReview(kernel, { ...feedback, verdict: "pass" }), /非全不透明/);
 }
 
 function addTask(kernel, taskId, ownerAgentId, inputArtifacts, outputArtifacts) {
@@ -264,14 +345,26 @@ function materializeText(kernel, input) {
 
 function materializeBinary(kernel, input) {
   const artifact = baseArtifact(kernel, input);
+  const generation = {
+    hash: createHash("sha256").update(input.content).digest("hex"), sizeBytes: input.content.length,
+    provider: "fixture", model: "fixture-image", requestId: `fixture-${input.artifactId}`, promptHash: "a".repeat(64)
+  };
+  artifact.metadata = {
+    ...artifact.metadata, toolName: "generate_raster_asset", generatedBy: "dashscope_multimodal_art_provider",
+    mediaProvider: generation.provider, mediaModel: generation.model, mediaRequestId: generation.requestId,
+    mediaPromptHash: generation.promptHash, mediaMime: "image/png", mediaWidth: 1, mediaHeight: 1
+  };
   kernel.upsertArtifact(artifact);
   const written = writeToolArtifactBinaryContent(kernel, artifact, input.content);
-  kernel.recordArtifactMaterialization(artifact.artifactId, {
+  const ledger = kernel.recordArtifactMaterialization(artifact.artifactId, {
     path: written.relativePath,
     hash: written.hash,
     sizeBytes: written.sizeBytes,
-    materializedAt: written.materializedAt
+    materializedAt: written.materializedAt,
+    operationMetadata: mediaGenerationOperationMetadata(generation)
   });
+  const current = kernel.listArtifacts().find((entry) => entry.artifactId === artifact.artifactId);
+  current.metadata = bindMediaGenerationArtifactMetadata(current.metadata, ledger.sourceOperationId, generation);
   return artifact;
 }
 
@@ -370,7 +463,12 @@ function qualityReview(kernel, contract, artBible, board, semantic, overrides) {
     criteria: selectedSemantic.criteria,
     scoreTotal: selectedSemantic.scoreTotal,
     verdict: selectedSemantic.verdict,
-    requiredChanges: [],
+    requiredChanges: selectedSemantic.verdict === "pass" ? [] : selectedSemantic.criteria.flatMap((criterion) =>
+      criterion.findings.filter((finding) => ["critical", "major"].includes(finding.severity)).map((finding) => ({
+        issueCode: finding.issueCode, summary: `Fix: ${finding.summary}`,
+        acceptanceCriteria: ["Re-inspection confirms the issue is resolved."], evidenceRefs: finding.evidenceRefs
+      }))
+    ),
     risks: [],
     blockingIssueCodes: [],
     modelTrace: { providerId: "placeholder", model: "placeholder", invocationId: "placeholder", promptVersion: "1.0.0" },

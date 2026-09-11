@@ -3,7 +3,10 @@ import { join, relative, sep } from "node:path";
 import type { AgentContract, Artifact, StudioMessage, Task } from "@game-pipeline/shared-schemas";
 import type { QualityReviewArtifactContract, StudioKernel } from "@game-pipeline/agent-runtime";
 import { inferArtifactType, stableArtifactId, type ToolExecutionResult } from "./toolExecutor.js";
-import { artifactFilePath, hashWorkspaceFile } from "./workspaceWriter.js";
+import { artifactFilePath, hashWorkspaceFile, resolveProjectWorkspaceRoot } from "./workspaceWriter.js";
+import { selfCheckPath, implementationReviewPath, validateImplementationReview, applyImplementationReviewFeedback } from "./implementationReview.js";
+import { runImplementationChecks } from "./implementationChecks.js";
+import { cocosEngineSettingsStore } from "./cocosEngineSettings.js";
 import { parsePlaytestMarker } from "./playtestEvidence.js";
 import type { AgentHarnessToolOperation } from "./agentHarness.js";
 import { isQaHarnessManagedPath } from "./qaEvidenceProtection.js";
@@ -13,6 +16,7 @@ import {
   applyQualityReviewChangeRequest,
   assertQualityReviewMatchesVisionSemanticResult,
   buildVisionReviewAuthoritativeContext,
+  currentVisionProducerDecisions,
   linkGeneratedRuntimeAssetToVisualReview,
   mergeVisionSemanticInspectionReceipts,
   qualityReviewContractForArtifact,
@@ -20,6 +24,7 @@ import {
 } from "./qualityReviewArtifacts.js";
 import {
   bindMediaGenerationArtifactMetadata,
+  hasCurrentGenerateRasterAssetReceipt,
   mediaGenerationOperationMetadata,
   stripPrivilegedMaterializationMetadata
 } from "./mediaArtifactEvidence.js";
@@ -77,6 +82,7 @@ function buildHarnessVisionAuthoritativeContext(
   return buildVisionReviewAuthoritativeContext({
     contract,
     artifacts,
+    producerDecisions: currentVisionProducerDecisions(kernel),
     readRuntimeAsset: (path) => {
       const file = workspace.get(path);
       if (!file) throw new Error(`Harness 视觉权威上下文缺少 runtime asset：${path}`);
@@ -132,7 +138,7 @@ export function recordHarnessWorkspaceChanges(
   invocationId: string,
   invocationChangedPaths?: string[],
   invocationToolOperations?: AgentHarnessToolOperation[],
-  options: { authoritativeWorkspace?: boolean } = {}
+  options: { authoritativeWorkspace?: boolean; validationWorkspaceRoot?: string } = {}
 ): HarnessEvidenceResult {
   const analysis = analyzeHarnessWorkspaceChanges(
     kernel,
@@ -164,13 +170,49 @@ export function recordHarnessWorkspaceChanges(
       continue;
     }
     const existing = findArtifactForPath(kernel, task, path);
-    const sourceOperation = invocationToolOperations
+    const pathWrites = invocationToolOperations
       ?.filter((operation) =>
         operation.path === path && toolOperationSucceeded(operation) && operationWritesWorkspace(operation)
-      )
-      .at(-1);
+      ) ?? [];
+    let sourceOperation = pathWrites.at(-1);
+    if (sourceOperation?.toolName === "resubmit_existing_asset") {
+      const precedingWrite = pathWrites.filter((operation) => operation.toolName !== "resubmit_existing_asset").at(-1);
+      // Resubmitting immediately after a genuine generation must not replace
+      // that generation's provenance with an unchanged-old-asset assertion.
+      // Do not search past an intervening write or accept mismatching bytes.
+      if (precedingWrite?.toolName === "generate_raster_asset" &&
+          generatedMediaReceiptMatchesFile(precedingWrite, file) && generatedMediaReceiptMatchesFile(sourceOperation, file)) {
+        sourceOperation = precedingWrite;
+      }
+    }
     const sourceTool = sourceOperation?.toolName;
+    if (sourceOperation?.toolName === "resubmit_existing_asset") {
+      if (!existing || existing.ownerAgentId !== agent.agentId || agent.agentId !== "asset_production" ||
+          existing.sourceTaskId !== task.taskId || task.taskId !== "task_stage_2_asset_pipeline" ||
+          !task.outputArtifacts.includes(existing.artifactId) || !path.startsWith("assets/art/first-playable/") || !path.endsWith(".png") ||
+          !sourceOperation.resubmissionReason?.trim() || before.get(path)?.hash !== file.hash ||
+          !generatedMediaReceiptMatchesFile(sourceOperation, file) || !hasCurrentGenerateRasterAssetReceipt(kernel, existing)) {
+        throw new Error(`Existing asset resubmission lacks unchanged original generation evidence: ${path}`);
+      }
+      // Keep the original generation operation/ledger/version; this is an
+      // author's explicit submission assertion, never a new creation or pass.
+      kernel.upsertArtifact({ ...existing, status: "submitted", updatedAt: now,
+        metadata: { ...existing.metadata, lastResubmission: { invocationId, reason: sourceOperation.resubmissionReason,
+          hash: file.hash, submittedAt: now }, mediaReviewStatus: "pending_independent_review" } });
+      artifactIds.add(existing.artifactId);
+      toolExecutions.push({ toolName: "write_artifact", status: "completed", path, artifactId: existing.artifactId,
+        hash: file.hash, sizeBytes: file.sizeBytes });
+      continue;
+    }
     const generatedMedia = sourceTool === "generate_raster_asset" ? sourceOperation : undefined;
+    const composition = sourceTool === "compose_asset_contact_sheet" ? sourceOperation : undefined;
+    if (composition && (!generatedMediaReceiptMatchesFile(composition, file) ||
+        existing?.artifactId !== "artifact_asset_contact_sheet" || agent.agentId !== "asset_production" ||
+        !composition.contactSheetReceipt || composition.contactSheetReceipt.outputHash !== file.hash ||
+        composition.contactSheetReceipt.sources.some((source) => {
+          const input = after.get(source.path);
+          return !input || input.hash !== source.hash || input.sizeBytes !== source.sizeBytes;
+        }))) throw new Error(`Contact sheet composition receipt does not match current bytes: ${path}`);
     if (generatedMedia && !generatedMediaReceiptMatchesFile(generatedMedia, file)) {
       const error =
         `generate_raster_asset 生成收据与本轮最终文件不一致，拒绝物化：${path}` +
@@ -187,6 +229,27 @@ export function recordHarnessWorkspaceChanges(
     }
     const playtest = path.endsWith(".md") ? parsePlaytestMarker(readFileSync(file.absolutePath, "utf8")) : undefined;
     const artifactType = existing?.type ?? inferArtifactType(agent.agentId, path);
+    let implementationReview: ReturnType<typeof validateImplementationReview> | undefined;
+    if (path === selfCheckPath || path === implementationReviewPath) {
+      if (sourceOperation?.hash !== file.hash || sourceOperation?.sizeBytes !== file.sizeBytes ||
+          sourceTool !== (path === selfCheckPath ? "run_implementation_checks" : "write_artifact")) {
+        throw new Error(`Implementation verification report lacks authoritative tool evidence: ${path}`);
+      }
+      const root = options.validationWorkspaceRoot ?? resolveProjectWorkspaceRoot(kernel.project.projectId);
+      const checks = runImplementationChecks(root, cocosEngineSettingsStore.getResolvedConfig().executablePath);
+      const document = JSON.parse(readFileSync(file.absolutePath, "utf8"));
+      if (path === selfCheckPath) {
+        // Preserve valid source edits if the author forgot to rerun the check.
+        // The immutable tool-produced report is retained as stale evidence;
+        // currentImplementationReport refuses to consume it. Throwing here
+        // rolls back the whole staged turn and loses the actual repair.
+        if (agent.agentId !== "gameplay_programmer" || document.scope !== "static_integration_only" ||
+            typeof document.fingerprint !== "string" || !["pass", "fail", "blocked"].includes(document.status)) throw new Error("Self-check lacks a valid programmer tool result.");
+      } else {
+        if (agent.agentId !== "qa_evaluator" || document.checks?.fingerprint !== checks.fingerprint) throw new Error("Independent implementation review is stale or not QA-owned.");
+        implementationReview = validateImplementationReview(root, document, checks);
+      }
+    }
     const qualityReview = artifactType === "quality_review"
       ? parseQualityReviewText(readFileSync(file.absolutePath, "utf8"))
       : undefined;
@@ -265,6 +328,7 @@ export function recordHarnessWorkspaceChanges(
               mediaWidth: generatedMedia.width,
               mediaHeight: generatedMedia.height,
               mediaLatencyMs: generatedMedia.latencyMs,
+              mediaNormalizationReceipt: generatedMedia.normalizationReceipt,
               mediaReviewStatus: "pending_independent_review"
             }
           : {}),
@@ -327,6 +391,7 @@ export function recordHarnessWorkspaceChanges(
       ...(generatedMedia
         ? {
             operationMetadata: mediaGenerationOperationMetadata({
+              normalizationReceipt: generatedMedia.normalizationReceipt,
               hash: file.hash,
               sizeBytes: file.sizeBytes,
               provider: requiredOperationString(generatedMedia.providerId, "providerId", path),
@@ -339,7 +404,10 @@ export function recordHarnessWorkspaceChanges(
               promptHash: requiredOperationString(generatedMedia.promptHash, "promptHash", path)
             })
           }
-        : {})
+        : composition ? { operationMetadata: { materializationToolName: "compose_asset_contact_sheet",
+            materializationHash: file.hash, materializationSizeBytes: file.sizeBytes, contactSheetReceipt: composition.contactSheetReceipt } }
+        : [selfCheckPath, implementationReviewPath].includes(path) ? { operationMetadata: {
+            implementationVerificationHash: file.hash, implementationVerificationTool: sourceTool } } : {})
     });
     if (generatedMedia) {
       stored = kernel.upsertArtifact({
@@ -356,6 +424,7 @@ export function recordHarnessWorkspaceChanges(
     if (qualityReview) {
       applyQualityReviewChangeRequest(kernel, stored, qualityReview, now);
     }
+    if (implementationReview) applyImplementationReviewFeedback(kernel, stored, implementationReview);
     artifactIds.add(stored.artifactId);
     toolExecutions.push({
       toolName: sourceTool === "generate_raster_asset"
@@ -441,8 +510,11 @@ export function analyzeHarnessWorkspaceChanges(
   const failedMutationPaths = [...failedOnlyOperationPaths]
     .filter((path) => after.has(path) && before.get(path)?.hash !== after.get(path)?.hash)
     .sort();
+  const explicitResubmissions = (invocationToolOperations ?? [])
+    .filter((operation) => operation.toolName === "resubmit_existing_asset" && toolOperationSucceeded(operation))
+    .map((operation) => operation.path).filter((path) => after.has(path));
   const candidateChangedPaths = options.authoritativeWorkspace || !invocationChangedPaths
-    ? workspaceChangedPaths
+    ? [...new Set([...workspaceChangedPaths, ...explicitResubmissions])].sort()
     : [...new Set([...invocationChangedPaths, ...failedMutationPaths])].filter((path) => after.has(path)).sort();
   const changedPaths = candidateChangedPaths
     .filter((path) => !readOnlyOperationPaths.has(path) || before.get(path)?.hash !== after.get(path)?.hash)

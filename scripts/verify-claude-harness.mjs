@@ -316,6 +316,7 @@ await harness.run({
   model: "qwen-test",
   systemPrompt: "test",
   userPrompt: "resume the proof",
+  visionProducerDecisions: [{messageId: "producer_scope", content: "Scope fixture", createdAt: "2026-09-11T00:00:00.000Z"}],
   authorization,
   sessionId: result.sessionId,
   sessionKey: "task:harness_test:design-room:task_harness:game_designer:e0",
@@ -329,6 +330,7 @@ for (const unsafeBuiltin of ["Read", "Glob", "Grep", "Bash"]) {
 assert.ok(toolsArg.includes("mcp__btp_workspace__read_file"));
 const mcpConfigArg = JSON.parse(args[args.indexOf("--mcp-config") + 1]);
 assert.equal(mcpConfigArg.mcpServers.btp_workspace.env.BTP_TOOL_MODE, "task");
+assert.equal(JSON.parse(mcpConfigArg.mcpServers.btp_workspace.env.BTP_VISION_PRODUCER_DECISIONS)[0].messageId, "producer_scope");
 assert.equal("BTP_ALLOWED_ROOTS" in mcpConfigArg.mcpServers.btp_workspace.env, false);
 assert.ok(args.includes("--resume"));
 assert.ok(args.includes(result.sessionId));
