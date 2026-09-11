@@ -1505,7 +1505,9 @@ function validatePlaytestContractSemantics(contract: PlaytestContract, path: str
       );
     }
     const worstCaseDurationMs = scenario.steps.reduce(
-      (sum, step) => sum + step.timeoutMs * (step.repeat?.maxIterations ?? 1),
+      // executeStep uses ONE absolute deadline across every repeat iteration,
+      // polling and assertions. Multiplying again rejects bounded scenarios.
+      (sum, step) => sum + step.timeoutMs,
       0,
     );
     if (worstCaseDurationMs > contract.environment.maxScenarioDurationMs) {

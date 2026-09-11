@@ -30,6 +30,13 @@ content. Historical receipts retain their original inputs; readiness checks and
 reconciliation still reject missing, altered and invalidated outputs.
 Regression: `verify-store-evidence-reconciliation.mjs`.
 
+Test submission then exposed a deadline mismatch: validation multiplied each
+step's timeout by its repeat count, while the runner already bounds all repeats
+and assertions with one step deadline. Validation now sums step deadlines once;
+the 60-second step, 300-second scenario and 100-iteration limits remain enforced,
+including the runner's hard watchdog. QA authors no longer need unrealistically
+short waits to pass an erroneously inflated budget calculation.
+
 ## Failure observed in Tidewatch
 
 The visual reviewer reported a passing score while a runtime PNG declared

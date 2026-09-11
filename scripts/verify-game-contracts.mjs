@@ -252,6 +252,14 @@ const unboundedRepeat = structuredClone(fixtures[0]);
 unboundedRepeat.playtestContract.scenarios[0].steps[1].repeat.maxIterations = 101;
 assert.throws(() => parseProductionContractBundle(unboundedRepeat), ContractValidationError);
 
+const sharedRepeatDeadline = structuredClone(fixtures[0].playtestContract);
+sharedRepeatDeadline.environment.maxScenarioDurationMs = 60000;
+sharedRepeatDeadline.scenarios[0].steps[1].timeoutMs = 30000;
+sharedRepeatDeadline.scenarios[0].steps[1].repeat.maxIterations = 100;
+assert.equal(validatePlaytestContract(sharedRepeatDeadline).ok, true, "100 repeat iterations share one 30-second step deadline, not 100 deadlines");
+sharedRepeatDeadline.scenarios[0].steps[1].timeoutMs = 60000;
+assert.equal(validatePlaytestContract(sharedRepeatDeadline).ok, false, "setup plus repeated step still cannot exceed the total scenario budget");
+
 const conflictingComponentProperty = structuredClone(fixtures[0]);
 conflictingComponentProperty.sceneBlueprint.scenes[0].nodes[0].components[0].bindings[0].property = "fixtureGenre";
 assert.throws(() => parseProductionContractBundle(conflictingComponentProperty), ContractValidationError);
