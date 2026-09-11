@@ -9,12 +9,16 @@
     "@game-pipeline/agent-runtime": "0.1.0",
     "@game-pipeline/shared-schemas": "0.1.0",
     "@resvg/resvg-js": "^2.6.2",
-    "playwright-core": "^1.61.1"
+    "playwright-core": "^1.61.1",
+    "pngjs": "^7.0.0"
   },
   "scripts": {
     "build": "tsc -b",
     "typecheck": "tsc -b --pretty false",
     "dev": "npm run build && node dist/server.js",
     "demo": "npm run build && node dist/demo.js"
+  },
+  "devDependencies": {
+    "@types/pngjs": "^6.0.5"
   }
 }

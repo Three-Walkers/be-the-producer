@@ -29,6 +29,7 @@ export interface AgentHarnessRunInput {
   authorization: AgentHarnessAuthorization;
   expectedPaths?: string[];
   taskInputEvidence?: ArtifactInputProvenance[];
+  visionProducerDecisions?: Array<{ messageId: string; content: string; createdAt: string }>;
   requireToolProgress?: boolean;
   toolMode?: "conversation" | "task";
   sessionKey?: string;
@@ -81,6 +82,9 @@ export interface AgentHarnessRunResult {
 }
 
 export interface AgentHarnessToolOperation {
+  resubmissionReason?: string;
+  contactSheetReceipt?: import("./assetContactSheet.js").ContactSheetReceipt;
+  normalizationReceipt?: import("./rasterNormalization.js").RasterNormalizationReceipt | undefined;
   toolName: string;
   path: string;
   access?: "read" | "write";

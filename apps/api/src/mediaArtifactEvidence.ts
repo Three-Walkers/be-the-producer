@@ -1,9 +1,37 @@
 import type { StudioKernel } from "@game-pipeline/agent-runtime";
 import type { Artifact } from "@game-pipeline/shared-schemas";
+import { hashWorkspaceFile, resolveWorkspacePathTarget } from "./workspaceWriter.js";
+
+export function hasCurrentComposedContactSheetReceipt(kernel: StudioKernel, artifact: Artifact): boolean {
+  if (artifact.artifactId !== "artifact_asset_contact_sheet" || artifact.ownerAgentId !== "asset_production" ||
+      artifact.sourceTaskId !== "task_stage_2_asset_pipeline" || artifact.type !== "asset") return false;
+  const ledger = kernel.listArtifactLedger().find((l) => l.artifactId === artifact.artifactId);
+  const operation = kernel.listArtifactOperations().find((o) => o.operationId === ledger?.sourceOperationId);
+  const receipt = operation?.metadata.contactSheetReceipt as import("./assetContactSheet.js").ContactSheetReceipt | undefined;
+  if (ledger?.status !== "verified" || !receipt || receipt.version !== 1 || receipt.outputHash !== ledger.hash ||
+      operation?.status !== "completed" || operation.agentId !== artifact.ownerAgentId || operation.taskId !== artifact.sourceTaskId ||
+      operation.artifactId !== artifact.artifactId || operation.path !== artifact.path ||
+      operation.metadata.materializationToolName !== "compose_asset_contact_sheet" ||
+      operation.metadata.materializationSizeBytes !== ledger.sizeBytes ||
+      artifact.metadata.harnessToolName !== "compose_asset_contact_sheet" ||
+      !Array.isArray(receipt.sources) || !receipt.sources.length || receipt.sources.length > 32) return false;
+  const actual = resolveWorkspacePathTarget(kernel.project.projectId, artifact.path);
+  if (!actual.exists || actual.type !== "file" || actual.sizeBytes !== ledger.sizeBytes || hashWorkspaceFile(actual.absolutePath) !== ledger.hash) return false;
+  return receipt.sources.every((source) => {
+    const input = kernel.listArtifacts().find((a) => a.path === source.path);
+    if (!input || input.ownerAgentId !== "asset_production" || input.sourceTaskId !== artifact.sourceTaskId ||
+        !hasCurrentGenerateRasterAssetReceipt(kernel, input)) return false;
+    const sourceLedger = kernel.listArtifactLedger().find((l) => l.artifactId === input.artifactId);
+    const file = resolveWorkspacePathTarget(kernel.project.projectId, source.path);
+    return sourceLedger?.hash === source.hash && sourceLedger.sizeBytes === source.sizeBytes && file.exists && file.type === "file" &&
+      file.sizeBytes === source.sizeBytes && hashWorkspaceFile(file.absolutePath) === source.hash;
+  });
+}
 
 const mediaEvidenceVersion = 1;
 
 export interface MediaGenerationMaterializationInput {
+  normalizationReceipt?: import("./rasterNormalization.js").RasterNormalizationReceipt | undefined;
   hash: string;
   sizeBytes: number;
   provider: string;
@@ -29,7 +57,8 @@ export function mediaGenerationOperationMetadata(
     mediaProvider: input.provider,
     mediaModel: input.model,
     mediaRequestId: input.requestId,
-    mediaPromptHash: input.promptHash
+    mediaPromptHash: input.promptHash,
+    ...(input.normalizationReceipt ? { mediaNormalizationReceipt: input.normalizationReceipt } : {})
   };
 }
 
@@ -141,6 +170,12 @@ export function hasCurrentGenerateRasterAssetReceipt(
   }
 
   const operation = kernel.listArtifactOperations().find((entry) => entry.operationId === ledger.sourceOperationId);
+  if (metadata.mediaNormalizationReceipt !== undefined || operation?.metadata.mediaNormalizationReceipt !== undefined) {
+    const normalization = metadata.mediaNormalizationReceipt as Partial<import("./rasterNormalization.js").RasterNormalizationReceipt> | undefined;
+    if (!normalization || normalization.version !== 1 || !sha256(normalization.rawHash) ||
+        normalization.outputHash !== ledger.hash || !positiveInteger(normalization.rawSizeBytes) ||
+        JSON.stringify(normalization) !== JSON.stringify(operation?.metadata.mediaNormalizationReceipt)) return false;
+  }
   return Boolean(
     operation &&
     operation.status === "completed" &&

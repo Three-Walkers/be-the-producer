@@ -110,7 +110,9 @@ export class QualityReviewValidationError extends Error {
   readonly issues: QualityReviewValidationIssue[];
 
   constructor(issues: QualityReviewValidationIssue[]) {
-    super(`ArtifactQualityReview validation failed with ${issues.length} issue${issues.length === 1 ? "" : "s"}`);
+    super(`ArtifactQualityReview validation failed with ${issues.length} issue${issues.length === 1 ? "" : "s"}:\n` +
+      issues.slice(0, 40).map((issue) => `${issue.path} [${issue.code}]: ${issue.message}`).join("\n") +
+      (issues.length > 40 ? `\n… ${issues.length - 40} more issues; fix these first and retry.` : ""));
     this.name = "QualityReviewValidationError";
     this.issues = issues;
   }

@@ -1,4 +1,5 @@
 import { createHash, randomInt } from "node:crypto";
+import { normalizeGeneratedRaster, parseRasterNormalization, type RasterNormalization, type RasterNormalizationReceipt } from "./rasterNormalization.js";
 
 const MEBIBYTE = 1024 * 1024;
 const HARD_MAX_IMAGE_BYTES = 25 * MEBIBYTE;
@@ -45,6 +46,7 @@ export interface MultimodalArtProviderConfig {
 }
 
 export interface GenerateArtImageInput {
+  normalization?: RasterNormalization | undefined;
   prompt: string;
   negativePrompt?: string;
   size: string | { width: number; height: number };
@@ -53,6 +55,7 @@ export interface GenerateArtImageInput {
 }
 
 export interface GeneratedArtImage {
+  normalizationReceipt?: RasterNormalizationReceipt;
   provider: "dashscope";
   model: string;
   requestId: string;
@@ -218,6 +221,7 @@ export class DashScopeMultimodalArtProvider {
   }
 
   async generateImage(input: GenerateArtImageInput): Promise<GeneratedArtImage> {
+    const normalization = parseRasterNormalization(input.normalization);
     const prompt = normalizeImageGenerationPrompt(input.prompt, "prompt");
     const negativePrompt = input.negativePrompt === undefined
       ? ""
@@ -290,6 +294,7 @@ export class DashScopeMultimodalArtProvider {
       label: "DashScope generated image download"
     });
     const dimensions = inspectPng(downloaded.body);
+    const normalized = normalization ? normalizeGeneratedRaster(downloaded.body, normalization) : undefined;
     return {
       provider: this.provider,
       model: this.config.imageModel,
@@ -298,10 +303,11 @@ export class DashScopeMultimodalArtProvider {
       promptHash: sha256(effectivePrompt),
       negativePromptHash: sha256(negativePrompt),
       seed,
-      width: dimensions.width,
-      height: dimensions.height,
+      width: normalization?.width ?? dimensions.width,
+      height: normalization?.height ?? dimensions.height,
       mime: PNG_MIME,
-      buffer: downloaded.body,
+      buffer: normalized?.buffer ?? downloaded.body,
+      ...(normalized ? { normalizationReceipt: normalized.receipt } : {}),
       latencyMs: Date.now() - startedAt
     };
   }
@@ -392,7 +398,9 @@ export class DashScopeMultimodalArtProvider {
         { cause: error }
       );
     }
-    const semanticResult = parseArtVisionSemanticResult(result, rubric, [...imagePaths]);
+    // The model judges individual criteria; arithmetic belongs to the server.
+    // Persisted/signed receipts remain strict, and rawHash binds the unmodified reply.
+    const semanticResult = parseArtVisionSemanticResult(result, rubric, [...imagePaths], { deriveScoreTotal: true });
     return {
       provider: this.provider,
       model: readOptionalString(responsePayload, "model") || this.config.visionModel,
@@ -854,7 +862,9 @@ function buildVisionSemanticContractPrompt(rubric: ArtVisionRubric, imagePaths: 
   return [
     "Return exactly one JSON object and no markdown.",
     "Use exactly the keys and canonical criterion order shown below; do not omit, add, rename, or merge criteria.",
+    "issueCode must match ^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$ (at most 160 characters): ASCII lowercase only, no spaces, capitals, Chinese, or parentheses. Put descriptive text in summary, not issueCode.",
     "Every criterion requires at least one finding grounded in a supplied image path using path#pixel:<specific region>.",
+    "Images may arrive in multiple batches. For this batch judge the supplied pixels; absence from this batch alone is NOT evidence an asset is missing. Use the authoritative complete manifest to assess coverage. Do not invent unseen UI layouts or claim runtime interaction was tested from standalone sprites.",
     "A pass criterion may contain only minor/note findings. Any critical/major observation forbids a pass verdict.",
     "scoreTotal must be the weighted score. verdict must be blocked if any criterion is blocked; otherwise change_requested when any criterion requests changes, any critical/major finding exists, or the threshold is missed; otherwise pass.",
     `Supplied image paths: ${JSON.stringify(imagePaths)}`,
@@ -865,7 +875,8 @@ function buildVisionSemanticContractPrompt(rubric: ArtVisionRubric, imagePaths: 
 export function parseArtVisionSemanticResult(
   value: unknown,
   rubricInput: ArtVisionRubric,
-  allowedImagePathsInput: readonly string[]
+  allowedImagePathsInput: readonly string[],
+  options: { deriveScoreTotal?: boolean } = {}
 ): ArtVisionSemanticResult {
   const rubric = normalizeVisionRubric(rubricInput);
   const allowedImagePaths = new Set(
@@ -952,7 +963,7 @@ export function parseArtVisionSemanticResult(
   });
   const scoreTotal = readVisionScore(root.scoreTotal, "scoreTotal");
   const calculatedScore = calculateVisionScore(criteria);
-  if (Math.abs(scoreTotal - calculatedScore) > VISION_SCORE_EPSILON) {
+  if (!options.deriveScoreTotal && Math.abs(scoreTotal - calculatedScore) > VISION_SCORE_EPSILON) {
     throw invalidVisionResponse(`vision result scoreTotal=${scoreTotal} does not equal weighted score ${calculatedScore}.`);
   }
   const verdict = readVisionStatus(root.verdict, "verdict");
