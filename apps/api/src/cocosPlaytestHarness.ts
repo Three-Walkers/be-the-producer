@@ -84,6 +84,11 @@ export class CocosPlaytestHarness {
     const checks: PlaytestCheckResult[] = [];
     const defects: PlaytestDefect[] = [];
     const consoleLines: string[] = [];
+    const buildEvidence: CocosBridgeEvidence[] = [];
+    let page: Page | undefined;
+    let launchPhase = "contract_load";
+    let previewUrl = input.previewUrl?.trim();
+    let outputDir: string | undefined;
     let browser: Browser | undefined;
     let staticServer: Server | undefined;
     let buildOperationId: string | undefined;
@@ -104,15 +109,22 @@ export class CocosPlaytestHarness {
       if (input.adapterMode === "contract" && !loadedContract) {
         throw new Error("已要求 contract 模式，但项目没有 PlaytestContract。");
       }
-      let previewUrl = input.previewUrl?.trim();
       if (!input.skipBuild) {
-        const outputDir = `shared/build-artifacts/playtest/${operationId}`;
+        launchPhase = "web_build";
+        outputDir = `shared/build-artifacts/playtest/${operationId}`;
         const build = new CocosEngineBridge(this.projectRoot, this.config).build({
           platform: "web-desktop",
           debug: true,
           outputDir
         });
         buildOperationId = build.operationId;
+        // The nested build is part of this trusted service invocation, even
+        // when the subsequent browser/adapter check fails. Preserve its exact
+        // bytes for the outer transaction; do not grant QA general writes.
+        buildEvidence.push(...build.evidence.filter((item) => !item.path.startsWith("assets/")));
+        const outputFiles = Array.isArray(build.details?.outputFiles) ? build.details.outputFiles : [];
+        buildEvidence.push(...outputFiles.filter((path): path is string => typeof path === "string")
+          .map((path) => fileEvidence(this.projectRoot, path)));
         if (!build.ok) {
           throw new Error(`QA Web 构建失败：${build.error ?? build.summary}`);
         }
@@ -124,11 +136,12 @@ export class CocosPlaytestHarness {
         throw new Error("没有可供试玩的 Web URL。请先完成 Cocos Web 构建或传入 previewUrl。");
       }
 
+      launchPhase = "browser_launch";
       browser = await chromium.launch({
         headless: true,
         executablePath: discoverChromeExecutable()
       });
-      const page = await browser.newPage({ viewport: input.viewport ?? defaultViewport });
+      page = await browser.newPage({ viewport: input.viewport ?? defaultViewport });
       page.on("console", (message) => {
         consoleLines.push(`[${message.type()}] ${message.text()}`);
       });
@@ -136,6 +149,7 @@ export class CocosPlaytestHarness {
         consoleLines.push(`[pageerror] ${error.message}`);
       });
 
+      launchPhase = "scene_load";
       await page.goto(previewUrl, { waitUntil: "domcontentloaded", timeout: 30_000 });
       await page.waitForFunction(() => {
         const cocos = (globalThis as unknown as { cc?: { director?: { getScene?: () => unknown } } }).cc;
@@ -144,6 +158,7 @@ export class CocosPlaytestHarness {
       await page.waitForTimeout(1_000);
 
       if (loadedContract) {
+        launchPhase = "runtime_adapter";
         return await this.runContractMode({
           page,
           loadedContract,
@@ -156,6 +171,7 @@ export class CocosPlaytestHarness {
           checks,
           defects,
           consoleLines,
+          buildEvidence,
           taskInputEvidence: input.taskInputEvidence ?? []
         });
       }
@@ -304,7 +320,7 @@ export class CocosPlaytestHarness {
       machineResult.evidencePaths = evidencePaths;
       writeTextEvidence(this.projectRoot, reportPath, renderMarkdownReport(machineResult));
 
-      const evidence = [reportPath, ...evidencePaths].map((path) => fileEvidence(this.projectRoot, path));
+      const evidence = [...buildEvidence, ...[reportPath, ...evidencePaths].map((path) => fileEvidence(this.projectRoot, path))];
       const result: CocosPlaytestResult = {
         ...machineResult,
         ok: true,
@@ -317,14 +333,32 @@ export class CocosPlaytestHarness {
     } catch (error) {
       const completedAt = new Date().toISOString();
       const details = error instanceof Error ? error.message : String(error);
+      const consoleErrors = consoleLines.filter((line) => /^\[(?:error|pageerror)\]/.test(line));
+      const consolePath = writeTextEvidence(this.projectRoot, `${runRoot}/console.log`, `${consoleLines.join("\n")}\n`);
+      evidencePaths.push(consolePath);
+      evidencePaths.push(writeJsonEvidence(this.projectRoot, `${runRoot}/launch.json`, {
+        phase: launchPhase, platform: input.skipBuild ? "external_preview" : "web-desktop",
+        outputPath: outputDir, previewUrl, buildOperationId,
+        sceneLoaded: launchPhase === "runtime_adapter", error: details, consoleErrors
+      }));
+      if (page) {
+        const screenshotPath = `${runRoot}/blocked-page.png`;
+        try {
+          ensureDirectoryInsideProject(this.projectRoot, runRoot);
+          await page.screenshot({ path: resolveInsideProject(this.projectRoot, screenshotPath), timeout: 5_000 });
+          evidencePaths.push(screenshotPath);
+        } catch { /* Browser startup may itself have failed; keep the logs. */ }
+      }
+      const failureDetails = `阶段=${launchPhase}；实际目标=${input.skipBuild ? previewUrl : `web-desktop:${outputDir ?? "未构建"}`}；${details}` +
+        (consoleErrors.length ? `；运行时错误：${consoleErrors.slice(0, 5).join("；")}` : "；未捕获控制台错误，不代表游戏没有缺陷。");
       const blockedDefect = defect({
         operationId,
         category: "runtime",
         severity: "blocker",
-        title: "试玩基础设施无法执行",
-        details,
-        ownerAgentId: "cocos_automation",
-        evidencePaths: []
+        title: launchPhase === "runtime_adapter" ? "游戏场景已加载但运行时适配器未就绪" : "试玩基础设施无法执行",
+        details: failureDetails,
+        ownerAgentId: launchPhase === "runtime_adapter" ? "gameplay_programmer" : "cocos_automation",
+        evidencePaths: [...evidencePaths]
       });
       defects.push(blockedDefect);
       checks.push({ checkId: "playtest_infrastructure", label: "试玩基础设施可用", status: "blocked", details });
@@ -351,14 +385,15 @@ export class CocosPlaytestHarness {
         defects,
         evidencePaths,
         ...(blockedContract ? { contract: blockedContract, scenarios: [] } : {}),
-        runtime: { consoleErrorCount: 0, durationMs: Date.now() - startedAt }
+        runtime: { consoleErrorCount: consoleErrors.length, durationMs: Date.now() - startedAt }
       };
+      evidencePaths.push(writeJsonEvidence(this.projectRoot, `${runRoot}/result.json`, machineResult));
       writeTextEvidence(this.projectRoot, reportPath, renderMarkdownReport(machineResult));
-      const evidence = [fileEvidence(this.projectRoot, reportPath)];
+      const evidence = [...buildEvidence, ...[reportPath, ...evidencePaths].map((path) => fileEvidence(this.projectRoot, path))];
       const result: CocosPlaytestResult = {
         ...machineResult,
         ok: false,
-        summary: `Cocos 试玩未能执行：${details}`,
+        summary: `Cocos 试玩未能执行：${failureDetails}`,
         reportPath,
         evidence
       };
@@ -384,6 +419,7 @@ export class CocosPlaytestHarness {
     checks: PlaytestCheckResult[];
     defects: PlaytestDefect[];
     consoleLines: string[];
+    buildEvidence: CocosBridgeEvidence[];
     taskInputEvidence: ArtifactInputProvenance[];
   }): Promise<CocosPlaytestResult> {
     const adapter = await BrowserRuntimeAdapter.connect(input.page);
@@ -603,7 +639,7 @@ export class CocosPlaytestHarness {
     machineResult.evidencePaths = input.evidencePaths;
     writeTextEvidence(this.projectRoot, input.reportPath, renderMarkdownReport(machineResult));
     const evidencePaths = [...new Set([input.reportPath, ...input.evidencePaths])];
-    const evidence = evidencePaths.map((path) => fileEvidence(this.projectRoot, path));
+    const evidence = [...input.buildEvidence, ...evidencePaths.map((path) => fileEvidence(this.projectRoot, path))];
     const result: CocosPlaytestResult = {
       ...machineResult,
       ok: true,

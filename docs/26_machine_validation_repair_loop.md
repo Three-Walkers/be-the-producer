@@ -172,3 +172,25 @@ obsolete build file before removing it and restores deletions along with writes 
 publication fails. Original authored assets and code are unaffected. This is build
 replacement, not a general agent delete capability or permanent version archive.
 Tests: `verify-cocos-engine-bridge.mjs` and `verify-workspace-isolation.mjs`.
+
+## QA launch failures are evidence, not permission violations
+
+The QA service builds a separate `web-desktop` target, not the WeChat bundle.
+Previously, browser startup failures dropped console logs and the nested build's
+file receipts. The outer guard then rejected those unaccounted service writes;
+the QA agent could only see a timeout and incorrectly inferred a WeChat/browser
+platform mismatch. Startup failures now retain the actual target, launch phase,
+console errors, page screenshot (when possible), result JSON and nested build
+receipts. A loaded scene with a missing runtime adapter routes to the programmer;
+build/browser/scene startup failures remain with automation for diagnosis.
+
+Only byte-matching `run_playtest` operations backed by a verified QA receipt may
+publish their own operation's Web directory and exact build log/report paths.
+Arbitrary writes, source mutations, foreign operation IDs and missing/tampered
+receipts remain rejected. Build bundles stay in the receipt rather than becoming
+hundreds of required QA deliverables; screenshots/logs are supporting evidence.
+Creator's native scene reserialization is restored alongside editor metadata,
+so a QA build does not silently edit the canonical authored scene.
+
+Tests: `verify-qa-launch-diagnostics.mjs`, `verify-staged-qa-receipts.mjs`,
+`verify-cocos-build-isolation.mjs`, `verify-qa-playtest-gate.mjs`.

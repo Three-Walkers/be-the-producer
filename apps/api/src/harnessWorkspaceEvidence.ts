@@ -14,6 +14,7 @@ import { isQaHarnessManagedPath } from "./qaEvidenceProtection.js";
 import { assertAgentPathAuthorized } from "./toolAuthorization.js";
 import { resolvePathWithinRoot } from "./pathSafety.js";
 import { isCocosBuildSupportingArtifact } from "./cocosSupportingEvidence.js";
+import { readVerifiedQaPlaytestReceipts } from "./qaPlaytestReceipt.js";
 import {
   applyQualityReviewChangeRequest,
   assertQualityReviewMatchesVisionSemanticResult,
@@ -184,6 +185,11 @@ export function recordHarnessWorkspaceChanges(
         operation.path === path && (toolOperationSucceeded(operation) || isFailedCocosDiagnostic(operation, file)) && operationWritesWorkspace(operation)
       ) ?? [];
     let sourceOperation = pathWrites.at(-1);
+    if (sourceOperation?.toolName === "run_playtest" && existing?.type !== "qa_report") {
+      // The receipt ingester owns QA evidence registration. Nested Web bundles
+      // are supporting bytes, not hundreds of new required deliverables.
+      continue;
+    }
     if (sourceOperation?.toolName === "resubmit_existing_asset") {
       const precedingWrite = pathWrites.filter((operation) => operation.toolName !== "resubmit_existing_asset").at(-1);
       // Resubmitting immediately after a genuine generation must not replace
@@ -539,6 +545,7 @@ export function analyzeHarnessWorkspaceChanges(
     .filter((path) => !failedOnlyOperationPaths.has(path) || failedMutationPaths.includes(path));
   const deletedPaths = [...before.keys()].filter((path) => !after.has(path)).sort();
   const replacementRoots = verifiedBuildReplacementRoots(kernel, task, after, invocationToolOperations ?? []);
+  const qaServicePaths = verifiedQaServicePaths(kernel, task, agent, after, invocationToolOperations ?? []);
   const protectedMutationPaths = changedPaths.filter((path) => {
     if (!isQaHarnessManagedPath(path)) return false;
     return invocationToolOperations
@@ -548,13 +555,38 @@ export function analyzeHarnessWorkspaceChanges(
       .at(-1)?.toolName !== "run_playtest";
   });
   const violations = [
-    ...changedPaths.filter((path) => !isAllowedAgentPath(kernel, task, agent, path)).map((path) => `未授权写入：${path}`),
+    ...changedPaths.filter((path) => !isAllowedAgentPath(kernel, task, agent, path) && !qaServicePaths.has(path)).map((path) => `未授权写入：${path}`),
     ...protectedMutationPaths.map((path) => `受保护 QA 机器证据被非 run_playtest 工具修改：${path}`),
     ...failedMutationPaths.map((path) => `失败工具仍修改了工作区，拒绝物化：${path}`),
     ...deletedPaths.filter((path) => !replacementRoots.some((root) => path.startsWith(`${root}/`)))
       .map((path) => `删除：${path}`)
   ];
   return { changedPaths, deletedPaths, violations };
+}
+
+function verifiedQaServicePaths(kernel: StudioKernel, task: Task, agent: AgentContract, after: WorkspaceSnapshot, operations: AgentHarnessToolOperation[]): Set<string> {
+  const allowed = new Set<string>();
+  if (agent.agentId !== "qa_evaluator" || task.ownerAgentId !== agent.agentId) return allowed;
+  const reports = kernel.listArtifacts().filter((artifact) => task.outputArtifacts.includes(artifact.artifactId) &&
+    artifact.type === "qa_report" && artifact.ownerAgentId === agent.agentId && artifact.sourceTaskId === task.taskId);
+  const first = after.values().next().value as WorkspaceFileEvidence | undefined;
+  if (!first) return allowed;
+  const root = first.absolutePath.slice(0, -first.path.length);
+  for (const receipt of readVerifiedQaPlaytestReceipts(root)) {
+    if (!/^playtest_\d{14}_[a-f0-9]{8}$/.test(receipt.operationId) || !reports.some((report) => report.path === receipt.reportPath)) continue;
+    const buildId = receipt.result.buildOperationId;
+    for (const item of receipt.evidence) {
+      const scoped = item.path.startsWith(`shared/build-artifacts/playtest/${receipt.operationId}/`) ||
+        (buildId && /^cocos_build_\d{14}_[a-f0-9]{8}$/.test(buildId) &&
+          [ `agents/cocos-automation/build-ops/${buildId}.json`, `agents/cocos-automation/cocos-build-logs/${buildId}.log` ].includes(item.path));
+      const op = operations.filter((operation) => operation.path === item.path && operationWritesWorkspace(operation)).at(-1);
+      const file = after.get(item.path);
+      if (scoped && file && op?.toolName === "run_playtest" && op.operationType === "playtest" &&
+          op.operationId === receipt.operationId && op.status === "completed" &&
+          op.hash === file.hash && op.sizeBytes === file.sizeBytes) allowed.add(item.path);
+    }
+  }
+  return allowed;
 }
 
 function verifiedBuildReplacementRoots(kernel: StudioKernel, task: Task, after: WorkspaceSnapshot, operations: AgentHarnessToolOperation[]): string[] {

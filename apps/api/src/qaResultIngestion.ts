@@ -157,6 +157,9 @@ function registerReceiptEvidence(kernel: StudioKernel, qaTask: Task, receipt: Qa
   const now = receipt.result.completedAt;
   let reportArtifactId = "";
   for (const evidence of receipt.evidence) {
+    // Build bytes remain hash-bound in the receipt; do not expand the task
+    // ledger with a deliverable for each engine bundle or imported texture.
+    if (evidence.path !== receipt.reportPath && !evidence.path.startsWith("agents/qa/playtest-runs/")) continue;
     const existing = kernel.listArtifacts().find((artifact) => artifact.path === evidence.path);
     const isReport = evidence.path === receipt.reportPath;
     const artifact = kernel.upsertArtifact({
@@ -174,6 +177,7 @@ function registerReceiptEvidence(kernel: StudioKernel, qaTask: Task, receipt: Qa
         ...(existing?.metadata ?? {}),
         generatedBy: "qa_result_ingestion",
         nativeHarnessManaged: true,
+        ...(!isReport ? { evidenceRole: "supporting" } : {}),
         toolName: "run_playtest",
         toolExecutedAt: now,
         playtestOperationId: receipt.operationId,
