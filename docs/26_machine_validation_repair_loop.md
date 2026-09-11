@@ -15,6 +15,15 @@ inside `onLoad`, single activation, draw order and failed-assembly isolation.
 This prevents a platform-induced race; it does not certify gameplay readiness or
 replace the independent QA's real browser run.
 
+The contract runner also reused a pre-action snapshot for non-repeated actions.
+If assertions were already true (or empty), it could certify a stale value and
+even miss a changed terminal state. It now captures the actual outcome after
+every such action, including waits, before evaluating assertions and aggregate
+gates. Regression demonstrates a balance changing from 120 to 0 and an unexpected
+terminal transition; both incorrectly passed before the fix. The report's
+interface-discovery check is labeled as scene/API loading, not game playability.
+Regression: `verify-playtest-contract-runner.mjs`, `verify-qa-launch-diagnostics.mjs`.
+
 ## Reopened QA recovery and test-authoring preflight
 
 A producer change can put a previously failed QA task back in `doing` while

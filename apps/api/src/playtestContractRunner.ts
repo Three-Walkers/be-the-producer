@@ -231,6 +231,9 @@ async function executeStep(input: {
     } else {
       iterations = step.action ? 1 : 0;
       await performAction(adapter, step.action, deadline);
+      // Assertions and final-state/quality-gate evidence must describe the
+      // outcome, even when they were already true before the action (or empty).
+      if (step.action) snapshot = await capture();
     }
 
     let assertions = evaluateAssertions(step.assertions, snapshot);

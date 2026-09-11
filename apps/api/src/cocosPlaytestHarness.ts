@@ -423,7 +423,7 @@ export class CocosPlaytestHarness {
     taskInputEvidence: ArtifactInputProvenance[];
   }): Promise<CocosPlaytestResult> {
     const adapter = await BrowserRuntimeAdapter.connect(input.page);
-    addCheck(input.checks, "launch", "游戏可启动", "passed", "Cocos 场景已加载并发现 Playtest Runtime Adapter。");
+    addCheck(input.checks, "launch", "场景与测试接口已加载", "passed", "已发现 Cocos 场景和 Playtest Runtime Adapter；游戏是否可交互由后续契约场景验证。");
 
     let run: PlaytestContractRunResult;
     try {
