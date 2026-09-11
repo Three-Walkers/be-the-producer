@@ -127,3 +127,17 @@ Active progress may be lost after a crash (and is cleared at restart already), b
 committed artifacts, decisions and final activity timelines retain their durable
 boundaries. Regression: `node scripts/verify-activity-checkpoints.mjs` verifies 200
 progress events without intermediate durable saves, plus producer-input durability.
+
+## Native Creator import side effects
+
+The first real Creator build succeeded but was rejected on publication because
+Creator emitted `.meta` files across `assets`, updated `package.json`, and created
+editor profiles/settings outside the agent's write grants. Broadening the role's
+source-write permissions would erase the isolation boundary. Instead, both WeChat
+and QA web builds snapshot the narrowly defined editor metadata/configuration just
+before native Creator execution and restore it in `finally`. Built files, logs and
+reports remain available; prior authored metadata/configuration retain exact bytes.
+Unexpected source/asset changes remain visible to the outer workspace guard and
+are still rejected. Symlinks are refused. This deliberately favors reproducible,
+isolated builds over caching generated editor metadata in the authored workspace.
+Regression: `node scripts/verify-cocos-build-isolation.mjs`.

@@ -29,6 +29,7 @@ import { adaptLegacySceneBlueprint } from "./legacySceneBlueprintAdapter.js";
 import { normalizeRelativePathWithinRoot, resolvePathWithinRoot } from "./pathSafety.js";
 import { playtestRuntimeBindingPath, readPlaytestRuntimeBinding } from "./playtestRuntimeBinding.js";
 import { discoverScriptComponents, type ScriptComponent } from "./cocosScriptComponents.js";
+import { withIsolatedCreatorMetadata } from "./cocosBuildIsolation.js";
 
 export interface CocosBridgeEvidence {
   path: string;
@@ -432,13 +433,13 @@ export class CocosEngineBridge {
         ? buildOptionsFromConfig(this.projectRoot, configPath, logAbsolute)
         : buildOptionsInline(platform, debug, outputDir, scene.uuid, logAbsolute);
       const args = ["--project", this.projectRoot, "--build", buildOptions];
-      const processResult = spawnSync(this.config.executablePath, args, {
+      const processResult = withIsolatedCreatorMetadata(this.projectRoot, () => spawnSync(this.config.executablePath, args, {
         cwd: this.projectRoot,
         encoding: "utf8",
         timeout: this.config.timeoutMs,
         maxBuffer: 20 * 1024 * 1024,
         env: minimalCreatorEnvironment(process.env)
-      });
+      }));
       const processOutput = `${processResult.stdout ?? ""}\n${processResult.stderr ?? ""}`.trim();
       const existingLog = existsSync(logAbsolute) && statSync(logAbsolute).isFile() ? readFileSync(logAbsolute, "utf8") : "";
       writeFileSync(logAbsolute, `${existingLog}${existingLog && processOutput ? "\n" : ""}${processOutput}\n`, "utf8");
