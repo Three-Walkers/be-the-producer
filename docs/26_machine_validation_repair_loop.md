@@ -99,3 +99,18 @@ their existing handling. No files or review verdicts are fabricated by recovery.
 When work is blocked, unrelated completed reviews no longer turn the whole loop
 into “waiting for producer”. The UI receives the actual unresolved work reason.
 Regression: `node scripts/verify-handoff-evidence.mjs` after `npm run build`.
+
+## Cocos tool contracts and failed-operation diagnostics
+
+The scene tool used to advertise any name under `assets/scenes`, while its worker
+was authorized for `MainGame.scene` only. The bridge, authorization builder and
+tool default now share a constant; the schema advertises the actual granted
+paths. This does not grant generic scene writes or arbitrary directory access.
+
+Cocos failures intentionally write operation reports. Treating those reports as
+unauthorized partial mutations rolled back earlier successful imports in the same
+isolated invocation. Exact, hash-bound server diagnostics are now retained on disk
+with failed tool records, without adding them to required outputs or the artifact
+ledger. Failed builds remain unconsumable. Any failed source/scene/asset mutation,
+wrong operation identity, altered report bytes or unauthorized path still rejects
+publication. Regression: `node scripts/verify-cocos-failure-diagnostics.mjs`.

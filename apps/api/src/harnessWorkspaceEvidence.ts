@@ -172,7 +172,7 @@ export function recordHarnessWorkspaceChanges(
     const existing = findArtifactForPath(kernel, task, path);
     const pathWrites = invocationToolOperations
       ?.filter((operation) =>
-        operation.path === path && toolOperationSucceeded(operation) && operationWritesWorkspace(operation)
+        operation.path === path && (toolOperationSucceeded(operation) || isFailedCocosDiagnostic(operation, file)) && operationWritesWorkspace(operation)
       ) ?? [];
     let sourceOperation = pathWrites.at(-1);
     if (sourceOperation?.toolName === "resubmit_existing_asset") {
@@ -186,6 +186,14 @@ export function recordHarnessWorkspaceChanges(
       }
     }
     const sourceTool = sourceOperation?.toolName;
+    if (sourceOperation && isFailedCocosDiagnostic(sourceOperation, file)) {
+      toolExecutions.push({ toolName: sourceOperation.toolName as ToolExecutionResult["toolName"],
+        status: "failed", path, hash: file.hash, sizeBytes: file.sizeBytes,
+        error: sourceOperation.error ?? "Cocos 操作失败；已保留诊断，不是可消费产物。" });
+      // Diagnostics are retained on disk and in the failed tool record, never
+      // added to required task outputs or registered as successful artifacts.
+      continue;
+    }
     if (sourceOperation?.toolName === "resubmit_existing_asset") {
       if (!existing || existing.ownerAgentId !== agent.agentId || agent.agentId !== "asset_production" ||
           existing.sourceTaskId !== task.taskId || task.taskId !== "task_stage_2_asset_pipeline" ||
@@ -458,7 +466,7 @@ export function recordHarnessWorkspaceChanges(
       continue;
     }
     toolExecutions.push({
-      toolName: operation.toolName as "write_artifact" | "append_document" | "generate_raster_asset" | "inspect_visual_assets",
+      toolName: operation.toolName,
       status: "failed",
       path: operation.path,
       ...(operation.error ? { error: operation.error } : {})
@@ -490,7 +498,7 @@ export function analyzeHarnessWorkspaceChanges(
     .sort();
   const successfulOperationPaths = new Set(
     (invocationToolOperations ?? [])
-      .filter((operation) => toolOperationSucceeded(operation) && operationWritesWorkspace(operation))
+      .filter((operation) => (toolOperationSucceeded(operation) || isFailedCocosDiagnostic(operation, after.get(operation.path))) && operationWritesWorkspace(operation))
       .map((operation) => operation.path)
   );
   const failedOnlyOperationPaths = new Set(
@@ -537,13 +545,38 @@ export function analyzeHarnessWorkspaceChanges(
   return { changedPaths, deletedPaths, violations };
 }
 
+/** A failed build is not a successful output, but its server-written diagnostic
+ * is intentional evidence, not an unauthorized partial game mutation. Keep it
+ * and prior successful work while preserving bridgeOk=false and failed tools.
+ * Never accept failed scene/source/asset writes through this exception. */
+function isFailedCocosDiagnostic(operation: AgentHarnessToolOperation, file?: WorkspaceFileEvidence): boolean {
+  if (!file || operation.status !== "failed" || operation.bridgeOk !== false ||
+      operation.hash !== file.hash || operation.sizeBytes !== file.sizeBytes || !operation.operationId) return false;
+  const kinds: Record<string, { type: string; root: string }> = {
+    cocos_validate_project: { type: "validate_project", root: "validation" },
+    cocos_import_assets: { type: "import_assets", root: "imports" },
+    cocos_apply_blueprint: { type: "apply_scene_blueprint", root: "scene-ops" },
+    cocos_build: { type: "build", root: "build-ops" }
+  };
+  const kind = kinds[operation.toolName];
+  if (!kind || operation.operationType !== kind.type || !/^cocos_[a-z]+_\d{14}_[a-f0-9]{8}$/.test(operation.operationId)) return false;
+  if (kind.type === "build" && file.path === `agents/cocos-automation/cocos-build-logs/${operation.operationId}.log`) return true;
+  try {
+    const document = JSON.parse(readFileSync(file.absolutePath, "utf8"));
+    if (document.operationId !== operation.operationId || document.operationType !== kind.type || document.status !== "failed") return false;
+    return file.path === `agents/cocos-automation/${kind.root}/${operation.operationId}.json` ||
+      (kind.type === "build" && typeof document.outputPath === "string" &&
+        file.path === `${document.outputPath}/build-report.json`);
+  } catch { return false; }
+}
+
 function failedHarnessToolExecutions(
   invocationToolOperations?: AgentHarnessToolOperation[]
 ): ToolExecutionResult[] {
   return (invocationToolOperations ?? []).flatMap((operation) => {
     if (toolOperationSucceeded(operation) || !failedToolExecutionName(operation.toolName)) return [];
     return [{
-      toolName: operation.toolName as "write_artifact" | "append_document" | "generate_raster_asset" | "inspect_visual_assets",
+      toolName: operation.toolName,
       status: "failed" as const,
       path: operation.path,
       ...(operation.error ? { error: operation.error } : {})
@@ -647,6 +680,7 @@ function requiredOperationString(value: unknown, field: string, path: string): s
 
 function failedToolExecutionName(
   value: string
-): value is "write_artifact" | "append_document" | "generate_raster_asset" | "inspect_visual_assets" {
-  return ["write_artifact", "append_document", "generate_raster_asset", "inspect_visual_assets"].includes(value);
+): value is ToolExecutionResult["toolName"] {
+  return ["write_artifact", "append_document", "generate_raster_asset", "inspect_visual_assets",
+    "cocos_validate_project", "cocos_import_assets", "cocos_apply_blueprint", "cocos_build"].includes(value);
 }
