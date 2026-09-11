@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { runInNewContext } from "node:vm";
 import ts from "typescript";
+import { verifyBootstrapLifecycle } from "./verify-cocos-bootstrap-lifecycle.mjs";
 import {
   CocosEngineBridge,
   minimalCreatorEnvironment,
@@ -295,6 +296,7 @@ assert.ok(bootstrapSource.indexOf("setSiblingIndex(siblingIndex)") < bootstrapSo
 assert.match(bootstrapSource, /invalid Sprite\.sizeMode/);
 assert.doesNotMatch(bootstrapSource, /yarn|basket|joystick|assetAliases/i);
 const normalizedDescriptor = JSON.parse(readFileSync(join(projectRoot, "assets", "resources", "btp", "scene-blueprint.json"), "utf8"));
+verifyBootstrapLifecycle(bootstrapSource, normalizedDescriptor);
 assert.equal(normalizedDescriptor.kind, "scene_blueprint");
 assert.equal(normalizedDescriptor.schemaVersion, "1.0.0");
 assert.equal(normalizedDescriptor.entrySceneId, "puzzle_room");

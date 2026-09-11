@@ -1,5 +1,20 @@
 # Machine validation must produce actionable author work
 
+## Configure scene graphs before gameplay lifecycle
+
+The first real browser run exposed uninitialized controllers. Independently of
+the game author's adapter readiness bug, the generated scene bridge attached
+components to active nodes before assigning properties, bindings and references.
+Cocos invokes `onLoad` synchronously in that situation. Blueprint root subtrees
+now remain inactive throughout assembly and are activated only after the entire
+graph is configured. No extra parent nodes or game-specific initialization calls
+are introduced. Failed reference resolution cannot activate partially assembled
+gameplay. The generated TypeScript is executed in the bridge regression with
+active-hierarchy lifecycle semantics, checking values and descendant references
+inside `onLoad`, single activation, draw order and failed-assembly isolation.
+This prevents a platform-induced race; it does not certify gameplay readiness or
+replace the independent QA's real browser run.
+
 ## Reopened QA recovery and test-authoring preflight
 
 A producer change can put a previously failed QA task back in `doing` while

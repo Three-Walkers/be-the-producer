@@ -1260,6 +1260,12 @@ export class BtpRuntimeBootstrap extends Component {
         nextSiblingIndex.set(parentKey, siblingIndex + 1);
       }
       this.applyRuntimeProperties();
+      // addComponent on an active hierarchy invokes onLoad synchronously. Keep
+      // every blueprint subtree inactive until the entire graph and all cross-
+      // node references are configured, then let Cocos run its normal lifecycle.
+      for (const spec of scene.nodes) {
+        if (!spec.parentNodeId) this.nodes.get(this.nodeKey(scene.sceneId, spec.nodeId))!.active = true;
+      }
       console.info('[BTP Bridge] scene blueprint materialized', {
         rootChildren: this.node.children.length,
         componentBindings: this.pendingBindings.length,
@@ -1269,6 +1275,7 @@ export class BtpRuntimeBootstrap extends Component {
 
   private materializeNode(sceneId: string, spec: BlueprintNode, parent: Node): Node {
     const node = new Node(spec.name);
+    if (!spec.parentNodeId) node.active = false;
     parent.addChild(node);
     node.layer = parent.layer;
     const [x, y] = spec.transform.position;
