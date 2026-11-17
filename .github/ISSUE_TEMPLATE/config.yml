@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Private security report · 私密漏洞报告
+    url: https://github.com/Three-Walkers/be-the-producer/security/advisories/new
+    about: Send a vulnerability report to the maintainers privately. 私下向维护者报告安全漏洞。
+  - name: Questions and ideas · 提问和讨论
+    url: https://github.com/Three-Walkers/be-the-producer/discussions
+    about: Discuss how to use the studio or explore an early idea. 交流工作室用法或初步想法。
